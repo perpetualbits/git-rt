@@ -10,6 +10,7 @@ members = [
     "crates/rt-engine",              # PTY + alacritty_terminal wrapper (one backend per pane)
     "crates/rt-config",              # keybindings + config, Terminator-compatible syntax
     "crates/rt-session",             # controller: ties tree+engine+focus+broadcast into actions
+    "crates/rt",                     # the binary: winit + GL front-end + input mapping
 ]
 
 # Shared release profile: optimise hard and thin-LTO, mirroring alacritty's

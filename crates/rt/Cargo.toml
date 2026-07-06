@@ -1,0 +1,42 @@
+[package]
+name = "rt"                          # the binary: a loose Rust port of Terminator
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "rt — a fast, tiling terminal emulator (loose Rust port of Terminator)"
+repository = "https://github.com/perpetualbits/git-rt"
+
+# Split into a library (pure, testable input mapping + app plumbing) and a thin
+# binary, so the winit key -> Chord translation can be unit-tested headlessly
+# while the GL rendering lives in the binary path that needs a display.
+[lib]
+name = "rt_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rt"
+path = "src/main.rs"
+
+[dependencies]
+rt-core = { path = "../rt-core" }
+rt-config = { path = "../rt-config" }
+rt-engine = { path = "../rt-engine" }
+rt-session = { path = "../rt-session" }
+
+# Windowing + GL, pinned to the same versions alacritty ships so we inherit a
+# known-good winit/glutin combination.
+#
+# rt is Wayland-native by design (ADR-0003): no X11/XWayland fallback. We enable
+# only winit's `wayland` backend (dlopen so we don't hard-link libwayland at
+# build time) and glutin's `egl` (the Wayland GL path). The `x11`/`glx` features
+# are deliberately omitted so an X11 code path cannot even be compiled in.
+winit = { version = "0.30.9", default-features = false, features = ["wayland", "wayland-dlopen", "rwh_06"] }
+glutin = { version = "0.32.2", default-features = false, features = ["egl", "wayland"] }
+# glutin-winit's DEFAULT features re-enable glx/x11, which would drag X11 crates
+# back into the tree — so disable defaults and opt into only egl+wayland.
+glutin-winit = { version = "0.5.0", default-features = false, features = ["egl", "wayland"] }
+raw-window-handle = "0.6"            # handle types passed between winit and glutin
+glow = "0.16"                        # safe-ish OpenGL wrapper (simpler than raw gl bindings)
+fontdue = "0.9"                      # CPU glyph rasteriser feeding the GL atlas
+log = "0.4"                          # diagnostics
+env_logger = "0.11"                  # RUST_LOG-driven logging for the binary

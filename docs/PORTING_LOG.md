@@ -111,3 +111,35 @@ Workspace: 25 tests green (core 9, engine 2, config 6, session 8).
 **Next:** the `rt` GL binary — winit `ApplicationHandler`, GL glyph-atlas
 renderer over the tree's `rects()`, and physical winit key → `rt_config::Chord`
 → `Action` → `session.apply()` wiring.
+
+## 2026-07-06 — Session 1: GL front-end runs and RENDERS (M4) + Wayland-native
+
+Built the `rt` binary: winit `ApplicationHandler` + glutin (EGL) context + a
+`glow` GL renderer with a `fontdue` glyph atlas. One shader does everything —
+vertices carry pos+uv+rgba, the fragment shader turns atlas coverage into alpha,
+and a forced-opaque seed texel at (0,0) lets *solid* quads (backgrounds, focus
+border, dividers) reuse the same pipeline. Per frame we walk the tree's
+`rects()`, blit each pane's `snapshot()` grid, and outline the focused pane.
+Input path: winit key → `chord_from_winit` → keymap → `Action`/`Session::apply`,
+else `encode_key` → `Session::feed_input`. `about_to_wait` drains pane events at
+~60fps so async PTY output repaints without keystrokes.
+
+**It compiled clean (zero warnings) and, crucially, RENDERS.** No display in the
+dev sandbox natively, but there is a live compositor — captured the window via
+Xwayland+xwd and confirmed the bash prompt draws correctly through the glyph
+atlas with the blue focus border. First light: `docs/screenshots/first-light.png`.
+For a GL renderer written without being able to see it, first-try correct text
+rendering is a strong result — credit to mirroring alacritty's proven
+winit/glutin versions and keeping the shader minimal.
+
+**Wayland-native (ADR-0003).** User asked to drop all X11. Removed the `x11`
+feature from winit and `glx`/`x11` from glutin AND glutin-winit (whose *default*
+features silently re-added them). Result verified two ways: `cargo tree` shows
+zero x11/xcb/glx crates, and the binary launches with `DISPLAY` unset using only
+`WAYLAND_DISPLAY`. (Trade-off: I can no longer screenshot it in this sandbox
+without `grim`; the render code is backend-agnostic so first-light still stands.)
+
+Workspace: 30 tests green (core 9, engine 2, config 6, session 8, rt input 5).
+
+**Next:** multi-pane/split visual check + cursor + grid colours; then M6
+packaging (deb/rpm/arch × x86_64/aarch64/rv64).

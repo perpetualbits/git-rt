@@ -78,6 +78,13 @@ crashes, and it is measurably faster at parsing throughput.
 - The feature/controller logic (`rt-session`) is written as pure, headless-
   testable code so it is verifiable in CI even though the GL window is not.
 
+### ADR-0003 (session 1 user decision) — Wayland-native
+- rt is **Wayland-only**. No X11, no XWayland fallback. winit is built with only
+  the `wayland`+`wayland-dlopen` backend and glutin/glutin-winit with only
+  `egl`+`wayland` (defaults disabled, since they re-add glx/x11). Verified: the
+  dependency tree contains zero `x11`/`xcb`/`glx` crates, and the binary
+  launches with `DISPLAY` unset using only `WAYLAND_DISPLAY`.
+
 ---
 
 ## 3. Workspace layout (target)
@@ -134,10 +141,16 @@ rt/
   `alacritty_terminal::Term`, expose a renderable grid snapshot.
 - ☐ Headless integration test: run `echo hi`, assert grid contents.
 
-### M4 — Renderer + window  ☐
-- ☐ `rt-render`: winit window, a monospace atlas, draw one pane.
-- ☐ Then multi-pane: draw the layout tree's leaves into their rects.
-- ⚠ Requires a display; may only be verifiable on the user's machine.
+### M4 — Renderer + window  ◐  (single-pane VISUALLY VERIFIED)
+- ☑ `rt` binary: winit `ApplicationHandler` + glutin(EGL/Wayland) context +
+  glow GL renderer with a `fontdue` glyph atlas (single shader; opaque seed
+  texel doubles for solid fills). Draws each pane's grid + focus border.
+- ☑ Wayland-native (ADR-0003): X11 fully removed from the dependency tree.
+- ☑ **Visually verified**: launched against the live Wayland display, captured
+  the window — the bash prompt renders through the atlas with the blue focus
+  border. See `docs/screenshots/first-light.png`.
+- ☐ Multi-pane visual check (split rendering); cursor block; colours/attrs from
+  the grid (currently one fg colour); tab strip drawing.
 
 ### M5 — Terminator features  ◐  (controller logic done + tested; GL wiring next)
 - ☑ Keybinding config parse (`rt-config`): Terminator accelerator syntax +
