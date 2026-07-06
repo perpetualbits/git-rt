@@ -99,6 +99,7 @@ pub struct Session<B: Backend, F: FnMut(usize, usize) -> B> {
     panes: HashMap<PaneId, B>,         // one backend per live leaf
     groups: HashMap<PaneId, u32>,      // pane -> group id (for Broadcast::Group)
     columns: HashMap<PaneId, u16>,     // pane -> newspaper column count (absent = 1)
+    titles: HashMap<PaneId, String>,   // pane -> latest OSC/shell title (for tab + window titles)
     focus: PaneId,                     // the currently focused pane
     broadcast: Broadcast,              // current input fan-out mode
     bounds: Rect,                      // window content rectangle in pixels
@@ -123,6 +124,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             panes,
             groups: HashMap::new(), // no groups assigned initially
             columns: HashMap::new(), // every pane starts single-column
+            titles: HashMap::new(),  // no titles until the shell sets one
             focus: first,           // focus starts on the only pane
             broadcast: Broadcast::Off,
             bounds,
@@ -178,6 +180,21 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     /// concrete type; this generic accessor is mostly for input routing/tests).
     pub fn pane(&self, id: PaneId) -> Option<&B> {
         self.panes.get(&id)
+    }
+
+    /// Record the latest title for pane `id` (from an OSC/shell title event).
+    /// An empty title clears it (the app asked to reset to the default).
+    pub fn set_title(&mut self, id: PaneId, title: String) {
+        if title.is_empty() {
+            self.titles.remove(&id); // reset → fall back to a default label
+        } else {
+            self.titles.insert(id, title);
+        }
+    }
+
+    /// The current title for pane `id`, if the shell has set one.
+    pub fn title_of(&self, id: PaneId) -> Option<&str> {
+        self.titles.get(&id).map(String::as_str)
     }
 
     /// The tab strips to draw/hit-test for the current window `bounds`. Thin
@@ -412,6 +429,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.panes.remove(&closing); // drop backend → PTY shutdown+join (Drop)
         self.groups.remove(&closing); // forget any group membership
         self.columns.remove(&closing); // forget its column count
+        self.titles.remove(&closing); // forget its title
         if self.tree.is_empty() {
             return Some(SessionEvent::CloseWindow); // no panes left → close window
         }

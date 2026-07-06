@@ -483,15 +483,32 @@ impl ApplicationHandler for App {
         // can't mutate the session while iterating its panes).
         let mut dirty = false; // did anything change this tick?
         let mut exited: Vec<rt_core::PaneId> = Vec::new(); // panes whose shell died
+        let mut titles: Vec<(rt_core::PaneId, String)> = Vec::new(); // pending title updates
         for id in active.session.tree().all_panes() {
             if let Some(pane) = active.session.pane(id) {
                 for ev in pane.drain_events() {
                     match ev {
                         rt_engine::PaneEvent::Exited => exited.push(id), // reap this pane
-                        _ => dirty = true, // Wakeup/Title/Bell → needs a redraw
+                        rt_engine::PaneEvent::Title(t) => {
+                            titles.push((id, t)); // apply after the loop (needs &mut session)
+                            dirty = true;
+                        }
+                        _ => dirty = true, // Wakeup/Bell → needs a redraw
                     }
                 }
             }
+        }
+        // Apply title updates, then refresh the window title from the focused pane.
+        if !titles.is_empty() {
+            for (id, t) in titles {
+                active.session.set_title(id, t);
+            }
+            let win_title = active
+                .session
+                .title_of(active.session.focus()) // focused pane's title
+                .map(|t| format!("{t} — rt")) // suffix so it's identifiable
+                .unwrap_or_else(|| "rt".to_string());
+            active.window.set_title(&win_title);
         }
         // Close every pane whose child exited. If that empties the window, quit.
         for id in exited {
@@ -744,8 +761,23 @@ impl App {
                 let r = tab.rect; // this tab's strip rectangle
                 // Segment background (active tab stands out).
                 active.renderer.fill_rect(r.x, r.y, r.w, r.h, if tab.active { tab_active } else { tab_bg });
-                // Label: the tab number, vertically centred, left-padded.
-                let label = tab.number.to_string(); // "1", "2", …
+                // Label: the pane's title if it has one, else the tab number.
+                // Truncate to what fits in the segment (leaving room for the
+                // number prefix and padding).
+                let max_chars = ((r.w - 16.0) / cell_w).floor().max(1.0) as usize;
+                let label = match active.session.title_of(tab.first_pane) {
+                    Some(title) => {
+                        let prefixed = format!("{}: {}", tab.number, title); // "1: user@host …"
+                        if prefixed.chars().count() > max_chars {
+                            // Truncate with an ellipsis.
+                            let keep = max_chars.saturating_sub(1);
+                            format!("{}…", prefixed.chars().take(keep).collect::<String>())
+                        } else {
+                            prefixed
+                        }
+                    }
+                    None => tab.number.to_string(), // untitled → just the number
+                };
                 let text_top = r.y + (r.h - cell_h) * 0.5; // centre the glyph line
                 let col = if tab.active { txt_on } else { txt_off };
                 for (i, ch) in label.chars().enumerate() {
