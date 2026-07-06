@@ -45,16 +45,30 @@ Consequences for rt:
 3. On compositors without a blur protocol, the user enables blur in the
    compositor's own settings; rt cannot do it for them.
 
-### The portable alternative that *does* give a slider
+### The scrim (implemented) — the portable slider that works everywhere
 
-Since we can't blur what's behind, but the stated goal is *"the window below is
-visible but its text is not too legible,"* a client-side **scrim** achieves that
-goal everywhere with a real strength slider: over the translucent background,
-draw a semi-opaque wash that reduces the contrast (and thus legibility) of
-whatever shows through, without hiding its shapes/motion. It is not Gaussian
-blur, but it is cheap, portable, and fully rt-controllable.
+Since we can't blur what's behind, but the goal is *"the window below is visible
+but its text is not too legible,"* rt draws a client-side **scrim**: over the
+translucent background and *behind* the text, a neutral mid-tone wash that
+compresses the contrast (and thus legibility) of whatever shows through, without
+hiding its gross shapes/motion. Not Gaussian blur, but cheap, portable, and
+fully rt-controllable — and it is the *only* option on COSMIC and GNOME.
 
-### Status / decision pending
-Translucency is implemented. The blur approach is a user decision (see the
-porting log): compositor-blur request (KDE on/off) vs. a portable scrim slider
-vs. both. To be resolved before implementing.
+- Setting: `scrim_strength` (`0.0..=0.95`; 0 = off). Wash colour is a mid neutral
+  (`#505058`) chosen to kill contrast faster than it darkens.
+- Controls: `Ctrl+Alt+Right` / `Ctrl+Alt+Left` (±5%), `RT_SCRIM=0.5` env.
+- Verified rendering: `docs/screenshots/scrim.png` (over an opaque bg the wash is
+  visible as a neutral background; over a translucent bg it de-legibilises what
+  is behind — that composited case is only observable on a real display).
+
+**Why a separate slider from opacity?** On Wayland both ultimately act through
+the surface alpha, but they are tuned differently: opacity uses the *dark* bg
+colour (dims toward black), while the scrim uses a *mid-neutral* colour, which
+compresses the contrast range of what shows through — so text below goes
+unreadable while a bright button or moving video stays perceptible. Combining a
+low opacity with a moderate scrim is the "see it, can't read it" sweet spot.
+
+### Decision (session 1): scrim slider + KWin blur
+User chose the portable scrim (built) **plus** requesting true compositor blur on
+KDE/KWin as a bonus (their daily drivers are COSMIC + GNOME, which have no
+compositor blur). KWin blur request status: see below / porting log.

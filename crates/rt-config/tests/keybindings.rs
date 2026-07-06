@@ -57,6 +57,39 @@ fn default_keymap_resolves_terminator_bindings() {
 }
 
 #[test]
+fn appearance_settings_clamp() {
+    use rt_config::Settings;
+    let mut s = Settings::default();
+    assert_eq!(s.background_opacity, 1.0); // opaque by default
+    assert_eq!(s.scrim_strength, 0.0); // no scrim by default
+    // Opacity clamps to [MIN_OPACITY, 1.0].
+    s.adjust_opacity(-5.0);
+    assert_eq!(s.background_opacity, Settings::MIN_OPACITY); // floored, not negative
+    s.adjust_opacity(5.0);
+    assert_eq!(s.background_opacity, 1.0); // capped at fully opaque
+    // Scrim clamps to [0.0, MAX_SCRIM].
+    s.adjust_scrim(5.0);
+    assert_eq!(s.scrim_strength, Settings::MAX_SCRIM); // capped
+    s.adjust_scrim(-5.0);
+    assert_eq!(s.scrim_strength, 0.0); // floored at off
+}
+
+#[test]
+fn appearance_bindings_resolve() {
+    use rt_config::{Action, Chord, Keymap};
+    let map = Keymap::defaults();
+    // Ctrl+Alt+Down = more see-through; Ctrl+Alt+Right = stronger scrim.
+    assert_eq!(
+        map.action_for(&Chord::parse("<Control><Alt>Down").unwrap()),
+        Some(Action::OpacityDown)
+    );
+    assert_eq!(
+        map.action_for(&Chord::parse("<Control><Alt>Right").unwrap()),
+        Some(Action::ScrimUp)
+    );
+}
+
+#[test]
 fn user_binding_overrides_default() {
     // Binding a chord that a default also uses must shadow the default.
     let mut map = Keymap::defaults();

@@ -228,6 +228,11 @@ impl ApplicationHandler for App {
                 settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0); // clamp to usable range
             }
         }
+        if let Ok(v) = std::env::var("RT_SCRIM") {
+            if let Ok(s) = v.parse::<f32>() {
+                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM); // clamp scrim range
+            }
+        }
 
         // Store the fully-initialised state and paint once.
         self.active = Some(Active {
@@ -360,6 +365,18 @@ impl App {
                         active.window.request_redraw();
                         return; // consumed
                     }
+                    rt_config::Action::ScrimUp => {
+                        let v = active.settings.adjust_scrim(0.05); // +5% scrim (less legible behind)
+                        log::info!("scrim strength = {v:.2}");
+                        active.window.request_redraw();
+                        return; // consumed
+                    }
+                    rt_config::Action::ScrimDown => {
+                        let v = active.settings.adjust_scrim(-0.05); // -5% scrim (more legible behind)
+                        log::info!("scrim strength = {v:.2}");
+                        active.window.request_redraw();
+                        return; // consumed
+                    }
                     _ => {} // fall through to the session for everything else
                 }
                 // Run the action; handle any session event it returns.
@@ -407,6 +424,17 @@ impl App {
         // background — we no longer draw an opaque per-pane fill, which under
         // translucency would double-blend and darken the see-through areas.
         active.renderer.begin_frame(bg); // translucent clear
+
+        // Scrim: a neutral wash over the whole window, drawn FIRST (behind all
+        // text), that compresses the contrast of whatever shows through the
+        // translucent background — rt's portable stand-in for background blur.
+        // A mid-neutral tone is used so it washes out legibility faster than it
+        // hides gross shapes/motion. At strength 0 this is a no-op.
+        let scrim = active.settings.scrim_strength; // 0.0 = off
+        if scrim > 0.0 {
+            let wash = Color::rgb(0x50, 0x50, 0x58).with_alpha(scrim); // mid neutral at the chosen strength
+            active.renderer.fill_rect(0.0, 0.0, size.width as f32, size.height as f32, wash);
+        }
 
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, _cell_h) = active.renderer.cell_size(); // px per cell (for column offsets)

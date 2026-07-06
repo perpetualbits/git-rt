@@ -250,3 +250,23 @@ Gaussian blur, but meets the stated goal everywhere. **Awaiting user decision.**
 build stays Wayland-native (verified zero x11 crates).
 
 Workspace: 32 tests green.
+
+## 2026-07-06 — Session 1: scrim implemented (the portable blur stand-in)
+
+User runs COSMIC + GNOME daily (neither can do compositor blur) and wants KWin
+to work well too. Decision: portable scrim slider + request KWin blur as a bonus.
+
+**Scrim built and rendering-verified.** `rt_config::Settings.scrim_strength`
+(0..=0.95) drives a neutral mid-tone (#505058) full-window wash drawn behind the
+text, over the translucent background. It compresses the contrast of whatever
+shows through — visible shapes/motion, illegible text — rt's portable stand-in
+for background blur (a Wayland client can't blur what's behind it). Controls:
+Ctrl+Alt+Right/Left (±5%), RT_SCRIM env. Separate from opacity because opacity
+dims toward the dark bg while the scrim uses a mid-neutral that kills contrast
+faster than brightness. Verified the wash renders (`docs/screenshots/scrim.png`);
+the composited de-legibilising effect over real background content is on-machine
+only (no compositor capture in this sandbox). Config tests: opacity+scrim clamp,
+appearance bindings resolve. Workspace: 34 tests green.
+
+**Next in this feature:** the KWin `org_kde_kwin_blur` request (KDE-only bonus,
+untestable here — I have no KDE session).

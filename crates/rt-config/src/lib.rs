@@ -57,6 +57,10 @@ pub enum Action {
     OpacityUp,
     /// rt-specific: make the window background more translucent (see-through).
     OpacityDown,
+    /// rt-specific: strengthen the background scrim (less legible behind).
+    ScrimUp,
+    /// rt-specific: weaken the background scrim (more legible behind).
+    ScrimDown,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -68,18 +72,31 @@ pub struct Settings {
     /// the window(s) behind show through (compositor permitting). Clamped away
     /// from 0 so the window can never become completely invisible.
     pub background_opacity: f32,
+    /// Background scrim strength, `0.0..=0.95`. A neutral wash drawn over the
+    /// translucent background (behind the text) that compresses the *contrast*
+    /// of whatever shows through — so you can still see motion/shapes below but
+    /// its text becomes hard to read. `0.0` = no scrim. This is rt's portable
+    /// stand-in for background blur (see `docs/APPEARANCE.md`): a Wayland client
+    /// can't blur what's behind it, but it can wash out its legibility.
+    pub scrim_strength: f32,
 }
 
 impl Default for Settings {
-    /// Sensible defaults: fully opaque, matching a normal terminal.
+    /// Sensible defaults: fully opaque, no scrim — a normal terminal.
     fn default() -> Self {
-        Settings { background_opacity: 1.0 } // opaque until the user dials it down
+        Settings {
+            background_opacity: 1.0, // opaque until the user dials it down
+            scrim_strength: 0.0,     // no scrim until the user enables it
+        }
     }
 }
 
 impl Settings {
     /// The smallest opacity we allow, so the window never vanishes entirely.
     pub const MIN_OPACITY: f32 = 0.05;
+    /// The strongest scrim we allow; above this almost nothing shows through, at
+    /// which point the user may as well raise opacity instead.
+    pub const MAX_SCRIM: f32 = 0.95;
 
     /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
     /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.
@@ -87,6 +104,13 @@ impl Settings {
         // Clamp so we stay in a usable, always-visible range.
         self.background_opacity = (self.background_opacity + delta).clamp(Self::MIN_OPACITY, 1.0);
         self.background_opacity
+    }
+
+    /// Nudge the scrim strength by `delta`, clamped to `[0.0, MAX_SCRIM]`.
+    /// Returns the new value. Used by the `ScrimUp`/`ScrimDown` actions.
+    pub fn adjust_scrim(&mut self, delta: f32) -> f32 {
+        self.scrim_strength = (self.scrim_strength + delta).clamp(0.0, Self::MAX_SCRIM); // stay in range
+        self.scrim_strength
     }
 }
 
@@ -131,6 +155,8 @@ impl Keymap {
             // Live background-opacity nudges (also settable in preferences).
             ("<Control><Alt>Up", Action::OpacityUp),     // more opaque
             ("<Control><Alt>Down", Action::OpacityDown), // more see-through
+            ("<Control><Alt>Right", Action::ScrimUp),    // stronger scrim (less legible behind)
+            ("<Control><Alt>Left", Action::ScrimDown),   // weaker scrim (more legible behind)
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {
