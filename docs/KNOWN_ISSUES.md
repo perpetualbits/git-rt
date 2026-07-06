@@ -90,3 +90,16 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   blur still only on KDE; COSMIC/GNOME have no blur protocol — use the scrim.)
   Not visually verifiable in this sandbox (no compositing capture); please
   confirm on your machine with e.g. `RT_OPACITY=0.8 RT_SCRIM=0.4`.
+
+## Phase 0 essentials (2026-07-06)
+- ☑ **Tab & window titles** from OSC (`docs/screenshots/tab-titles.png`).
+- ☑ **Config persistence** — settings saved to `~/.config/rt/config.toml`, loaded
+  at startup (opacity, scrim, focus-follows-mouse; more as features land).
+- ☑ **Dead keys / IME** — `[user: ~ \` ' " ^ compose keys didn't work]`. Enabled
+  winit IME (`set_ime_allowed(true)`); composed text (´+o→ó, ~+n→ñ) arrives via
+  `Ime::Commit`; key presses are suppressed while a preedit is active so the
+  dead key and its result aren't both sent (mirrors alacritty). Normal typing
+  verified still works with IME on; dead-key composition needs a compose-capable
+  layout to observe (on the user's machine). Preedit is not yet *rendered*
+  inline (follow-up).
+- ☐ **Copy/paste** — next.

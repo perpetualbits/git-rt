@@ -26,7 +26,7 @@ use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -55,6 +55,7 @@ struct Active {
     settings: rt_config::Settings,        // window appearance (background opacity, …)
     mouse: (f32, f32),                    // last cursor position in physical pixels
     menu: Option<menu::Menu>,             // the open right-click context menu, if any
+    ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
 }
 
 /// The winit application object. Holds only the font bytes until `resumed`
@@ -237,6 +238,10 @@ impl ApplicationHandler for App {
         // COSMIC/GNOME/sway, where the portable scrim does the job instead.
         blur::try_enable_kwin_blur(&window);
 
+        // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
+        // IMEs work: composed text arrives via WindowEvent::Ime(Commit).
+        window.set_ime_allowed(true);
+
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.inner_size(); // physical pixel size
         renderer.resize(size.width as f32, size.height as f32);
@@ -318,6 +323,7 @@ impl ApplicationHandler for App {
             settings,
             mouse: (0.0, 0.0),
             menu: None,
+            ime_preedit: false,
         });
         // Debug/verification hook: RT_MENU opens the context menu at startup so
         // its rendering can be screenshotted without synthetic mouse input.
@@ -350,6 +356,24 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(new_mods) => {
                 active.mods = new_mods.state(); // remember Ctrl/Shift/Alt/Super
             }
+
+            // IME: dead-key/compose and full input methods. Composed text is
+            // committed here; while a preedit is in progress, on_key_press is
+            // suppressed so the intermediate keys don't also reach the PTY.
+            WindowEvent::Ime(ime) => match ime {
+                Ime::Commit(text) => {
+                    active.ime_preedit = false; // composition finished
+                    if !text.is_empty() {
+                        active.session.feed_input(text.as_bytes()); // send the composed text (e.g. "ó")
+                    }
+                }
+                Ime::Preedit(text, _cursor) => {
+                    // A non-empty preedit means a composition is under way.
+                    active.ime_preedit = !text.is_empty();
+                }
+                Ime::Enabled => {} // IME turned on; nothing to do
+                Ime::Disabled => active.ime_preedit = false, // IME off; clear any preedit gate
+            },
 
             // Window resized: resize the GL surface, viewport, and relayout PTYs.
             WindowEvent::Resized(size) => {
@@ -598,6 +622,12 @@ impl App {
         if active.menu.is_some() && matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
             active.menu = None;
             active.window.request_redraw();
+            return;
+        }
+        // While an IME/dead-key composition is in progress, swallow key presses:
+        // the composed result arrives via WindowEvent::Ime(Commit) instead. This
+        // is what prevents the dead key (´) and its result (ó) both being sent.
+        if active.ime_preedit {
             return;
         }
         let mods = active.mods; // current modifier state
