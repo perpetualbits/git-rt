@@ -379,6 +379,12 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.groups.insert(self.focus, group); // record membership for the focus
     }
 
+    /// Update the character-cell pixel size (after a font change) so subsequent
+    /// [`Session::relayout`] converts pane rectangles to (cols, rows) correctly.
+    pub fn set_cell(&mut self, cell: (f32, f32)) {
+        self.cell = cell;
+    }
+
     /// Recompute every pane's (cols, rows) from the current tree layout and
     /// window bounds, resizing each backend. Called by the GUI on window resize
     /// or font change. Panes on inactive tabs (absent from `rects`) keep their

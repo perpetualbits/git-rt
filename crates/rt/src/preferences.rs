@@ -10,12 +10,25 @@ use rt_config::Settings;
 /// Build the preferences window for this frame. Mutates `settings` directly
 /// (sliders/checkboxes bind to its fields) and sets `close` true when the user
 /// dismisses the dialog. Call once per frame from the egui run closure.
-pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool) {
+pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool, families: &[String]) {
     egui::Window::new("rt preferences")
         .collapsible(false)
         .resizable(false)
-        .default_width(320.0)
+        .default_width(340.0)
         .show(ctx, |ui| {
+            ui.heading("Font");
+            // Size slider.
+            ui.add(egui::Slider::new(&mut settings.font_size, 8.0..=48.0).text("Size (px)"));
+            // Family combo, populated with the system's monospace families.
+            egui::ComboBox::from_label("Family")
+                .selected_text(settings.font_family.clone())
+                .show_ui(ui, |ui| {
+                    for fam in families {
+                        ui.selectable_value(&mut settings.font_family, fam.clone(), fam);
+                    }
+                });
+
+            ui.separator();
             ui.heading("Appearance");
             // Background opacity: 0.05 (see-through) .. 1.0 (opaque).
             ui.add(

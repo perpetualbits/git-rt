@@ -70,7 +70,7 @@ pub enum Action {
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
 /// spirit). Kept minimal for now; a future preferences panel edits these and a
 /// config file persists them.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)] // missing fields in the file fall back to Default, so old/partial configs load
 pub struct Settings {
     /// Background opacity, `0.05..=1.0`. `1.0` is fully opaque; lower values let
@@ -98,6 +98,11 @@ pub struct Settings {
     /// The 16 ANSI palette colours (0–7 normal, 8–15 bright), RGB each. The
     /// 256-colour cube and greyscale ramp are derived from these by the engine.
     pub palette: [[u8; 3]; 16],
+    /// Monospace font family name (as system font databases know it). If it
+    /// can't be found, rt falls back to a bundled-path search.
+    pub font_family: String,
+    /// Font size in pixels.
+    pub font_size: f32,
 }
 
 /// The default 16-colour ANSI palette (classic xterm values).
@@ -130,6 +135,8 @@ impl Default for Settings {
             foreground: [0xd0, 0xd0, 0xd8], // light grey text
             background: [0x10, 0x10, 0x14], // near-black background
             palette: DEFAULT_PALETTE,      // classic xterm 16-colour palette
+            font_family: "DejaVu Sans Mono".to_string(), // ubiquitous monospace default
+            font_size: 18.0,               // pixels
         }
     }
 }

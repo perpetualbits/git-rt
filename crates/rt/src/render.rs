@@ -74,6 +74,36 @@ struct Glyph {
 /// Laid out flat in a `Vec<f32>` for a single glBufferData upload per frame.
 const FLOATS_PER_VERTEX: usize = 8;
 
+/// Parse a slice of font blobs into `Font`s, skipping any that fail to parse
+/// (e.g. CFF/OTF that fontdue can't read). If `primary_required`, the first blob
+/// must parse. Shared by `Renderer::new` and `reload_fonts`.
+fn parse_chain(blobs: &[Vec<u8>], primary_required: bool) -> Result<Vec<Font>, String> {
+    let mut out: Vec<Font> = Vec::new();
+    for (i, blob) in blobs.iter().enumerate() {
+        match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
+            Ok(f) => out.push(f), // usable font
+            Err(e) if i == 0 && primary_required => {
+                return Err(format!("primary font parse failed: {e}")); // fatal
+            }
+            Err(e) => log::warn!("skipping unparseable font #{i}: {e}"), // non-fatal
+        }
+    }
+    Ok(out)
+}
+
+/// Measure the monospace cell for a font at `font_px`: `(cell_w, cell_h, ascent)`.
+/// Width comes from 'M''s advance; height/ascent from the font's line metrics,
+/// with sensible fallbacks.
+fn measure_cell(font: &Font, font_px: f32) -> (f32, f32, f32) {
+    let (metrics, _) = font.rasterize('M', font_px); // reference glyph
+    let line = font.horizontal_line_metrics(font_px); // vertical metrics
+    let cell_w = metrics.advance_width.ceil().max(1.0); // never zero-width
+    match line {
+        Some(l) => (cell_w, l.new_line_size.ceil().max(1.0), l.ascent), // proper metrics
+        None => (cell_w, font_px.ceil().max(1.0), font_px * 0.8),       // fallback estimate
+    }
+}
+
 /// The renderer owns the GL objects, the font, the atlas, and the per-frame
 /// vertex scratch buffer.
 pub struct Renderer {
@@ -110,36 +140,16 @@ impl Renderer {
     /// then ready for `begin_frame`/`draw_*`/`end_frame`. Returns an error string
     /// on any GL or font failure so `main` can report it instead of panicking.
     pub fn new(gl: std::sync::Arc<glow::Context>, blobs: &FontBlobs, font_px: f32) -> Result<Self, String> {
-        // Parse a slice of font blobs into `Font`s, skipping any that fail. Used
-        // for each weight/style chain; only the regular primary is required.
-        let parse_chain = |blobs: &[Vec<u8>], primary_required: bool| -> Result<Vec<Font>, String> {
-            let mut out: Vec<Font> = Vec::new();
-            for (i, blob) in blobs.iter().enumerate() {
-                match Font::from_bytes(blob.as_slice(), fontdue::FontSettings::default()) {
-                    Ok(f) => out.push(f), // usable font
-                    Err(e) if i == 0 && primary_required => {
-                        return Err(format!("primary font parse failed: {e}")); // fatal
-                    }
-                    Err(e) => log::warn!("skipping unparseable font #{i}: {e}"), // non-fatal
-                }
-            }
-            Ok(out)
-        };
-        let fonts = parse_chain(&blobs.regular, true)?; // regular chain; primary must parse
-        let bold_fonts = parse_chain(&blobs.bold, false)?; // bold chain; optional
-        let italic_fonts = parse_chain(&blobs.italic, false)?; // italic chain; optional
-        let bold_italic_fonts = parse_chain(&blobs.bold_italic, false)?; // bold-italic; optional
+        // Parse the four weight/style chains (only the regular primary required).
+        let fonts = parse_chain(&blobs.regular, true)?;
+        if fonts.is_empty() {
+            return Err("no usable primary font".to_string()); // avoid fonts[0] panic
+        }
+        let bold_fonts = parse_chain(&blobs.bold, false)?;
+        let italic_fonts = parse_chain(&blobs.italic, false)?;
+        let bold_italic_fonts = parse_chain(&blobs.bold_italic, false)?;
         // The primary font (index 0) defines the monospace cell metrics.
-        let font = &fonts[0];
-        // Measure the monospace cell: 'M' advance for width, line metrics for
-        // height/ascent. Unwraps guarded with sensible fallbacks.
-        let (metrics, _) = font.rasterize('M', font_px); // reference glyph
-        let line = font.horizontal_line_metrics(font_px); // vertical metrics
-        let cell_w = metrics.advance_width.ceil().max(1.0); // never zero-width
-        let (cell_h, ascent) = match line {
-            Some(l) => (l.new_line_size.ceil().max(1.0), l.ascent), // proper metrics
-            None => (font_px.ceil().max(1.0), font_px * 0.8),       // fallback estimate
-        };
+        let (cell_w, cell_h, ascent) = measure_cell(&fonts[0], font_px);
 
         unsafe {
             // --- shader program -------------------------------------------
@@ -237,6 +247,40 @@ impl Renderer {
     /// uses this to convert pane pixel rectangles into terminal (cols, rows).
     pub fn cell_size(&self) -> (f32, f32) {
         (self.cell_w, self.cell_h)
+    }
+
+    /// Reload the font chains and/or pixel size (a preferences font change).
+    /// Re-parses the four chains, re-measures the cell, and invalidates the
+    /// glyph cache + atlas packing so glyphs re-rasterise at the new font. The
+    /// caller must then recompute pane (cols, rows) from the new `cell_size`.
+    /// Returns an error only if the new primary font fails to parse (in which
+    /// case the old fonts are left untouched).
+    pub fn reload_fonts(&mut self, blobs: &FontBlobs, font_px: f32) -> Result<(), String> {
+        // Parse into locals first so a failure leaves the current fonts intact.
+        let fonts = parse_chain(&blobs.regular, true)?;
+        if fonts.is_empty() {
+            return Err("no usable primary font".to_string()); // keep the old fonts
+        }
+        let bold_fonts = parse_chain(&blobs.bold, false)?;
+        let italic_fonts = parse_chain(&blobs.italic, false)?;
+        let bold_italic_fonts = parse_chain(&blobs.bold_italic, false)?;
+        let (cell_w, cell_h, ascent) = measure_cell(&fonts[0], font_px);
+        // Commit the new fonts/metrics.
+        self.fonts = fonts;
+        self.bold_fonts = bold_fonts;
+        self.italic_fonts = italic_fonts;
+        self.bold_italic_fonts = bold_italic_fonts;
+        self.font_px = font_px;
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        self.ascent = ascent;
+        // Old cached glyphs are stale (wrong font/size); drop them and reset the
+        // atlas packing cursor. Old pixels linger harmlessly until overwritten.
+        self.glyphs.clear();
+        self.shelf_x = 2;
+        self.shelf_y = 2;
+        self.shelf_h = 0;
+        Ok(())
     }
 
     /// Compile and link the vertex+fragment shaders into a program, returning a

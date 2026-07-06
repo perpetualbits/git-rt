@@ -46,6 +46,7 @@ glutin-winit = { version = "0.5.0", default-features = false, features = ["egl",
 raw-window-handle = "0.6"            # handle types passed between winit and glutin
 glow = "0.17"                        # OpenGL wrapper; 0.17 matches egui_glow so they share the GL context
 fontdue = "0.9"                      # CPU glyph rasteriser feeding the GL atlas
+fontdb = "0.23"                      # pure-Rust system font discovery (family picker; no X11)
 log = "0.4"                          # diagnostics
 env_logger = "0.11"                  # RUST_LOG-driven logging for the binary
 # egui for UI chrome (preferences dialog, colour/font pickers). default-features

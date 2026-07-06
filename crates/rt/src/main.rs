@@ -65,6 +65,9 @@ struct Active {
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
     prefs_open: bool,                     // whether the preferences dialog is showing
     palette: std::sync::Arc<std::sync::Mutex<rt_engine::Palette>>, // shared so new panes inherit current colours
+    font_db: std::sync::Arc<fontdb::Database>, // for reloading fonts on a family change
+    font_blobs: render::FontBlobs,        // the current font chains (kept so a size change can reload)
+    mono_families: Vec<String>,           // monospace family names for the preferences picker
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -109,8 +112,76 @@ impl Selection {
 /// The winit application object. Holds only the font bytes until `resumed`
 /// builds the `Active` state.
 struct App {
-    fonts: render::FontBlobs, // regular/bold/italic/bold-italic font byte chains
-    active: Option<Active>,   // populated on first resume
+    font_db: std::sync::Arc<fontdb::Database>, // system fonts, for family lookup + the picker
+    mono_families: Vec<String>,                // monospace family names for the preferences combo
+    active: Option<Active>,                    // populated on first resume
+}
+
+/// Build the system font database (scans the usual font directories).
+fn build_font_db() -> fontdb::Database {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    db
+}
+
+/// The sorted, de-duplicated names of every monospace family in the database —
+/// what the preferences font picker offers.
+fn monospace_families(db: &fontdb::Database) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for face in db.faces() {
+        if face.monospaced {
+            if let Some((name, _)) = face.families.first() {
+                names.insert(name.clone());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Fetch the raw bytes of the `family` face nearest the given weight/style, or
+/// `None` if the family isn't installed.
+fn face_data(db: &fontdb::Database, family: &str, weight: fontdb::Weight, style: fontdb::Style) -> Option<Vec<u8>> {
+    let id = db.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        weight,
+        stretch: fontdb::Stretch::Normal,
+        style,
+    })?;
+    db.with_face_data(id, |data, _index| data.to_vec())
+}
+
+/// Build the four font chains (regular/bold/italic/bold-italic) for `family`,
+/// each with coverage fallbacks appended to the regular chain (DejaVu Sans etc.
+/// cover braille that DejaVu Sans Mono lacks). Falls back to a path search if
+/// the database yields no usable primary.
+fn font_blobs(db: &fontdb::Database, family: &str) -> render::FontBlobs {
+    use fontdb::{Style, Weight};
+    // Primary regular face: the chosen family, then sensible monospace fallbacks.
+    let primary = face_data(db, family, Weight::NORMAL, Style::Normal)
+        .or_else(|| face_data(db, "DejaVu Sans Mono", Weight::NORMAL, Style::Normal))
+        .or_else(|| face_data(db, "monospace", Weight::NORMAL, Style::Normal));
+    let mut regular = Vec::new();
+    if let Some(d) = primary {
+        regular.push(d);
+    }
+    // Coverage fallbacks (braille, symbols) appended after the primary.
+    for fam in ["DejaVu Sans", "Noto Sans Symbols2", "FreeMono"] {
+        if let Some(d) = face_data(db, fam, Weight::NORMAL, Style::Normal) {
+            regular.push(d);
+        }
+    }
+    // Nothing at all from the DB → last-resort path loader.
+    if regular.is_empty() {
+        if let Some(fb) = load_fonts() {
+            return fb;
+        }
+    }
+    render::FontBlobs {
+        regular,
+        bold: face_data(db, family, Weight::BOLD, Style::Normal).into_iter().collect(),
+        italic: face_data(db, family, Weight::NORMAL, Style::Italic).into_iter().collect(),
+        bold_italic: face_data(db, family, Weight::BOLD, Style::Italic).into_iter().collect(),
+    }
 }
 
 /// Locate a monospace font (plus fallback fonts for coverage gaps) on the
@@ -275,8 +346,29 @@ impl ApplicationHandler for App {
             glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
         });
 
+        // Load persisted settings (before the renderer, so fonts/colours come
+        // from the config). Env vars override for demos/screenshots.
+        let mut settings = rt_config::Config::load().settings;
+        if let Ok(v) = std::env::var("RT_OPACITY") {
+            if let Ok(o) = v.parse::<f32>() {
+                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0);
+            }
+        }
+        if let Ok(v) = std::env::var("RT_SCRIM") {
+            if let Ok(s) = v.parse::<f32>() {
+                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM);
+            }
+        }
+        if let Ok(v) = std::env::var("RT_FOCUS") {
+            settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
+        }
+
+        // Font chains for the configured family (system fonts via fontdb). Kept
+        // in `Active` so a live font change can reload them.
+        let font_blobs = font_blobs(&self.font_db, &settings.font_family);
+
         // --- build the renderer ------------------------------------------
-        let mut renderer = match Renderer::new(gl.clone(), &self.fonts, 18.0) {
+        let mut renderer = match Renderer::new(gl.clone(), &font_blobs, settings.font_size) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e}");
@@ -309,27 +401,8 @@ impl ApplicationHandler for App {
 
         // --- build the session with real PTY panes -----------------------
         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
-        // Optional demo/verification hook: RT_EXEC runs a command in every new
-        // pane before dropping to an interactive shell. Handy for screenshots
-        // (e.g. RT_EXEC='seq 1 200') and a stepping-stone toward saved layouts.
-        // Load persisted settings from ~/.config/rt/config.toml so they survive
-        // restarts; env vars below override for demos/screenshots. Loaded here
-        // (before the session) so pane colours come from the configured palette.
-        let mut settings = rt_config::Config::load().settings;
-        if let Ok(v) = std::env::var("RT_OPACITY") {
-            if let Ok(o) = v.parse::<f32>() {
-                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0);
-            }
-        }
-        if let Ok(v) = std::env::var("RT_SCRIM") {
-            if let Ok(s) = v.parse::<f32>() {
-                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM);
-            }
-        }
-        if let Ok(v) = std::env::var("RT_FOCUS") {
-            settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
-        }
-
+        // RT_EXEC runs a command in every new pane before dropping to an
+        // interactive shell (handy for screenshots / demos).
         let exec = std::env::var("RT_EXEC").ok();
         // Shared colour palette (built from the configured colours). Every new
         // pane picks up the *current* palette, so a colour-scheme change applies
@@ -419,6 +492,9 @@ impl ApplicationHandler for App {
             egui_painter,
             prefs_open: false,
             palette,
+            font_db: self.font_db.clone(),
+            font_blobs,
+            mono_families: self.mono_families.clone(),
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so its egui rendering can be screenshotted.
@@ -850,7 +926,7 @@ impl App {
     /// Persist the current settings to the config file, logging (not failing) on
     /// error. Called after any setting change so it survives a restart.
     fn persist(settings: &rt_config::Settings) {
-        let cfg = rt_config::Config { settings: *settings }; // wrap for serialisation
+        let cfg = rt_config::Config { settings: settings.clone() }; // wrap for serialisation
         if let Err(e) = cfg.save() {
             log::warn!("could not save config: {e}"); // non-fatal
         }
@@ -1118,27 +1194,50 @@ impl App {
     fn paint_egui(active: &mut Active) {
         let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
         let ctx = active.egui_ctx.clone(); // cheap Arc clone (avoids borrowing active in the closure)
-        let mut settings = active.settings; // Copy; the UI edits this local
+        let mut settings = active.settings.clone(); // the UI edits this clone
         let mut close = false; // set by the Close button
         // egui 0.35 frame API: begin_pass → build UI → end_pass.
         ctx.begin_pass(raw_input);
-        preferences::ui(&ctx, &mut settings, &mut close); // build the dialog
+        preferences::ui(&ctx, &mut settings, &mut close, &active.mono_families); // build the dialog
         let output = ctx.end_pass();
         // Apply + persist any change the user made.
         if settings != active.settings {
-            // If the colours changed, rebuild the palette and apply it live to
-            // every pane (and the shared palette new panes inherit).
+            // What changed drives which subsystem we refresh.
             let colours_changed = settings.foreground != active.settings.foreground
                 || settings.background != active.settings.background
                 || settings.palette != active.settings.palette;
-            active.settings = settings;
-            Self::persist(&settings);
+            let family_changed = settings.font_family != active.settings.font_family;
+            let fonts_changed = family_changed || settings.font_size != active.settings.font_size;
+            active.settings = settings; // commit
+            Self::persist(&active.settings);
+            // Colours: rebuild the palette and apply it live to every pane.
             if colours_changed {
-                let pal = rt_engine::Palette::new(settings.foreground, settings.background, settings.palette);
+                let pal = rt_engine::Palette::new(
+                    active.settings.foreground,
+                    active.settings.background,
+                    active.settings.palette,
+                );
                 if let Ok(mut p) = active.palette.lock() {
                     *p = pal.clone(); // future panes inherit these colours
                 }
                 active.session.set_all_palettes(pal); // recolour existing panes
+            }
+            // Fonts: reload the family (if changed) and/or size, then re-measure
+            // the cell and resize every pane to the new (cols, rows).
+            if fonts_changed {
+                if family_changed {
+                    active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
+                }
+                let px = active.settings.font_size;
+                match active.renderer.reload_fonts(&active.font_blobs, px) {
+                    Ok(()) => {
+                        let cell = active.renderer.cell_size(); // new cell metrics
+                        active.session.set_cell(cell);
+                        let size = active.window.inner_size();
+                        active.session.relayout(Rect::new(0.0, 0.0, size.width as f32, size.height as f32));
+                    }
+                    Err(e) => log::warn!("font reload failed: {e}"),
+                }
             }
         }
         if close {
@@ -1161,20 +1260,20 @@ impl App {
 /// Program entry point: set up logging, load a font, and run the winit loop.
 fn main() {
     env_logger::init(); // honour RUST_LOG for diagnostics
-    // A font is mandatory; fail early with guidance if none is installed.
-    let fonts = match load_fonts() {
-        Some(f) => f,
-        None => {
-            eprintln!(
-                "rt: no monospace font found. Install e.g. 'fonts-dejavu-core' \
-                 (Debian/Ubuntu) or 'ttf-dejavu' (Arch) and retry."
-            );
-            std::process::exit(1);
-        }
-    };
+    // Scan system fonts up front (for the family picker + lookup). A monospace
+    // font is mandatory; fail early with guidance if none is installed.
+    let font_db = std::sync::Arc::new(build_font_db());
+    let mono_families = monospace_families(&font_db);
+    if mono_families.is_empty() && load_fonts().is_none() {
+        eprintln!(
+            "rt: no monospace font found. Install e.g. 'fonts-dejavu-core' \
+             (Debian/Ubuntu) or 'ttf-dejavu' (Arch) and retry."
+        );
+        std::process::exit(1);
+    }
     // Build the winit event loop and hand it our application.
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App { fonts, active: None };
+    let mut app = App { font_db, mono_families, active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
