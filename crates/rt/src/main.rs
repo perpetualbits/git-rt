@@ -50,6 +50,7 @@ struct Active {
     session: AppSession,                  // layout + panes + focus + broadcast
     keymap: Keymap,                       // Terminator-style bindings
     mods: ModifiersState,                 // live modifier state (updated on change)
+    settings: rt_config::Settings,        // window appearance (background opacity, …)
 }
 
 /// The winit application object. Holds only the font bytes until `resumed`
@@ -219,6 +220,15 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Appearance settings. RT_OPACITY (0.05..=1.0) seeds the background
+        // opacity for demos/screenshots; a preferences panel will edit it later.
+        let mut settings = rt_config::Settings::default(); // opaque by default
+        if let Ok(v) = std::env::var("RT_OPACITY") {
+            if let Ok(o) = v.parse::<f32>() {
+                settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0); // clamp to usable range
+            }
+        }
+
         // Store the fully-initialised state and paint once.
         self.active = Some(Active {
             window,
@@ -228,6 +238,7 @@ impl ApplicationHandler for App {
             session,
             keymap: Keymap::defaults(),
             mods: ModifiersState::empty(),
+            settings,
         });
         // Poll so we keep re-checking PTYs for async output even without input.
         event_loop.set_control_flow(ControlFlow::Poll);
@@ -334,6 +345,23 @@ impl App {
         // First, is this chord bound to an rt action?
         if let Some(chord) = input::chord_from_winit(&key_event.logical_key, mods) {
             if let Some(action) = active.keymap.action_for(&chord) {
+                // Window-level appearance actions are handled here (the session
+                // owns no window). Adjust opacity and repaint.
+                match action {
+                    rt_config::Action::OpacityUp => {
+                        let v = active.settings.adjust_opacity(0.05); // +5% opaque
+                        log::info!("background opacity = {v:.2}");
+                        active.window.request_redraw();
+                        return; // consumed
+                    }
+                    rt_config::Action::OpacityDown => {
+                        let v = active.settings.adjust_opacity(-0.05); // -5% (more see-through)
+                        log::info!("background opacity = {v:.2}");
+                        active.window.request_redraw();
+                        return; // consumed
+                    }
+                    _ => {} // fall through to the session for everything else
+                }
                 // Run the action; handle any session event it returns.
                 if let Some(ev) = active.session.apply(action) {
                     match ev {
@@ -366,21 +394,26 @@ impl App {
     fn redraw(&mut self) {
         let Some(active) = self.active.as_mut() else { return };
         // Terminal colours (a dark theme): near-black bg, light-grey fg.
-        let bg = Color::rgb(0x10, 0x10, 0x14); // window/pane background
-        let fg = Color::rgb(0xd0, 0xd0, 0xd8); // default text colour
-        let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline
+        // The background carries the user's opacity in its alpha channel, so a
+        // value < 1.0 makes empty areas translucent (the window(s) behind show
+        // through, compositor permitting). Glyphs and chrome stay fully opaque.
+        let bg = Color::rgb(0x10, 0x10, 0x14).with_alpha(active.settings.background_opacity);
+        let fg = Color::rgb(0xd0, 0xd0, 0xd8); // default text colour (opaque)
+        let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline (opaque)
 
         let size = active.window.inner_size(); // physical pixels
         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
-        active.renderer.begin_frame(bg); // clear to bg
+        // Clear to the (possibly translucent) background. This IS the pane
+        // background — we no longer draw an opaque per-pane fill, which under
+        // translucency would double-blend and darken the see-through areas.
+        active.renderer.begin_frame(bg); // translucent clear
 
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, _cell_h) = active.renderer.cell_size(); // px per cell (for column offsets)
         let sep = Color::rgb(0x2a, 0x2a, 0x33); // subtle inter-column separator colour
-        // Draw every visible pane.
+        // Draw every visible pane. (No per-pane background fill: the translucent
+        // clear above already is the background.)
         for (id, rect) in active.session.tree().rects(bounds) {
-            // Fill this pane's background (in case the clear colour differs).
-            active.renderer.fill_rect(rect.x, rect.y, rect.w, rect.h, bg);
             let n = active.session.columns_of(id); // newspaper column count (1 = normal)
             // Copy the pane's current grid and draw each non-blank cell.
             if let Some(pane) = active.session.pane(id) {

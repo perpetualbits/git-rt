@@ -241,6 +241,10 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             // Clipboard is owned by the GUI shell; just forward the intent.
             Action::Copy => Some(SessionEvent::Copy),
             Action::Paste => Some(SessionEvent::Paste),
+            // Window-level appearance (background opacity) is owned by the GUI
+            // shell, not the session — it holds no window handle. The binary
+            // intercepts these before dispatch; this arm keeps `apply` total.
+            Action::OpacityUp | Action::OpacityDown => None,
         }
     }
 

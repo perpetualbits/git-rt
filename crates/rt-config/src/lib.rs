@@ -53,6 +53,41 @@ pub enum Action {
     ColumnsMore,
     /// rt-specific: remove one newspaper column (clamped at 1 = normal).
     ColumnsFewer,
+    /// rt-specific: make the window background more opaque.
+    OpacityUp,
+    /// rt-specific: make the window background more translucent (see-through).
+    OpacityDown,
+}
+
+/// Window-level appearance settings (Terminator's "Profiles → Background" in
+/// spirit). Kept minimal for now; a future preferences panel edits these and a
+/// config file persists them.
+#[derive(Clone, Copy, Debug)]
+pub struct Settings {
+    /// Background opacity, `0.05..=1.0`. `1.0` is fully opaque; lower values let
+    /// the window(s) behind show through (compositor permitting). Clamped away
+    /// from 0 so the window can never become completely invisible.
+    pub background_opacity: f32,
+}
+
+impl Default for Settings {
+    /// Sensible defaults: fully opaque, matching a normal terminal.
+    fn default() -> Self {
+        Settings { background_opacity: 1.0 } // opaque until the user dials it down
+    }
+}
+
+impl Settings {
+    /// The smallest opacity we allow, so the window never vanishes entirely.
+    pub const MIN_OPACITY: f32 = 0.05;
+
+    /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
+    /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.
+    pub fn adjust_opacity(&mut self, delta: f32) -> f32 {
+        // Clamp so we stay in a usable, always-visible range.
+        self.background_opacity = (self.background_opacity + delta).clamp(Self::MIN_OPACITY, 1.0);
+        self.background_opacity
+    }
 }
 
 /// The keymap: an ordered list of `(chord, action)` bindings.
@@ -93,6 +128,9 @@ impl Keymap {
             // (no Shift) so winit's shifted-symbol remapping can't break them.
             ("<Control>period", Action::ColumnsMore),    // Ctrl+.  -> more columns
             ("<Control>comma", Action::ColumnsFewer),    // Ctrl+,  -> fewer columns
+            // Live background-opacity nudges (also settable in preferences).
+            ("<Control><Alt>Up", Action::OpacityUp),     // more opaque
+            ("<Control><Alt>Down", Action::OpacityDown), // more see-through
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {

@@ -37,6 +37,12 @@ impl Color {
     pub fn rgb(r: u8, g: u8, b: u8) -> Color {
         Color(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
     }
+
+    /// Return a copy of this colour with its alpha replaced. Used to turn the
+    /// opaque background colour into a translucent one at the requested opacity.
+    pub fn with_alpha(self, a: f32) -> Color {
+        Color(self.0, self.1, self.2, a) // keep rgb, set alpha
+    }
 }
 
 /// Where a rasterised glyph lives in the atlas plus how to place it on the
@@ -158,9 +164,14 @@ impl Renderer {
                 glow::PixelUnpackData::Slice(Some(&[255u8])),
             );
 
-            // Standard alpha blending so glyph coverage composites over the bg.
+            // PREMULTIPLIED alpha blending (ONE, ONE_MINUS_SRC_ALPHA). The
+            // fragment shader outputs premultiplied colour, which is what a
+            // Wayland compositor expects — this is what makes a translucent
+            // background composite correctly over whatever is behind the window.
+            // For fully-opaque content it is identical to straight blending, so
+            // normal rendering is unchanged.
             gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
 
             Ok(Renderer {
                 gl,
@@ -218,7 +229,8 @@ impl Renderer {
             out vec4 frag;
             void main() {
                 float cov = texture(u_atlas, v_uv).r; // glyph coverage / 1.0 for solids
-                frag = vec4(v_color.rgb, v_color.a * cov);
+                float a = v_color.a * cov;             // effective alpha of this fragment
+                frag = vec4(v_color.rgb * a, a);       // PREMULTIPLIED output (rgb scaled by alpha)
             }"#;
 
         // Helper closure to compile one shader stage and check for errors.
@@ -260,8 +272,12 @@ impl Renderer {
     /// Start a frame: clear the framebuffer to `bg` and reset the vertex buffer.
     pub fn begin_frame(&mut self, bg: Color) {
         self.verts.clear(); // drop last frame's geometry
+        // Clear to a PREMULTIPLIED background so the alpha channel carries the
+        // window's opacity: bg.3 < 1 makes the empty areas translucent, and the
+        // rgb is pre-scaled by that alpha to match the premultiplied blend mode.
+        let a = bg.3; // requested background opacity (1.0 = fully opaque)
         unsafe {
-            self.gl.clear_color(bg.0, bg.1, bg.2, bg.3); // set clear colour
+            self.gl.clear_color(bg.0 * a, bg.1 * a, bg.2 * a, a); // premultiplied clear
             self.gl.clear(glow::COLOR_BUFFER_BIT); // clear the colour buffer
         }
     }

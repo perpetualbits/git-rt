@@ -215,3 +215,38 @@ needed later.
 Workspace: 32 tests green (core 9, engine 3, config 6, session 9, rt 5).
 
 **Next:** M6 packaging, or rendering polish (grid colours + cursor).
+
+## 2026-07-06 — Session 1: the look + translucency; blur reality documented
+
+User asked how rt looks, and whether Terminator's translucent-background (and
+Gaussian blur, with a preferences slider) are available.
+
+**The look** (`docs/screenshots/hero.png`): a real session — `uname`, `git log`,
+`ls crates`. Clean DejaVu Sans Mono, dark theme (#101014 bg, #d0d0d8 fg), blue
+focus border, correct line-wrapping. Honest gaps still visible: monochrome (no
+grid colours yet) and no cursor block.
+
+**Translucency: implemented, native.** Switched the renderer to premultiplied-
+alpha compositing (`glBlendFunc(ONE, ONE_MINUS_SRC_ALPHA)`, fragment outputs
+`rgb·a, a`) — correct for compositor blending and identical to before for opaque
+content (verified opaque still renders crisply). Background clear carries the
+opacity; glyphs/chrome stay opaque so text is always readable. Controls:
+`Ctrl+Alt+Up/Down` (±5%), `RT_OPACITY` env. Config lives in `rt_config::Settings`.
+The composited see-through effect isn't capturable in this sandbox (no
+screencopy; xwd doesn't composite), so visual confirmation is on-machine; the
+math is standard.
+
+**Blur: documented the hard constraint** in `docs/APPEARANCE.md`. A Wayland
+client CANNOT blur what's behind its window — that's the compositor's job
+(security model). Options: KDE `org_kde_kwin_blur` (on/off + region; strength is
+a KWin global, NOT a client slider); Hyprland via compositor rules (no client
+protocol); sway/GNOME none. A client-controlled blur-*strength* slider is not
+achievable on Wayland. Portable alternative that DOES give a slider: a client
+"scrim" that reduces the legibility (contrast) of what shows through — not
+Gaussian blur, but meets the stated goal everywhere. **Awaiting user decision.**
+
+**Dev tooling:** added a `default`-off `x11` cargo feature so screenshots use
+`cargo run -p rt --features x11` without hand-editing Cargo.toml; release/default
+build stays Wayland-native (verified zero x11 crates).
+
+Workspace: 32 tests green.

@@ -17,6 +17,14 @@ path = "src/lib.rs"
 name = "rt"
 path = "src/main.rs"
 
+[features]
+default = []
+# DEV-ONLY: adds the X11/XWayland backends so the window can be captured with
+# `xwd` on compositors that lack wlr-screencopy (grim). Release packages are
+# built WITHOUT this feature, so shipped binaries stay Wayland-native (the
+# dependency tree keeps zero x11 crates). For screenshots: cargo run -p rt --features x11
+x11 = ["winit/x11", "glutin/glx", "glutin/x11", "glutin-winit/glx", "glutin-winit/x11"]
+
 [dependencies]
 rt-core = { path = "../rt-core" }
 rt-config = { path = "../rt-config" }
