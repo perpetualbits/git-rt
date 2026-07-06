@@ -55,6 +55,7 @@ impl Menu {
             Item::Action("Weaker Blur", Action::ScrimDown),
             Item::Separator,
             Item::Action("Toggle Focus-Follows-Mouse", Action::ToggleFocusFollowsMouse),
+            Item::Action("Preferences…", Action::Preferences),
         ];
         Menu { items, x, y, hovered: None }
     }

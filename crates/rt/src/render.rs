@@ -77,7 +77,7 @@ const FLOATS_PER_VERTEX: usize = 8;
 /// The renderer owns the GL objects, the font, the atlas, and the per-frame
 /// vertex scratch buffer.
 pub struct Renderer {
-    gl: glow::Context,                 // the live GL context (made current by caller)
+    gl: std::sync::Arc<glow::Context>, // the live GL context (shared with egui_glow via Arc)
     program: glow::Program,            // the single shader program
     vao: glow::VertexArray,            // vertex array object describing the layout
     vbo: glow::Buffer,                 // dynamic vertex buffer, re-uploaded each frame
@@ -109,7 +109,7 @@ impl Renderer {
     /// for solid fills, measures the monospace cell from the primary font, and is
     /// then ready for `begin_frame`/`draw_*`/`end_frame`. Returns an error string
     /// on any GL or font failure so `main` can report it instead of panicking.
-    pub fn new(gl: glow::Context, blobs: &FontBlobs, font_px: f32) -> Result<Self, String> {
+    pub fn new(gl: std::sync::Arc<glow::Context>, blobs: &FontBlobs, font_px: f32) -> Result<Self, String> {
         // Parse a slice of font blobs into `Font`s, skipping any that fail. Used
         // for each weight/style chain; only the regular primary is required.
         let parse_chain = |blobs: &[Vec<u8>], primary_required: bool| -> Result<Vec<Font>, String> {
@@ -315,6 +315,13 @@ impl Renderer {
         // rgb is pre-scaled by that alpha to match the premultiplied blend mode.
         let a = bg.3; // requested background opacity (1.0 = fully opaque)
         unsafe {
+            // Re-assert our GL state each frame: egui (painted last frame) leaves
+            // its own viewport/scissor/blend behind, so restore ours before we
+            // draw the terminal.
+            self.gl.viewport(0, 0, self.screen.0 as i32, self.screen.1 as i32); // full window
+            self.gl.disable(glow::SCISSOR_TEST); // egui uses scissor; we don't
+            self.gl.enable(glow::BLEND); // premultiplied-alpha blending (translucency)
+            self.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
             self.gl.clear_color(bg.0 * a, bg.1 * a, bg.2 * a, a); // premultiplied clear
             self.gl.clear(glow::COLOR_BUFFER_BIT); // clear the colour buffer
         }

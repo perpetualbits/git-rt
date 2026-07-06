@@ -63,12 +63,14 @@ pub enum Action {
     ScrimDown,
     /// rt-specific: toggle focus-follows-mouse (sloppy focus) on/off.
     ToggleFocusFollowsMouse,
+    /// Open/close the preferences dialog.
+    Preferences,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
 /// spirit). Kept minimal for now; a future preferences panel edits these and a
 /// config file persists them.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)] // missing fields in the file fall back to Default, so old/partial configs load
 pub struct Settings {
     /// Background opacity, `0.05..=1.0`. `1.0` is fully opaque; lower values let

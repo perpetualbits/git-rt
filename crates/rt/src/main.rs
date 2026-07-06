@@ -13,6 +13,7 @@
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod menu; // right-click context menu (Terminator-style)
+mod preferences; // egui preferences dialog
 mod render; // the GL glyph-atlas renderer
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
@@ -59,6 +60,10 @@ struct Active {
     clipboard: Option<smithay_clipboard::Clipboard>, // Wayland clipboard + PRIMARY (None on x11 dev builds)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
+    egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
+    egui_state: egui_winit::State,        // egui-winit input bridge
+    egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
+    prefs_open: bool,                     // whether the preferences dialog is showing
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -263,12 +268,14 @@ impl ApplicationHandler for App {
         };
 
         // --- load GL function pointers into glow -------------------------
-        let gl = unsafe {
+        // Wrapped in an Arc so the terminal renderer and egui_glow's painter
+        // share one live GL context (ADR-0004).
+        let gl = std::sync::Arc::new(unsafe {
             glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
-        };
+        });
 
         // --- build the renderer ------------------------------------------
-        let mut renderer = match Renderer::new(gl, &self.fonts, 18.0) {
+        let mut renderer = match Renderer::new(gl.clone(), &self.fonts, 18.0) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("renderer init failed: {e}");
@@ -363,6 +370,20 @@ impl ApplicationHandler for App {
             settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
         }
 
+        // egui overlay for chrome (preferences, colour pickers). Shares our GL
+        // context via egui_glow's painter; egui-winit bridges window input.
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_painter = egui_glow::Painter::new(gl.clone(), "", None, false)
+            .expect("failed to create egui painter");
+
         // Store the fully-initialised state and paint once.
         self.active = Some(Active {
             window,
@@ -379,7 +400,18 @@ impl ApplicationHandler for App {
             clipboard,
             selection: None,
             selecting: false,
+            egui_ctx,
+            egui_state,
+            egui_painter,
+            prefs_open: false,
         });
+        // Debug/verification hook: RT_PREFS opens the preferences dialog at
+        // startup so its egui rendering can be screenshotted.
+        if std::env::var("RT_PREFS").is_ok() {
+            if let Some(active) = self.active.as_mut() {
+                active.prefs_open = true;
+            }
+        }
         // Debug/verification hook: RT_MENU opens the context menu at startup so
         // its rendering can be screenshotted without synthetic mouse input.
         if std::env::var("RT_MENU").is_ok() {
@@ -402,6 +434,35 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Everything here needs the active state; ignore events before resume.
         let Some(active) = self.active.as_mut() else { return };
+
+        // While the preferences dialog is open, egui gets first look at events
+        // and terminal input is suspended (window lifecycle still flows through).
+        if active.prefs_open {
+            let r = active.egui_state.on_window_event(&active.window, &event);
+            if r.repaint {
+                active.window.request_redraw();
+            }
+            match event {
+                // Escape closes the dialog.
+                WindowEvent::KeyboardInput { event: ref ke, .. }
+                    if ke.state == ElementState::Pressed
+                        && matches!(ke.logical_key, Key::Named(NamedKey::Escape)) =>
+                {
+                    active.prefs_open = false;
+                    active.window.request_redraw();
+                    return;
+                }
+                // Swallow terminal input while the dialog is up.
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::ModifiersChanged(_) => return,
+                // Close / resize / redraw fall through to the normal handling.
+                _ => {}
+            }
+        }
 
         match event {
             // The user closed the window.
@@ -685,6 +746,10 @@ impl App {
                 active.settings.focus_follows_mouse = !active.settings.focus_follows_mouse; // flip mode
                 log::info!("focus-follows-mouse = {}", active.settings.focus_follows_mouse);
                 Self::persist(&active.settings);
+                active.window.request_redraw();
+            }
+            Action::Preferences => {
+                active.prefs_open = !active.prefs_open; // toggle the dialog
                 active.window.request_redraw();
             }
             // Everything else is a session action.
@@ -1018,10 +1083,48 @@ impl App {
         }
 
         active.renderer.end_frame(); // upload + draw call
+
+        // egui overlay (preferences dialog), painted on top of the terminal.
+        if active.prefs_open {
+            Self::paint_egui(active);
+        }
+
         // Present the frame.
         if let Err(e) = active.surface.swap_buffers(&active.context) {
             log::error!("swap_buffers failed: {e}"); // non-fatal; log and continue
         }
+    }
+
+    /// Run the egui preferences UI for this frame and paint it. Applies any
+    /// changed settings (persisting them) and closes the dialog when requested.
+    fn paint_egui(active: &mut Active) {
+        let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
+        let ctx = active.egui_ctx.clone(); // cheap Arc clone (avoids borrowing active in the closure)
+        let mut settings = active.settings; // Copy; the UI edits this local
+        let mut close = false; // set by the Close button
+        // egui 0.35 frame API: begin_pass → build UI → end_pass.
+        ctx.begin_pass(raw_input);
+        preferences::ui(&ctx, &mut settings, &mut close); // build the dialog
+        let output = ctx.end_pass();
+        // Apply + persist any change the user made.
+        if settings != active.settings {
+            active.settings = settings;
+            Self::persist(&settings);
+        }
+        if close {
+            active.prefs_open = false;
+        }
+        active.egui_state.handle_platform_output(&active.window, output.platform_output);
+        // Tessellate and paint egui's shapes over the current framebuffer.
+        let ppp = output.pixels_per_point;
+        let primitives = ctx.tessellate(output.shapes, ppp);
+        let size = active.window.inner_size();
+        active.egui_painter.paint_and_update_textures(
+            [size.width, size.height],
+            ppp,
+            &primitives,
+            &output.textures_delta,
+        );
     }
 }
 

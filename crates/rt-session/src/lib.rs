@@ -317,7 +317,8 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             | Action::OpacityDown
             | Action::ScrimUp
             | Action::ScrimDown
-            | Action::ToggleFocusFollowsMouse => None,
+            | Action::ToggleFocusFollowsMouse
+            | Action::Preferences => None,
         }
     }
 
