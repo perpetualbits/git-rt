@@ -384,7 +384,8 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             | Action::ZoomIn
             | Action::ZoomOut
             | Action::ZoomReset
-            | Action::Fullscreen => None,
+            | Action::Fullscreen
+            | Action::Search => None,
         }
     }
 

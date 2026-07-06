@@ -68,6 +68,11 @@ struct Active {
     egui_state: egui_winit::State,        // egui-winit input bridge
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
     prefs_open: bool,                     // whether the preferences dialog is showing
+    search_open: bool,                    // whether the scrollback-search bar is showing
+    search_query: String,                 // the current search text
+    search_matches: Vec<rt_engine::SearchMatch>, // hits for search_query in search_pane
+    search_index: usize,                  // which hit is the "current" one (highlighted brighter)
+    search_pane: Option<rt_core::PaneId>, // the pane the current matches belong to
     palette: std::sync::Arc<std::sync::Mutex<rt_engine::Palette>>, // shared so new panes inherit current colours
     font_db: std::sync::Arc<fontdb::Database>, // for reloading fonts on a family change
     font_blobs: render::FontBlobs,        // the current font chains (kept so a size change can reload)
@@ -509,6 +514,11 @@ impl ApplicationHandler for App {
             egui_state,
             egui_painter,
             prefs_open: false,
+            search_open: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_index: 0,
+            search_pane: None,
             palette,
             font_db: self.font_db.clone(),
             font_blobs,
@@ -530,6 +540,16 @@ impl ApplicationHandler for App {
                 let mut m = menu::Menu::new(200.0, 150.0); // fixed, visible spot
                 m.clamp(size.width as f32, size.height as f32, cw, ch);
                 active.menu = Some(m);
+            }
+        }
+        // Debug/verification hook: RT_SEARCH opens the search bar at startup with
+        // a pre-filled query so its rendering + highlighting can be screenshotted
+        // without synthetic keyboard input.
+        if let Ok(q) = std::env::var("RT_SEARCH") {
+            if let Some(active) = self.active.as_mut() {
+                active.search_open = true;
+                active.search_query = q; // e.g. RT_SEARCH=echo
+                Self::run_search(active, true); // populate matches + highlight
             }
         }
         // Poll so we keep re-checking PTYs for async output even without input.
@@ -569,6 +589,49 @@ impl ApplicationHandler for App {
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
                 // Close / resize / redraw fall through to the normal handling.
+                _ => {}
+            }
+        }
+
+        // The scrollback-search bar is a lighter overlay: it captures typing (via
+        // egui) and Enter/Escape for navigation, but leaves the terminal visible
+        // and lets mouse events (scroll/click) through so the user can still look
+        // around while a search is open.
+        if active.search_open {
+            // Enter = jump to next hit (Shift+Enter = previous); Escape closes.
+            if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+                if ke.state == ElementState::Pressed {
+                    match ke.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            Self::close_search(active);
+                            return;
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            let dir: isize = if active.mods.shift_key() { -1 } else { 1 };
+                            Self::search_step(active, dir);
+                            active.window.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Keep the modifier state current (Shift+Enter above needs it), since
+            // the normal ModifiersChanged handler is bypassed while searching.
+            if let WindowEvent::ModifiersChanged(m) = &event {
+                active.mods = m.state();
+            }
+            // Feed typing/edit keys to the egui text field.
+            let r = active.egui_state.on_window_event(&active.window, &event);
+            if r.repaint {
+                active.window.request_redraw();
+            }
+            // Swallow keyboard/IME so the terminal receives no input while typing
+            // a query; mouse and lifecycle events fall through to the normal path.
+            match event {
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::ModifiersChanged(_) => return,
                 _ => {}
             }
         }
@@ -867,6 +930,12 @@ impl ApplicationHandler for App {
                 _ => dirty = true, // a pane closed; repaint the survivors
             }
         }
+        // While the search bar is open, keep its results current as new output
+        // streams into the searched pane (so a running command's fresh lines are
+        // matched live). Re-run only on a change, and only when the query is set.
+        if dirty && active.search_open && !active.search_query.is_empty() {
+            Self::run_search(active, false); // live refresh; keep position + view
+        }
         if dirty {
             active.window.request_redraw(); // schedule a paint
         }
@@ -937,6 +1006,16 @@ impl App {
                 active.settings.font_size = rt_config::Settings::default().font_size;
                 Self::persist(&active.settings);
                 Self::refresh_fonts(active, false);
+                active.window.request_redraw();
+            }
+            Action::Search => {
+                // Open the scrollback-search bar for the focused pane, starting
+                // from a clean slate each time it is opened.
+                active.search_open = true;
+                active.search_query.clear();
+                active.search_matches.clear();
+                active.search_index = 0;
+                active.search_pane = Some(active.session.focus());
                 active.window.request_redraw();
             }
             Action::Fullscreen => {
@@ -1243,6 +1322,29 @@ impl App {
                 // The selection, if it belongs to this (single-column) pane.
                 let pane_sel: Option<Selection> = active.selection.filter(|s| n <= 1 && s.pane == id);
                 let sel_bg = Color::rgb(0x33, 0x44, 0x66); // selection highlight colour
+                // Scrollback-search highlights for this pane: which (row, col)
+                // cells fall inside a match. The current hit gets a brighter tint
+                // than the rest. Only for single-column panes (column-mode cell
+                // mapping is ambiguous). Maps each hit's absolute line to a
+                // snapshot row via the pane's current scroll offset.
+                let mut hl_cur: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+                let mut hl_other: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+                if active.search_open && active.search_pane == Some(id) && n <= 1 {
+                    let offset = pane.scroll_info().0 as i32; // lines scrolled up
+                    for (mi, m) in active.search_matches.iter().enumerate() {
+                        let row = m.line + offset; // absolute line → snapshot row
+                        if row < 0 || row as usize >= snap.rows.len() {
+                            continue; // off the visible screen
+                        }
+                        let row = row as usize;
+                        let set = if mi == active.search_index { &mut hl_cur } else { &mut hl_other };
+                        for c in m.col..m.col + m.len {
+                            set.insert((row, c)); // mark each cell of the hit
+                        }
+                    }
+                }
+                let cur_hl = Color::rgb(0xbb, 0x99, 0x22); // current match (brighter amber)
+                let other_hl = Color::rgb(0x5a, 0x4a, 0x10); // other matches (dim amber)
                 // One column's height in rows. For a single pane the whole
                 // snapshot stacks directly, so we use a sentinel that keeps the
                 // mapping a no-op.
@@ -1271,7 +1373,11 @@ impl App {
                     for (col_idx, cell) in row.iter().enumerate() {
                         // Selection highlight wins over the cell's own background;
                         // otherwise draw an explicit (non-default) background.
-                        if pane_sel.map_or(false, |s| s.contains(col_idx, sub)) {
+                        if hl_cur.contains(&(r, col_idx)) {
+                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, cur_hl);
+                        } else if hl_other.contains(&(r, col_idx)) {
+                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, other_hl);
+                        } else if pane_sel.map_or(false, |s| s.contains(col_idx, sub)) {
                             active.renderer.fill_cell(ox, rect.y, col_idx, sub, sel_bg);
                         } else if cell.bg != cfg_bg {
                             // A non-default background: draw it opaque (default-bg
@@ -1465,6 +1571,10 @@ impl App {
         if active.prefs_open {
             Self::paint_egui(active);
         }
+        // The scrollback-search bar, also an egui overlay, painted on top.
+        if active.search_open {
+            Self::paint_search(active);
+        }
 
         // Present the frame.
         if let Err(e) = active.surface.swap_buffers(&active.context) {
@@ -1525,6 +1635,125 @@ impl App {
             &primitives,
             &output.textures_delta,
         );
+    }
+
+    /// Run the scrollback-search bar UI for this frame and paint it. Draws a slim
+    /// bottom bar with the query field and a hit counter; re-runs the search when
+    /// the query text changes and jumps to the first hit.
+    fn paint_search(active: &mut Active) {
+        let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
+        let ctx = active.egui_ctx.clone(); // cheap Arc clone
+        let mut query = active.search_query.clone(); // the UI edits this clone
+        let mut close = false; // set by the ✕ button
+        let mut step: isize = 0; // set by the ▲/▼ buttons (prev/next)
+        let count = active.search_matches.len(); // hit count for the label
+        // Human 1-based position (0 of 0 when there are no hits).
+        let pos = if count == 0 { 0 } else { active.search_index + 1 };
+        ctx.begin_pass(raw_input);
+        egui::Window::new("rt_search")
+            .title_bar(false) // a bare bar, not a draggable window
+            .resizable(false)
+            .anchor(egui::Align2::LEFT_BOTTOM, [8.0, -8.0]) // pinned near the bottom-left
+            .show(&ctx, |ui| {
+                ui.horizontal(|ui| {
+                ui.label("Find:"); // prompt
+                // The text field: single-line so Enter is handled by us (winit),
+                // and auto-focused so typing lands here the moment the bar opens.
+                let edit = egui::TextEdit::singleline(&mut query).desired_width(240.0);
+                let resp = ui.add(edit);
+                resp.request_focus(); // keep the caret in the field every frame
+                ui.label(format!("{pos} / {count}")); // e.g. "3 / 12"
+                // ASCII labels: egui's default font lacks the arrow/✕ glyphs.
+                if ui.button("Prev").clicked() {
+                    step = -1; // previous hit
+                }
+                if ui.button("Next").clicked() {
+                    step = 1; // next hit
+                }
+                if ui.button("Close").clicked() {
+                    close = true; // close the bar
+                }
+                ui.label("(Enter next, Shift+Enter prev, Esc close)"); // hint
+            });
+        });
+        let output = ctx.end_pass();
+        // If the query text changed, re-run the search from scratch.
+        if query != active.search_query {
+            active.search_query = query;
+            Self::run_search(active, true); // new query → jump to the first hit
+        } else if step != 0 {
+            Self::search_step(active, step); // ▲/▼ navigation
+        }
+        if close {
+            Self::close_search(active);
+        }
+        active.egui_state.handle_platform_output(&active.window, output.platform_output);
+        let ppp = output.pixels_per_point;
+        let primitives = ctx.tessellate(output.shapes, ppp);
+        let size = active.window.inner_size();
+        active.egui_painter.paint_and_update_textures(
+            [size.width, size.height],
+            ppp,
+            &primitives,
+            &output.textures_delta,
+        );
+    }
+
+    /// Re-run the current search query against the focused pane and replace the
+    /// stored hits. When `jump` is true (the query just changed) it resets to the
+    /// first hit and scrolls it into view; when false (a live refresh as new
+    /// output arrives) it keeps the user's current hit position and does not
+    /// scroll, so streaming output never yanks the viewport around.
+    fn run_search(active: &mut Active, jump: bool) {
+        let pane_id = active.session.focus(); // search the focused pane
+        active.search_pane = Some(pane_id);
+        active.search_matches = match active.session.pane(pane_id) {
+            // Case-insensitive by default (the common expectation for find bars).
+            Some(pane) => pane.search(&active.search_query, false),
+            None => Vec::new(),
+        };
+        if jump {
+            // Fresh query: start at the first hit and bring it into view.
+            active.search_index = 0;
+            if let Some(m) = active.search_matches.first() {
+                if let Some(pane) = active.session.pane(pane_id) {
+                    pane.scroll_to_line(m.line);
+                }
+            }
+        } else {
+            // Live refresh: keep the position valid without moving the view.
+            active.search_index = active.search_index.min(active.search_matches.len().saturating_sub(1));
+        }
+        active.window.request_redraw();
+    }
+
+    /// Move to the next (`dir = 1`) or previous (`dir = -1`) search hit, wrapping
+    /// around the ends, and scroll it into view. No-op when there are no hits.
+    fn search_step(active: &mut Active, dir: isize) {
+        let count = active.search_matches.len();
+        if count == 0 {
+            return; // nothing to step through
+        }
+        // Wrap with modular arithmetic (add count before %-ing so -1 wraps up).
+        let next = ((active.search_index as isize + dir).rem_euclid(count as isize)) as usize;
+        active.search_index = next;
+        let line = active.search_matches[next].line; // the hit's absolute line
+        if let Some(pane_id) = active.search_pane {
+            if let Some(pane) = active.session.pane(pane_id) {
+                pane.scroll_to_line(line); // centre it in the viewport
+            }
+        }
+    }
+
+    /// Close the search bar and clear its state (matches + query), then redraw so
+    /// the highlights disappear.
+    fn close_search(active: &mut Active) {
+        active.search_open = false;
+        active.search_query.clear();
+        active.search_matches.clear();
+        active.search_index = 0;
+        active.search_pane = None;
+        active.window.request_redraw();
     }
 }
 

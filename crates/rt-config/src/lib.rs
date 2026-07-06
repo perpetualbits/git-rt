@@ -75,6 +75,8 @@ pub enum Action {
     Fullscreen,
     /// Maximise/restore the focused pane (Terminator's toggle_zoom).
     ToggleZoom,
+    /// Open the scrollback-search bar (find text in this pane's history).
+    Search,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -333,6 +335,7 @@ impl Keymap {
             ("<Control>0", Action::ZoomReset),
             ("F11", Action::Fullscreen),                 // fullscreen toggle
             ("<Shift><Control>x", Action::ToggleZoom),   // maximise/restore the focused pane
+            ("<Shift><Control>f", Action::Search),       // open the scrollback-search bar
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {

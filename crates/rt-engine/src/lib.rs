@@ -141,6 +141,20 @@ pub struct LineBounds {
     pub cols: usize,
 }
 
+/// One scrollback-search hit: an absolute grid line, the starting column, and
+/// the length in cells. Coordinates are in `alacritty_terminal`'s integer line
+/// space (negative = scrollback history, `0..screen_lines` = visible screen), so
+/// the caller can both scroll the hit into view and highlight the exact cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    /// Absolute grid line of the hit (`<= 0` in history).
+    pub line: i32,
+    /// Starting column of the hit.
+    pub col: usize,
+    /// Length of the hit in cells.
+    pub len: usize,
+}
+
 /// Fixed initial grid dimensions expressed as an `alacritty_terminal`
 /// `Dimensions`. The engine is told how many columns/lines it has; the renderer
 /// recomputes this from pixel size ÷ cell size and calls [`TermPane::resize`].
@@ -605,6 +619,69 @@ impl TermPane {
             out.push(line); // append this (possibly blank) line
         }
         Snapshot { cols, rows: out, cursor: None }
+    }
+
+    /// Search the whole grid (scrollback history + visible screen) for `needle`,
+    /// returning every hit top-to-bottom. A plain substring search — not a regex
+    /// — matched cell-by-cell so it lines up exactly with the rendered grid; wide
+    /// glyphs and colours are ignored (only the character content matters).
+    /// `case_sensitive == false` folds ASCII/Unicode case on both sides.
+    ///
+    /// This is rt's answer to the scrollback-search Terminator never had. It runs
+    /// under one lock and allocates only per line, so even a full 10k-line buffer
+    /// searches in a few milliseconds.
+    pub fn search(&self, needle: &str, case_sensitive: bool) -> Vec<SearchMatch> {
+        use alacritty_terminal::index::{Column, Line}; // integer grid coordinates
+        if needle.is_empty() {
+            return Vec::new(); // an empty needle matches nothing (avoids a match storm)
+        }
+        // Fold one char to a single lowercase char for case-insensitive compares
+        // (first char of its lowercase mapping — good enough for terminal text).
+        let fold = |c: char| -> char {
+            if case_sensitive { c } else { c.to_lowercase().next().unwrap_or(c) }
+        };
+        let needle_chars: Vec<char> = needle.chars().map(fold).collect(); // folded needle
+        let nlen = needle_chars.len(); // length in cells
+        let term = self.term.lock(); // read access for the whole scan
+        let grid = term.grid(); // the cell storage
+        let cols = term.columns(); // width of every line
+        let topmost = term.topmost_line().0; // oldest readable line
+        let bottommost = term.bottommost_line().0; // newest readable line
+        let mut out = Vec::new(); // accumulates hits in reading order
+        for idx in topmost..=bottommost {
+            let row = &grid[Line(idx)]; // borrow this line
+            // Fold the whole line to a char vector so column index == char index.
+            let hay: Vec<char> = (0..cols).map(|c| fold(row[Column(c)].c)).collect();
+            if nlen > hay.len() {
+                continue; // needle longer than the line: no hit possible
+            }
+            // Slide a window of the needle's width across the line.
+            for start in 0..=(hay.len() - nlen) {
+                if hay[start..start + nlen] == needle_chars[..] {
+                    out.push(SearchMatch { line: idx, col: start, len: nlen });
+                }
+            }
+        }
+        out
+    }
+
+    /// Scroll the view so absolute grid line `line` sits near the vertical centre
+    /// of the screen (for jumping to a search hit). Clamps to the valid scroll
+    /// range: it will not scroll below the newest line or above the oldest
+    /// history. Takes `&self` because it locks the shared `Term`.
+    pub fn scroll_to_line(&self, line: i32) {
+        use alacritty_terminal::grid::Scroll; // the scroll command enum
+        let mut term = self.term.lock(); // exclusive access to move the viewport
+        let screen = term.screen_lines() as i32; // viewport height
+        let history = term.history_size() as i32; // how far up we may scroll
+        let current = term.grid().display_offset() as i32; // current scroll amount
+        // A cell at absolute `line` renders at viewport row `line + offset`; to
+        // centre it we want that row ≈ screen/2, so offset = screen/2 - line.
+        let desired = (screen / 2 - line).clamp(0, history); // clamp to the scrollable range
+        let delta = desired - current; // relative move scroll_display expects
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta)); // shift the viewport
+        }
     }
 
     /// Remove and return all pending high-level events (title/bell/exit/wakeup)

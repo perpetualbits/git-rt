@@ -47,18 +47,21 @@ Where the widget toolkit pays off.
    18px); rebuild the renderer's font chains on change. (cat. §2)
 
 ## Phase 2 — Terminal UX parity
-9.  **Mouse selection + copy-on-select** (word/line select via `word_chars`),
-    feeding Copy. (cat. §2, §5)
-10. **URL/regex detection + open** (hover highlight, click/Ctrl-click to open via
-    xdg-open); ships URL/regex matching as a built-in. (cat. §5, §11)
-11. **Pane zoom / maximise** (toggle_zoom, scaled_zoom). (cat. §3, §4)
+9.  **Mouse selection + copy-on-select** ✅ — drag-select copies on release;
+    double-click selects the word, triple-click the line; all copy to PRIMARY.
+    (cat. §2, §5)
+10. **URL detection + open** ✅ — Ctrl+click on an http/https/ftp/file/mailto URL
+    opens it via xdg-open (trailing sentence punctuation trimmed). (cat. §5, §11)
+11. **Pane zoom / maximise** ✅ — toggle_zoom (Ctrl+Shift+X / menu). (cat. §3, §4)
 12. **Rotate / resize / auto splits** (rotate_cw/ccw, resize_*; split_auto picks
-    the longer axis). Drag-to-resize the split gutter. (cat. §3, §4)
-13. **Scrollback search bar** `[user — wants this specifically]` in-terminal find
-    over the whole scrollback buffer; drive `alacritty_terminal`'s `RegexSearch`;
-    egui or a simple hand-drawn bar; Match-Case / Wrap / Invert; highlight hits
-    and jump between them. (cat. §9)
-14. **Bell** (visible flash — engine already emits Bell; + urgent hint). (cat. §2)
+    the longer axis). Drag-to-resize the split gutter ✅. (cat. §3, §4)
+13. **Scrollback search bar** ✅ `[user — wanted this specifically]` — Ctrl+Shift+F
+    (or menu) opens a find bar over the whole scrollback; case-insensitive
+    substring match; every hit highlighted (current hit brighter), Enter/Shift+Enter
+    (or Next/Prev) to jump, results refresh live as output streams in, Esc closes.
+    Implemented as a plain cell-accurate search (not RegexSearch) so highlights
+    line up exactly with the grid. (cat. §9)
+14. **Bell** ✅ — visible flash (translucent white overlay, 150ms). (cat. §2)
 15. **Per-pane titlebar** with editable title + size text (optional, config
     `show_titlebar`). (cat. §4)
 16. **Scrollbar UI** + scrollback config (position, infinite). (cat. §2)
