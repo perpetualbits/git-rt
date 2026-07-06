@@ -120,5 +120,74 @@ Legend for rt status is applied in `ROADMAP.md`; this file is the raw catalogue.
 - **Search bar** (incremental scrollback search, next/prev, case, invert, wrap).
   — rt ☐.
 
-<!-- Section 5 (context menu, preferences UI widgets, plugins, grouping detail,
-     IPC/remotinator) is appended from the second inventory pass. -->
+## 5. Context menu (`terminal_popup_menu.py`) — rt ◐
+
+On a URL match: Open link / Send email / Call VoIP + Copy address, sep. Then:
+**Copy · Paste**, sep · **Set Window Title** · **Split Auto/Horizontally/
+Vertically · Open Tab**, sep · **Close**, sep · **Zoom / Maximize terminal**
+(or Restore all when zoomed) · **Grouping** submenu · Relaunch Command (held) ·
+**Read only** ✔ · **Show scrollbar** ✔ · **Preferences** · **_Colors** theme
+submenu (Solarized/Monokai/Dracula/Gruvbox/Nord/… + Custom colour dialog) ·
+**Profiles** radio submenu · **Layouts…** submenu · plugin items.
+rt today: Split H/V, New Tab, Close, Columns, Opacity/Scrim, Focus-follows-mouse.
+
+## 6. Preferences dialog (`preferences.glade`, `prefseditor.py`) — rt ☐
+
+Notebook: **Global · Profiles · Layouts · Keybindings · Plugins · About**.
+- **Global** → Behaviour (window state, always-on-top, hide-on-lose-focus, DBus,
+  detachable tabs, ask-before-closing, mouse-focus, broadcast-default, PuTTY
+  paste, smart-copy, single-click-link, …) + Appearance (borders, unfocused
+  brightness slider, separator size, cell w/h sliders, tab position, homogeneous
+  tabs, title-at-bottom, new-tab-after-current, decoration style).
+- **Profiles** → list + Add/Remove/Copy, and 7 sub-tabs: General (font chooser,
+  cursor shape/blink/colour pickers, bell), Command (login shell, custom command,
+  exit action), **Colors** (fg/bg swatches, 11 scheme presets, **16-colour
+  palette editor**, bold-is-bright), Background (solid/transparent/image + image
+  chooser + darkness slider + KDE blur), Scrolling (scrollbar position, scroll-on-
+  output/keystroke, infinite, **scrollback-lines spinner**), Compatibility
+  (backspace/delete bindings), Titlebar (6 colour pickers + font).
+- **Layouts** → layout list + hierarchy tree + per-node profile/command/cwd.
+- **Keybindings** → tree of ~90 actions with an accelerator-capture cell.
+- **Plugins** → enable/disable toggle list.
+
+**Rich widgets a reimplementation needs (→ egui, ADR-0004):** ~8 colour buttons
++ 18 custom colour swatches (fg/bg + 16-palette), 2 font choosers, 1 image
+chooser, ~17 combos, spinbutton, 6 sliders, 5 tree/list views, an accelerator
+capture, ~41 checkboxes, radio groups.
+
+## 7. Grouping / broadcast (`terminator.py`, `titlebar.py`) — rt ◐
+
+Per-terminal group name; global broadcast mode all/group/off. Group titlebar
+with clickable group icon + editable label, colour-coded by transmit/receive/
+inactive. Group menu: New group…, existing groups (radio) + None, Remove group,
+Group/Ungroup all in window/tab, Broadcast all/group/off, Split-to-group,
+Autoclean-groups, Insert number / padded number / name. Auto-named groups.
+rt today: broadcast off/group/all routing in the session; no titlebar/menu/keys.
+
+## 8. Layouts (`layout.py`, `layoutlauncher.py`) — rt ◐
+
+Layout = serialized window/paned/notebook/terminal tree (position, profile,
+command, cwd, group). Save via prefs or session plugins; launch via `-l name` or
+the layout launcher (treeview + double-click). rt today: RT_SPLIT/RT_COLUMNS/
+RT_TABS startup hooks are the seed; no save/load/launcher.
+
+## 9. Search bar (`searchbar.py`) — rt ☐
+
+In-terminal scrollback find: entry, Prev/Next, Match-Case / Wrap / Invert
+checkboxes; Esc closes. (alacritty_terminal has a `RegexSearch` we can drive.)
+
+## 10. IPC / remotinator (`ipc.py`) — rt ☐
+
+DBus service exposing: new_window, new_tab, hsplit, vsplit, get_terminals,
+get_focused_terminal, get/set tab title, bg_img, switch_profile,
+reload_configuration, toggle_visibility, … + CLI `-u/-p/-f/-x/-t/-T`. A scripting
+surface; rt could expose an equivalent over a Unix socket or zbus/DBus.
+
+## 11. Plugins (`plugins/*.py`) — rt ☐
+
+activitywatch (activity/silence alerts), auto_theme (follow system dark/light),
+command_notify (notify on long command finish), custom_commands (user command
+menu), dir_open (open cwd in file manager), insert_term_name, logger (log
+scrollback to file), url_handlers (Launchpad/apt/maven), mousefree_url_handler
+(keyboard URL nav), remote (clone SSH/docker sessions into splits),
+run_cmd_on_match (regex→command), save_*_session_layout, terminalshot (PNG).
