@@ -36,7 +36,7 @@ use render::{Color, Renderer};
 use rt_config::Keymap;
 use rt_core::Rect;
 use rt_engine::TermPane;
-use rt_session::{Session, SessionEvent};
+use rt_session::{Broadcast, Session, SessionEvent};
 
 /// The concrete session type used by the app: real PTY panes, spawned by a
 /// boxed closure (boxed so the `Session`'s factory type is nameable in a field).
@@ -455,6 +455,13 @@ impl ApplicationHandler for App {
                     session.apply(rt_config::Action::NewTab);
                 }
             }
+        }
+        if let Ok(v) = std::env::var("RT_BROADCAST") {
+            let _ = match v.as_str() {
+                "all" => session.apply(rt_config::Action::BroadcastAll),
+                "group" => session.apply(rt_config::Action::BroadcastGroup),
+                _ => None,
+            };
         }
 
         // egui overlay for chrome (preferences, colour pickers). Shares our GL
@@ -1229,6 +1236,26 @@ impl App {
                 }
                 // Right separator between tabs.
                 active.renderer.fill_rect(r.right() - 1.0, r.y, 1.0, r.h, tab_line);
+            }
+        }
+
+        // Broadcast indicator: when typed input is being fanned out to more than
+        // the focused pane, draw a bold coloured border around the whole window
+        // (red = all panes, orange = group) so it's never a surprise.
+        match active.session.broadcast() {
+            Broadcast::Off => {}
+            mode => {
+                let col = if matches!(mode, Broadcast::All) {
+                    Color::rgb(0xd9, 0x4a, 0x4a) // red: broadcasting to ALL panes
+                } else {
+                    Color::rgb(0xd9, 0x90, 0x4a) // orange: broadcasting to the group
+                };
+                let t = 3.0; // border thickness
+                let (w, h) = (bounds.w, bounds.h);
+                active.renderer.fill_rect(0.0, 0.0, w, t, col); // top
+                active.renderer.fill_rect(0.0, h - t, w, t, col); // bottom
+                active.renderer.fill_rect(0.0, 0.0, t, h, col); // left
+                active.renderer.fill_rect(w - t, 0.0, t, h, col); // right
             }
         }
 
