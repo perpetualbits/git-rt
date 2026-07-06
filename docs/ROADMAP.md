@@ -54,9 +54,10 @@ Where the widget toolkit pays off.
 11. **Pane zoom / maximise** (toggle_zoom, scaled_zoom). (cat. §3, §4)
 12. **Rotate / resize / auto splits** (rotate_cw/ccw, resize_*; split_auto picks
     the longer axis). Drag-to-resize the split gutter. (cat. §3, §4)
-13. **Search bar** (in-terminal scrollback find; drive `alacritty_terminal`'s
-    `RegexSearch`; egui or a simple hand-drawn bar; Match-Case/Wrap/Invert).
-    (cat. §9)
+13. **Scrollback search bar** `[user — wants this specifically]` in-terminal find
+    over the whole scrollback buffer; drive `alacritty_terminal`'s `RegexSearch`;
+    egui or a simple hand-drawn bar; Match-Case / Wrap / Invert; highlight hits
+    and jump between them. (cat. §9)
 14. **Bell** (visible flash — engine already emits Bell; + urgent hint). (cat. §2)
 15. **Per-pane titlebar** with editable title + size text (optional, config
     `show_titlebar`). (cat. §4)

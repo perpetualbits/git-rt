@@ -1175,6 +1175,27 @@ impl App {
                         active.renderer.fill_rect(x, rect.y, 1.0, rect.h, sep); // 1px vertical rule
                     }
                 }
+
+                // Scrollbar on the right edge, shown when the pane has scrollback.
+                let (offset, history, screen) = pane.scroll_info();
+                if history > 0 {
+                    let total = (history + screen) as f32; // whole buffer height in lines
+                    let bw = 6.0; // scrollbar width
+                    let bx = rect.right() - bw - 1.0; // inset slightly from the edge
+                    // Track + thumb; thumb sized/placed by the visible fraction and
+                    // how far we're scrolled up. Brighter when scrolled off bottom.
+                    active.renderer.fill_rect(bx, rect.y, bw, rect.h, Color::rgb(0x22, 0x22, 0x2c));
+                    let thumb_h = (screen as f32 / total * rect.h).max(24.0); // min grabbable size
+                    let thumb_y = (rect.y + (history - offset) as f32 / total * rect.h)
+                        .min(rect.bottom() - thumb_h) // keep inside the pane
+                        .max(rect.y);
+                    let thumb_col = if offset > 0 {
+                        Color::rgb(0x88, 0x88, 0x9a) // scrolled up: highlight
+                    } else {
+                        Color::rgb(0x55, 0x55, 0x66) // at the bottom: dimmer
+                    };
+                    active.renderer.fill_rect(bx, thumb_y, bw, thumb_h, thumb_col);
+                }
             }
             // Outline the focused pane with a thin border (four thin rects).
             if id == focus {

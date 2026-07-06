@@ -521,6 +521,18 @@ impl TermPane {
         term.scroll_display(Scroll::Delta(delta as i32)); // shift by whole lines
     }
 
+    /// Scrollbar state: `(offset, history, screen)` — how many lines the view is
+    /// scrolled up (`offset`, 0 = at the bottom), the number of scrollback lines
+    /// (`history`), and the visible height (`screen`). The renderer uses this to
+    /// draw a scrollbar thumb. `history == 0` means nothing to scroll.
+    pub fn scroll_info(&self) -> (usize, usize, usize) {
+        let term = self.term.lock(); // read the grid metrics
+        let offset = term.grid().display_offset(); // lines scrolled up
+        let history = term.history_size(); // scrollback line count
+        let screen = term.screen_lines(); // visible rows
+        (offset, history, screen)
+    }
+
     /// The line-index bounds of everything currently in the grid, so a caller
     /// (notably newspaper-column view) can compute which slice of the line
     /// buffer to show and how far it may scroll.
