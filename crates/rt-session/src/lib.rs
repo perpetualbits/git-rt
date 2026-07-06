@@ -263,7 +263,11 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             // the GUI shell, not the session — it holds no window handle. The
             // binary intercepts these before dispatch; this arm keeps `apply`
             // total.
-            Action::OpacityUp | Action::OpacityDown | Action::ScrimUp | Action::ScrimDown => None,
+            Action::OpacityUp
+            | Action::OpacityDown
+            | Action::ScrimUp
+            | Action::ScrimDown
+            | Action::ToggleFocusFollowsMouse => None,
         }
     }
 

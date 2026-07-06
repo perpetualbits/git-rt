@@ -61,8 +61,11 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   focused. Unit-tested (`click_to_focus_selects_pane_under_point`). This also
   explains the earlier "menu items don't work": Close etc. WERE working, just on
   the focused (last) pane rather than the right-clicked one.
-- ☐ **Focus-follows-mouse** not implemented (easy opt-in via a setting + the
-  existing `focus_at` on CursorMoved) — left as a future option.
+- ☑ **Focus-follows-mouse (sloppy focus)** implemented as an opt-in: enable via
+  `RT_FOCUS=sloppy` at startup, the menu's "Toggle Focus-Follows-Mouse", or the
+  `ToggleFocusFollowsMouse` action. On CursorMoved it focuses the pane under the
+  pointer (repainting only when focus changes); over a gutter the focus sticks
+  (sloppy). Default remains click-to-focus.
 - ☐ **New Tab has no visible tab strip.** It works (adds a tab, switches to it)
   but with no tab bar it looks like the pane was replaced. Needs a tab-strip UI.
 - ☐ **Opacity/Blur menu items need a compositing compositor.** They change the

@@ -287,6 +287,10 @@ impl ApplicationHandler for App {
                 settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM); // clamp scrim range
             }
         }
+        // RT_FOCUS=sloppy|mouse|follow|1 enables focus-follows-mouse at startup.
+        if let Ok(v) = std::env::var("RT_FOCUS") {
+            settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
+        }
 
         // Store the fully-initialised state and paint once.
         self.active = Some(Active {
@@ -381,6 +385,15 @@ impl ApplicationHandler for App {
                     let (cw, ch) = active.renderer.cell_size(); // cell metrics for hit layout
                     if m.set_hover(active.mouse.0, active.mouse.1, cw, ch) {
                         active.window.request_redraw(); // hovered row changed
+                    }
+                } else if active.settings.focus_follows_mouse {
+                    // Sloppy focus: focus the pane under the pointer. Only redraw
+                    // when focus actually changes (not on every motion), and only
+                    // when a pane is hit (over a gutter, focus sticks).
+                    let before = active.session.focus();
+                    active.session.focus_at(active.mouse.0, active.mouse.1);
+                    if active.session.focus() != before {
+                        active.window.request_redraw(); // repaint the focus border
                     }
                 }
             }
@@ -499,6 +512,11 @@ impl App {
             Action::ScrimDown => {
                 let v = active.settings.adjust_scrim(-0.05); // weaker wash
                 log::info!("scrim strength = {v:.2}");
+                active.window.request_redraw();
+            }
+            Action::ToggleFocusFollowsMouse => {
+                active.settings.focus_follows_mouse = !active.settings.focus_follows_mouse; // flip mode
+                log::info!("focus-follows-mouse = {}", active.settings.focus_follows_mouse);
                 active.window.request_redraw();
             }
             // Everything else is a session action.

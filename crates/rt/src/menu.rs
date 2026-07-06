@@ -53,6 +53,8 @@ impl Menu {
             Item::Action("More Transparent", Action::OpacityDown),
             Item::Action("Stronger Blur", Action::ScrimUp),
             Item::Action("Weaker Blur", Action::ScrimDown),
+            Item::Separator,
+            Item::Action("Toggle Focus-Follows-Mouse", Action::ToggleFocusFollowsMouse),
         ];
         Menu { items, x, y, hovered: None }
     }

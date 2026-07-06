@@ -17,3 +17,8 @@ Cargo.lock.orig
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# Stray top-level dump files (e.g. an accidental `ls -R > 1`) that git add -A
+# would otherwise sweep in. See the 201MB file-1 incident.
+/1
+/2

@@ -61,6 +61,8 @@ pub enum Action {
     ScrimUp,
     /// rt-specific: weaken the background scrim (more legible behind).
     ScrimDown,
+    /// rt-specific: toggle focus-follows-mouse (sloppy focus) on/off.
+    ToggleFocusFollowsMouse,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -79,14 +81,20 @@ pub struct Settings {
     /// stand-in for background blur (see `docs/APPEARANCE.md`): a Wayland client
     /// can't blur what's behind it, but it can wash out its legibility.
     pub scrim_strength: f32,
+    /// When true, moving the mouse over a pane focuses it (sloppy focus). When
+    /// false (default), focus changes only on click. In rt sloppy and strict
+    /// pointer-focus coincide, since a pane is always focused (over a gutter the
+    /// previous focus simply sticks).
+    pub focus_follows_mouse: bool,
 }
 
 impl Default for Settings {
-    /// Sensible defaults: fully opaque, no scrim — a normal terminal.
+    /// Sensible defaults: fully opaque, no scrim, click-to-focus.
     fn default() -> Self {
         Settings {
-            background_opacity: 1.0, // opaque until the user dials it down
-            scrim_strength: 0.0,     // no scrim until the user enables it
+            background_opacity: 1.0,     // opaque until the user dials it down
+            scrim_strength: 0.0,         // no scrim until the user enables it
+            focus_follows_mouse: false,  // click-to-focus by default
         }
     }
 }
