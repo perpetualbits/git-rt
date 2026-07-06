@@ -68,7 +68,20 @@ compresses the contrast range of what shows through — so text below goes
 unreadable while a bright button or moving video stays perceptible. Combining a
 low opacity with a moderate scrim is the "see it, can't read it" sweet spot.
 
-### Decision (session 1): scrim slider + KWin blur
+### Decision (session 1): scrim slider + KWin blur — both implemented
 User chose the portable scrim (built) **plus** requesting true compositor blur on
 KDE/KWin as a bonus (their daily drivers are COSMIC + GNOME, which have no
-compositor blur). KWin blur request status: see below / porting log.
+compositor blur).
+
+**KWin blur: implemented** in `crates/rt/src/blur.rs`. On startup rt wraps
+winit's `wl_display` in its own connection, does one registry roundtrip, and — if
+the compositor advertises `org_kde_kwin_blur_manager` — reconstructs winit's
+`wl_surface` and requests blur over the whole surface. It is a safe no-op
+everywhere else. wayland-client routes each proxy's events to its owning queue,
+so our setup roundtrip buffers rather than steals winit's events.
+- **Verified safe** on a non-KDE compositor: it logs "blur manager not
+  advertised (non-KDE?); relying on the scrim" and the app runs normally — the
+  foreign-display integration does not disturb winit's loop.
+- **Not yet verified on live KWin** (no KDE session available here). The protocol
+  calls are correct by construction; confirm on a KDE box that the window gains
+  a real blur behind it.

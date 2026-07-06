@@ -1424,6 +1424,8 @@ dependencies = [
  "rt-core",
  "rt-engine",
  "rt-session",
+ "wayland-client",
+ "wayland-protocols-plasma",
  "winit",
 ]
 

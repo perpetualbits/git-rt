@@ -48,3 +48,9 @@ glow = "0.16"                        # safe-ish OpenGL wrapper (simpler than raw
 fontdue = "0.9"                      # CPU glyph rasteriser feeding the GL atlas
 log = "0.4"                          # diagnostics
 env_logger = "0.11"                  # RUST_LOG-driven logging for the binary
+# KDE/KWin background-blur request (org_kde_kwin_blur). Both crates are already
+# in the tree via winit, so depending on them directly adds no new crates; it
+# just lets rt ask KWin to blur behind its surface. No-op on non-KDE. The
+# versions must match winit's so the shared wl_surface object is compatible.
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }

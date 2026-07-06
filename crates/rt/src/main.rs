@@ -10,6 +10,7 @@
 //! becomes an `Action` fed to `Session::apply`; a miss becomes PTY bytes via
 //! `encode_key` fed to `Session::feed_input` (respecting broadcast mode).
 
+mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod render; // the GL glyph-atlas renderer
 
@@ -177,6 +178,10 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        // Ask KWin to blur behind us (true background blur on KDE). No-op on
+        // COSMIC/GNOME/sway, where the portable scrim does the job instead.
+        blur::try_enable_kwin_blur(&window);
+
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.inner_size(); // physical pixel size
         renderer.resize(size.width as f32, size.height as f32);
