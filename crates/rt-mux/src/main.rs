@@ -1,0 +1,576 @@
+//! `rt-mux` — a text-mode (tmux-style) terminal multiplexer.
+//!
+//! This is rt's *text-mode sibling*. Where the `rt` binary is a Wayland/GL
+//! terminal that draws its own pixels, `rt-mux` runs **inside any terminal** and
+//! draws with characters — yet it reuses the exact same terminal engine
+//! (`rt-engine`, itself a thin wrapper over `alacritty_terminal`). One engine,
+//! two front-ends.
+//!
+//! The whole design is *cells into cells*:
+//!   * [`mullion`] is a ratatui-shaped TUI tiling engine. It owns the frame: a
+//!     tree of tiles, a diffing double-buffer, borders, focus/zoom, and input.
+//!     Hosting real subprocess terminals is a documented *non-goal* it leaves to
+//!     "a future consumer" — which is exactly us.
+//!   * Each mullion leaf tile hosts one [`rt_engine::TermPane`] (a PTY + shell +
+//!     ANSI grid). Every frame we ask mullion for each tile's content rectangle,
+//!     take the pane's [`Snapshot`](rt_engine::Snapshot) (a grid of
+//!     `char + fg/bg + attrs`), and **blit** it cell-for-cell into mullion's
+//!     `Buffer`. mullion then diffs and flushes only what changed.
+//!
+//! Because the pane snapshot and the mullion cell share the same shape, the
+//! adapter is trivial: an `Rgb` becomes a `Color::Rgb`, a `CellAttrs` becomes a
+//! `Modifier`, and `buf.set_char` writes it. Splitting, focus, zoom and borders
+//! are all mullion's; the PTY layer is all rt-engine's; this file is only the
+//! seam between them.
+
+use std::collections::HashMap; // tile id -> pane, and tile id -> title
+use std::io::{self, Stdout}; // stdout backend + Result
+use std::time::{Duration, Instant}; // frame pacing
+
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers}; // input events (mullion's crossterm)
+
+use mullion::backend::{Backend, CrosstermBackend}; // Backend trait (size) + the real terminal backend
+use mullion::border::{render_shared, BorderStyle, CornerStyle, LineWeight}; // shared-seam borders
+use mullion::buffer::Buffer; // the cell buffer we paint into
+use mullion::capabilities::Capabilities; // terminal feature probe (colour depth, unicode…)
+use mullion::geometry::Rect; // tile rectangles
+use mullion::layout::{Constraint, Node, Orientation, TileId}; // the layout tree
+use mullion::style::{Color, Modifier, Style}; // cell colours + attributes
+use mullion::terminal::{EventReader, Terminal}; // double-buffer driver + threaded input
+use mullion::tree::{focus_override, Direction, Tree}; // focus/zoom wrapper + focus-thickening
+
+use rt_engine::{PaneEvent, TermPane}; // the terminal engine (PTY + alacritty grid)
+
+/// The prefix key that introduces a multiplexer command, tmux-style. We use
+/// `Ctrl-a`; pressing it twice sends a literal `Ctrl-a` to the focused shell.
+const PREFIX: char = 'a';
+
+/// Target frame period. We repaint the whole buffer every frame and let mullion
+/// diff it, mirroring aerie's `spiral_stress` loop; ~60 fps is smooth and the
+/// per-pane snapshot is cheap.
+const FRAME: Duration = Duration::from_millis(16);
+
+/// The whole multiplexer: the mullion layout tree, one engine pane per leaf, the
+/// per-pane titles, and the small amount of interaction state.
+struct Mux {
+    /// mullion's focus/zoom-aware layout tree. Its leaves are `Node::Tile(id)`;
+    /// each `id` keys a pane in `panes`.
+    tree: Tree,
+    /// One terminal engine (PTY + shell) per visible tile.
+    panes: HashMap<TileId, TermPane>,
+    /// Latest OSC/shell title per pane, shown in its titlebar.
+    titles: HashMap<TileId, String>,
+    /// Monotonic id allocator for new tiles (never reused, so stale ids are inert).
+    next_id: TileId,
+    /// True while we are between the prefix key and its command key.
+    prefix_armed: bool,
+    /// The tiling area from the last frame, used by directional focus (which
+    /// needs a viewport but runs before the next draw computes one).
+    area: Rect,
+}
+
+impl Mux {
+    /// Build the multiplexer with a single pane filling `area` (minus the outer
+    /// border). Fails only if the first PTY cannot be spawned.
+    fn new(area: Rect) -> io::Result<Self> {
+        let mut mux = Mux {
+            tree: Tree::new(Node::Tile(1)), // start with one leaf, id 1
+            panes: HashMap::new(),
+            titles: HashMap::new(),
+            next_id: 2, // 1 is taken by the first pane
+            prefix_armed: false,
+            area,
+        };
+        // Size the first pane to the content area (screen minus the 1-cell frame).
+        let cols = area.width.saturating_sub(2).max(1) as usize;
+        let rows = area.height.saturating_sub(2).max(1) as usize;
+        let pane = TermPane::spawn(None, None, cols, rows)?; // None = default login shell
+        mux.panes.insert(1, pane);
+        mux.tree.focus_set(1); // focus the only pane
+        Ok(mux)
+    }
+
+    /// Spawn a fresh engine pane at a placeholder size (the next frame resizes it
+    /// to its real rectangle) and register it under a new id. Returns the id, or
+    /// `None` if the PTY could not be created.
+    fn spawn_pane(&mut self) -> Option<TileId> {
+        // 80x24 is only a seed; `render` resizes every pane to its tile each frame.
+        match TermPane::spawn(None, None, 80, 24) {
+            Ok(pane) => {
+                let id = self.next_id; // allocate a never-reused id
+                self.next_id += 1;
+                self.panes.insert(id, pane);
+                Some(id)
+            }
+            Err(_) => None, // out of ptys/fds: refuse the split rather than crash
+        }
+    }
+
+    /// Split the focused tile along `orient`, spawning a new pane in the freed
+    /// half and moving focus to it. Un-zooms first so the edit targets the real
+    /// tree, not a zoomed subtree.
+    fn split(&mut self, orient: Orientation) {
+        if self.tree.is_zoomed() {
+            self.tree.zoom_reset(); // structural edits operate on the full tree
+        }
+        let Some(focus) = self.tree.focus() else { return };
+        let Some(new_id) = self.spawn_pane() else { return }; // no pane → no split
+        // Replace the focused `Tile` leaf with a 2-child `Split`.
+        if split_tile(self.tree.root_mut(), focus, new_id, orient) {
+            self.tree.ensure_focus_valid(); // the tree shape changed
+            self.tree.focus_set(new_id); // focus follows the split, like Terminator/tmux
+        } else {
+            self.panes.remove(&new_id); // couldn't place it: reap the orphan pane
+        }
+    }
+
+    /// Close tile `id`: drop its pane (which shuts the PTY down via `Drop`) and
+    /// prune it from the tree, collapsing any split left with a single child.
+    /// Returns `true` when no panes remain (the caller should quit).
+    fn close_tile(&mut self, id: TileId) -> bool {
+        if !self.panes.contains_key(&id) {
+            return false; // unknown/stale id: nothing to do
+        }
+        if self.tree.is_zoomed() {
+            self.tree.zoom_reset();
+        }
+        // If the root itself is this tile, the tree becomes empty → we quit.
+        let root_was_target = matches!(self.tree.root_mut(), Node::Tile(t) if *t == id);
+        if !root_was_target {
+            remove_tile(self.tree.root_mut(), id); // prune + collapse
+        }
+        self.panes.remove(&id); // Drop -> PTY shutdown + thread join
+        self.titles.remove(&id);
+        self.tree.ensure_focus_valid(); // reseat focus onto a survivor
+        self.tree.ensure_zoom_valid();
+        root_was_target || self.panes.is_empty()
+    }
+
+    /// Handle one key. Returns `false` to quit the multiplexer.
+    ///
+    /// Keys pass straight through to the focused shell *unless* they follow the
+    /// prefix, in which case they are multiplexer commands (split/focus/zoom/…).
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Is this the prefix chord (Ctrl-a)?
+        let is_prefix = matches!(key.code, KeyCode::Char(PREFIX))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+
+        if self.prefix_armed {
+            self.prefix_armed = false; // the command key consumes the armed state
+            match key.code {
+                // Prefix twice → send a literal Ctrl-a to the shell.
+                KeyCode::Char(PREFIX) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.forward_key(key);
+                }
+                // Splits (tmux mnemonics): % / v = side-by-side, " / s = stacked.
+                KeyCode::Char('%') | KeyCode::Char('v') => self.split(Orientation::Horizontal),
+                KeyCode::Char('"') | KeyCode::Char('s') => self.split(Orientation::Vertical),
+                // Close the focused pane; quit if it was the last one.
+                KeyCode::Char('x') => {
+                    if let Some(f) = self.tree.focus() {
+                        if self.close_tile(f) {
+                            return false;
+                        }
+                    }
+                }
+                // Cycle focus / directional focus.
+                KeyCode::Char('o') | KeyCode::Tab => self.tree.focus_next(),
+                KeyCode::Left | KeyCode::Char('h') => self.tree.focus_dir_cross(Direction::Left, self.area),
+                KeyCode::Right | KeyCode::Char('l') => self.tree.focus_dir_cross(Direction::Right, self.area),
+                KeyCode::Up | KeyCode::Char('k') => self.tree.focus_dir_cross(Direction::Up, self.area),
+                KeyCode::Down | KeyCode::Char('j') => self.tree.focus_dir_cross(Direction::Down, self.area),
+                // Zoom (maximise) the focused pane / restore.
+                KeyCode::Char('z') => {
+                    if self.tree.is_zoomed() {
+                        self.tree.zoom_out();
+                    } else {
+                        self.tree.zoom_focus();
+                    }
+                }
+                // Rotate: flip the focused tile's parent split H<->V.
+                KeyCode::Char('r') => self.tree.flip_focused_parent(),
+                // Quit the whole multiplexer.
+                KeyCode::Char('q') => return false,
+                _ => {} // unknown command: ignore
+            }
+            return true;
+        }
+
+        if is_prefix {
+            self.prefix_armed = true; // arm; the next key is a command
+            return true;
+        }
+
+        self.forward_key(key); // ordinary key → the focused shell
+        true
+    }
+
+    /// Encode a key event and write it to the focused pane's PTY. The pane's
+    /// application-cursor-keys mode selects CSI vs SS3 arrow encodings.
+    fn forward_key(&mut self, key: KeyEvent) {
+        let Some(focus) = self.tree.focus() else { return };
+        if let Some(pane) = self.panes.get(&focus) {
+            let app_cursor = pane.app_cursor_keys(); // DECCKM: arrows as SS3 not CSI
+            if let Some(bytes) = encode_key(&key, app_cursor) {
+                pane.write(&bytes); // straight to the shell
+            }
+        }
+    }
+
+    /// Drain each pane's async engine events (titles, child exits). Returns
+    /// `true` when every pane has exited (quit the multiplexer).
+    fn poll_panes(&mut self) -> bool {
+        // Snapshot the ids first so we can mutate `panes` while iterating.
+        let ids: Vec<TileId> = self.panes.keys().copied().collect();
+        let mut exited: Vec<TileId> = Vec::new();
+        for id in ids {
+            if let Some(pane) = self.panes.get(&id) {
+                for ev in pane.drain_events() {
+                    match ev {
+                        PaneEvent::Title(t) => {
+                            self.titles.insert(id, t); // update the titlebar text
+                        }
+                        PaneEvent::Exited => exited.push(id), // shell exited: close later
+                        _ => {} // Bell / Wakeup: a full-repaint loop needs no action
+                    }
+                }
+            }
+        }
+        // Close every pane whose shell exited; quit if that empties the tree.
+        for id in exited {
+            if self.close_tile(id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Paint one frame: draw the shared tile borders, then blit every pane's
+    /// snapshot into its content rectangle, overlay titles, and mark the focused
+    /// pane's cursor. Finally draw a one-line command hint at the very bottom.
+    fn render(&mut self, buf: &mut Buffer) {
+        let full = buf.area; // the whole screen this frame
+        // Reserve the bottom row for a status line; tiles get everything above.
+        let tiling = Rect::new(full.x, full.y, full.width, full.height.saturating_sub(1));
+        self.area = tiling; // remember for next frame's directional focus
+
+        // A calm rounded frame; the focused tile is thickened via `focus_override`.
+        let border_style = BorderStyle {
+            weight: LineWeight::Light,
+            corners: CornerStyle::Rounded,
+            style: Style::default().fg(Color::Rgb(0x50, 0x50, 0x64)),
+        };
+        let focus = self.tree.focus();
+        let overrides = focus_override(&self.tree, LineWeight::Heavy); // thicken the focused border
+        // Draw shared single-cell seams + outer frame, and get each tile's interior.
+        let rects = render_shared(buf, self.tree.effective_root_mut(), tiling, &border_style, &overrides);
+
+        for (id, rect) in rects {
+            if rect.width == 0 || rect.height == 0 {
+                continue; // a tile squeezed to nothing this frame
+            }
+            let Some(pane) = self.panes.get_mut(&id) else { continue }; // no engine for this tile
+            // Size the PTY to its content rectangle (rt-engine resizes the grid
+            // synchronously, so the snapshot below already reflects it).
+            pane.resize((rect.width as usize).max(1), (rect.height as usize).max(1));
+            let snap = pane.snapshot(); // char + fg/bg + attrs grid
+
+            // Blit the grid cell-for-cell into the tile.
+            for (r, row) in snap.rows.iter().enumerate() {
+                let y = rect.y + r as u16;
+                if y >= rect.bottom() {
+                    break; // past the tile's bottom
+                }
+                for (c, cell) in row.iter().enumerate() {
+                    let x = rect.x + c as u16;
+                    if x >= rect.right() {
+                        break; // past the tile's right edge
+                    }
+                    buf.set_char(x, y, cell.c, style_of(cell)); // the actual cells-into-cells write
+                }
+            }
+
+            // Focused pane: mark the cursor cell with reverse video (a block cursor).
+            if Some(id) == focus {
+                if let Some(cur) = snap.cursor {
+                    let cx = rect.x + cur.col as u16;
+                    let cy = rect.y + cur.line as u16;
+                    if cx < rect.right() && cy < rect.bottom() {
+                        let cell = buf.get_mut(cx, cy);
+                        cell.style = cell.style.add_modifier(Modifier::REVERSE);
+                    }
+                }
+            }
+
+            // Title overlaid on the top border (like tmux/Terminator).
+            if rect.y >= 1 {
+                let title = self.titles.get(&id).map(String::as_str).unwrap_or("");
+                let label = if title.is_empty() {
+                    format!(" shell {id} ")
+                } else {
+                    format!(" {title} ")
+                };
+                let maxw = rect.width.saturating_sub(2) as usize; // room between the corners
+                let label: String = label.chars().take(maxw).collect();
+                let tstyle = if Some(id) == focus {
+                    Style::default().fg(Color::Rgb(0xe6, 0xe6, 0xf0)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(0x9a, 0x9a, 0xaa))
+                };
+                buf.set_string(rect.x + 1, rect.y - 1, &label, tstyle); // sits in the top border row
+            }
+        }
+
+        // Bottom status line: the command cheatsheet.
+        let hint = " C-a  %/\" split · o/←→ focus · z zoom · r rotate · x close · q quit ";
+        let status = Style::default().fg(Color::Rgb(0xc8, 0xc8, 0xd4)).bg(Color::Rgb(0x22, 0x22, 0x2c));
+        // Pad the row so the background spans the full width.
+        let mut line = String::from(hint);
+        while (line.chars().count() as u16) < full.width {
+            line.push(' ');
+        }
+        let line: String = line.chars().take(full.width as usize).collect();
+        buf.set_string(full.x, full.bottom() - 1, &line, status);
+    }
+}
+
+/// Translate one engine cell (`char` + `Rgb` fg/bg + attribute flags) into a
+/// mullion [`Style`]. This is the entire colour/attribute half of the seam.
+fn style_of(cell: &rt_engine::SnapCell) -> Style {
+    // Opaque fg/bg for every cell — a terminal has no transparency in text mode.
+    let mut style = Style::default()
+        .fg(Color::Rgb(cell.fg[0], cell.fg[1], cell.fg[2]))
+        .bg(Color::Rgb(cell.bg[0], cell.bg[1], cell.bg[2]));
+    // Map the drawing attributes mullion also understands (strikeout has no
+    // mullion Modifier, so it is dropped — acceptable for a text-mode host).
+    if cell.attrs.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.attrs.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.attrs.underline {
+        style = style.add_modifier(Modifier::UNDERLINE);
+    }
+    style
+}
+
+/// Replace the leaf `Node::Tile(target)` with a two-child split (the old tile
+/// plus `new_id`), searching the tree depth-first. Returns whether it was found.
+fn split_tile(node: &mut Node, target: TileId, new_id: TileId, orient: Orientation) -> bool {
+    match node {
+        Node::Tile(id) if *id == target => {
+            let old = *id; // keep the existing pane as the first child
+            *node = Node::Split {
+                orientation: orient,
+                children: vec![
+                    (Constraint::default(), Node::Tile(old)),   // equal weights (Fill(1))
+                    (Constraint::default(), Node::Tile(new_id)),
+                ],
+            };
+            true
+        }
+        Node::Tile(_) => false, // a different leaf
+        Node::Split { children, .. } => {
+            for (_, child) in children.iter_mut() {
+                // Clone per branch: `Orientation` is not `Copy` (its Adaptive
+                // variant carries state), and only the matching leaf consumes it.
+                if split_tile(child, target, new_id, orient.clone()) {
+                    return true;
+                }
+            }
+            false
+        }
+        Node::Carousel { children, .. } => {
+            for (_, child) in children.iter_mut() {
+                if split_tile(child, target, new_id, orient.clone()) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Remove the leaf `target` from the tree, collapsing any split that is left
+/// with a single child back into that child (so no redundant 1-way splits
+/// linger). Returns `true` if `node` itself became empty and should be removed
+/// by its parent. Mirrors rt-core's `close`, but on mullion's `Node`.
+fn remove_tile(node: &mut Node, target: TileId) -> bool {
+    match node {
+        Node::Tile(id) => *id == target, // ask the parent to drop me if I'm the target
+        Node::Split { children, .. } => {
+            // Drop any child that reports itself empty (the target, or a split
+            // that emptied out beneath it).
+            let mut i = 0;
+            while i < children.len() {
+                if remove_tile(&mut children[i].1, target) {
+                    children.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            if children.is_empty() {
+                return true; // this split has no children left
+            }
+            if children.len() == 1 {
+                // Collapse: this split now just wraps one child — become it.
+                let (_, only) = children.remove(0);
+                *node = only;
+            }
+            false
+        }
+        Node::Carousel { children, .. } => {
+            let mut i = 0;
+            while i < children.len() {
+                if remove_tile(&mut children[i].1, target) {
+                    children.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            children.is_empty()
+        }
+    }
+}
+
+/// Encode a crossterm key event as the byte sequence a PTY expects, or `None`
+/// for keys we do not forward. `app_cursor` picks SS3 (`ESC O x`) over CSI
+/// (`ESC [ x`) for the arrow/Home/End keys, as DECCKM requires.
+fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
+    use KeyCode::*;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Cursor-ish keys: SS3 when the app enabled application cursor keys, else CSI.
+    let cursor = |c: u8| -> Vec<u8> {
+        if app_cursor {
+            vec![0x1b, b'O', c]
+        } else {
+            vec![0x1b, b'[', c]
+        }
+    };
+    // CSI ... ~ sequences (PageUp, Delete, function keys…).
+    let tilde = |n: &[u8]| -> Vec<u8> {
+        let mut v = vec![0x1b, b'[']; // ESC [
+        v.extend_from_slice(n);
+        v.push(b'~');
+        v
+    };
+
+    let mut out = match key.code {
+        Char(c) => {
+            if ctrl {
+                // Control combos → C0 control bytes; unknown combos send the char.
+                match ctrl_byte(c) {
+                    Some(b) => vec![b],
+                    None => c.to_string().into_bytes(),
+                }
+            } else {
+                c.to_string().into_bytes() // plain (shift already folded into `c`)
+            }
+        }
+        Enter => vec![b'\r'],
+        Tab => vec![b'\t'],
+        BackTab => vec![0x1b, b'[', b'Z'],
+        Backspace => vec![0x7f],
+        Esc => vec![0x1b],
+        Left => cursor(b'D'),
+        Right => cursor(b'C'),
+        Up => cursor(b'A'),
+        Down => cursor(b'B'),
+        Home => cursor(b'H'),
+        End => cursor(b'F'),
+        PageUp => tilde(b"5"),
+        PageDown => tilde(b"6"),
+        Insert => tilde(b"2"),
+        Delete => tilde(b"3"),
+        F(n) => match n {
+            1 => vec![0x1b, b'O', b'P'],
+            2 => vec![0x1b, b'O', b'Q'],
+            3 => vec![0x1b, b'O', b'R'],
+            4 => vec![0x1b, b'O', b'S'],
+            5 => tilde(b"15"),
+            6 => tilde(b"17"),
+            7 => tilde(b"18"),
+            8 => tilde(b"19"),
+            9 => tilde(b"20"),
+            10 => tilde(b"21"),
+            11 => tilde(b"23"),
+            12 => tilde(b"24"),
+            _ => return None,
+        },
+        _ => return None, // keys we don't forward (media keys, etc.)
+    };
+    // Alt/Meta on a printable char → prefix with ESC (the classic meta encoding).
+    if alt && matches!(key.code, Char(_)) {
+        let mut v = vec![0x1b];
+        v.append(&mut out);
+        out = v;
+    }
+    Some(out)
+}
+
+/// The C0 control byte for `Ctrl`+`c`, or `None` if the combination has no
+/// standard control code (in which case the caller sends the plain char).
+fn ctrl_byte(c: char) -> Option<u8> {
+    match c {
+        'a'..='z' => Some(c as u8 - b'a' + 1),   // Ctrl-a..z → 0x01..0x1a
+        'A'..='Z' => Some(c as u8 - b'A' + 1),   // Ctrl-A..Z → same
+        ' ' | '@' => Some(0x00),                 // Ctrl-Space / Ctrl-@ → NUL
+        '[' => Some(0x1b),                       // Ctrl-[ → ESC
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' | '/' => Some(0x1f),
+        '?' => Some(0x7f),                       // Ctrl-? → DEL
+        _ => None,
+    }
+}
+
+/// The render + input loop. Sets up the mux from the initial terminal size, then
+/// each frame: drain input → drain pane events → repaint → pace the frame.
+fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    let area = term.backend().size()?; // initial screen rectangle
+    let mut mux = Mux::new(area)?;
+    let input = EventReader::new(); // background input thread (never blocked by a slow draw)
+
+    loop {
+        let start = Instant::now();
+        // Handle every queued input event this frame (a burst collapses into one frame).
+        for ev in input.drain() {
+            match ev {
+                Event::Key(k) => {
+                    if !mux.handle_key(k) {
+                        return Ok(()); // a command asked to quit
+                    }
+                }
+                // Resize is handled implicitly: `Terminal::draw` re-reads the size
+                // and reallocates; we just read `buf.area` next frame.
+                _ => {}
+            }
+        }
+        // Titles / child exits. If every shell exited, we're done.
+        if mux.poll_panes() {
+            return Ok(());
+        }
+        // Repaint the whole buffer; mullion diffs and flushes only what changed.
+        term.draw(|buf| mux.render(buf))?;
+        // Pace to the frame budget (sleep the remainder).
+        std::thread::sleep(FRAME.saturating_sub(start.elapsed()));
+    }
+}
+
+/// Set up the terminal, run the loop, and always restore the terminal on the way
+/// out (even if the loop returns an error).
+fn main() -> io::Result<()> {
+    let mut backend = CrosstermBackend::new(io::stdout());
+    backend.apply_capabilities(&Capabilities::detect()); // truecolor/unicode probe
+    backend.set_mouse_capture(false); // leave native mouse/selection to the outer terminal
+    let mut term = Terminal::new(backend)?;
+    term.enter()?; // raw mode, alternate screen, hidden cursor
+
+    let result = run(&mut term); // the app; errors are returned, not propagated past leave()
+
+    term.leave()?; // restore the terminal no matter what
+    result
+}

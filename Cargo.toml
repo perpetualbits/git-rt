@@ -11,6 +11,7 @@ members = [
     "crates/rt-config",              # keybindings + config, Terminator-compatible syntax
     "crates/rt-session",             # controller: ties tree+engine+focus+broadcast into actions
     "crates/rt",                     # the binary: winit + GL front-end + input mapping
+    "crates/rt-mux",                 # text-mode sibling: rt-engine panes hosted in mullion tiles
 ]
 
 # Shared release profile: optimise hard and thin-LTO, mirroring alacritty's

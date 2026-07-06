@@ -1,0 +1,21 @@
+[package]
+name = "rt-mux"                      # rt's text-mode sibling: a tmux-style multiplexer
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "rt-mux: a text-mode terminal multiplexer — rt-engine panes hosted in mullion tiles"
+
+[[bin]]
+name = "rt-mux"
+path = "src/main.rs"
+
+[dependencies]
+# The SAME engine rt's Wayland GUI uses: PTY + alacritty_terminal, exposing a
+# cell snapshot. rt-mux reuses it verbatim, so both front-ends share one
+# battle-tested terminal core with zero duplicated logic.
+rt-engine = { path = "../rt-engine" }
+# The tiling/render engine: a ratatui-shaped TUI cell-buffer library. We host
+# rt-engine panes inside its tiles (cells-into-cells) and let it do the chrome.
+mullion = { path = "../../../mullion" }
+# Matches mullion's crossterm so Event/KeyCode types line up across the seam.
+crossterm = "0.28"
