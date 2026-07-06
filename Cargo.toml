@@ -1,0 +1,19 @@
+# Top-level Cargo workspace for rt.
+#
+# We add member crates as each milestone lands so that `cargo test` stays fast
+# and green while the GUI layers (which need system libraries) are still stubs.
+# See PLAN.md §3 for the full intended crate list.
+[workspace]
+resolver = "2"                       # use the modern feature resolver (edition-2021+ default)
+members = [
+    "crates/rt-core",                # pure layout-tree + session model (no I/O, headless-testable)
+]
+
+# Shared release profile: optimise hard and thin-LTO, mirroring alacritty's
+# profile so our engine dependency is built the same fast way.
+[profile.release]
+opt-level = 3                        # maximum optimisation for the hot parser/render paths
+lto = "thin"                         # cross-crate inlining without full-LTO's link-time cost
+codegen-units = 1                    # let the optimiser see whole crates (slower build, faster binary)
+panic = "abort"                      # smaller binary; a terminal has no useful unwind recovery
+strip = true                         # drop symbols from release artifacts shipped in packages

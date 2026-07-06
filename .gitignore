@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Reference source trees (terminator + alacritty) are cloned locally for study
+# but MUST NOT be committed into rt's history — they have their own licenses
+# and would bloat the repo. See docs/REFERENCES.md for how to re-fetch them.
+/reference/
+
+# Packaging output
+/dist/
+*.deb
+*.rpm
+*.pkg.tar.zst
+
+# Editor / OS noise
+*.swp
+.DS_Store
