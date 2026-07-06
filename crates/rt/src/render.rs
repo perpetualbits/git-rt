@@ -372,6 +372,15 @@ impl Renderer {
         self.push_quad(x, y, w, h, (s, s, s, s), c); // solid fill
     }
 
+    /// Fill a single character cell's background with a solid `color`. `(ox,oy)`
+    /// is the containing region's top-left pixel; `col`/`row` index the cell.
+    /// Used to paint per-cell background colours and the cursor block.
+    pub fn fill_cell(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w; // cell's left pixel
+        let y = oy + row as f32 * self.cell_h; // cell's top pixel
+        self.fill_rect(x, y, self.cell_w, self.cell_h, color); // solid fill
+    }
+
     /// Draw a 1-cell character at cell column/row within a pane whose top-left
     /// pixel is `(ox, oy)`. Skips blanks. `fg` is the glyph colour.
     pub fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color) {

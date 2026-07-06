@@ -14,6 +14,9 @@
 //! can fail returns `Result`/`Option` — no unwrap on the hot path — which is
 //! the direct antidote to Terminator's unguarded-callback crashes.
 
+mod palette; // xterm 256-colour palette + cell-colour resolution
+pub use palette::{Rgb, CURSOR, DEFAULT_BG, DEFAULT_FG}; // colours the renderer needs
+
 use std::borrow::Cow; // Msg::Input takes a Cow<[u8]>; we always own our bytes
 use std::collections::VecDeque; // FIFO queue of high-level events for the GUI to drain
 use std::sync::{Arc, Mutex}; // shared, lock-guarded state between us and the I/O thread
@@ -42,20 +45,38 @@ pub enum PaneEvent {
     Wakeup,
 }
 
-/// A single terminal cell's rendered character plus whether the cursor is on
-/// it. Kept intentionally minimal for now; colour/attribute fields will be
-/// added when the renderer needs them (M4).
+/// A single terminal cell: its glyph plus its already-resolved foreground and
+/// background RGB (attribute flags like bold/dim/inverse/hidden are baked into
+/// these colours by `snapshot`, so the renderer just draws them).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapCell {
-    pub c: char, // the glyph to draw in this cell
+    pub c: char,   // the glyph to draw in this cell
+    pub fg: Rgb,   // resolved foreground colour
+    pub bg: Rgb,   // resolved background colour
+}
+
+impl SnapCell {
+    /// A blank cell (space) in the default colours — used to pre-fill rows.
+    fn blank() -> Self {
+        SnapCell { c: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG }
+    }
+}
+
+/// Where the text cursor is within a snapshot, in the snapshot's own row/column
+/// coordinates. `None` when the cursor is hidden or the view is scrolled back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPos {
+    pub col: usize,  // column within the captured grid
+    pub line: usize, // row within the captured grid (0 = top of the snapshot)
 }
 
 /// An immutable snapshot of a pane's visible grid, produced for rendering or
 /// for headless assertions in tests. Row-major: `rows[y]` is one screen line.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
-    pub cols: usize,           // number of columns captured
+    pub cols: usize,              // number of columns captured
     pub rows: Vec<Vec<SnapCell>>, // one inner Vec per visible screen line
+    pub cursor: Option<CursorPos>, // cursor location, if visible
 }
 
 impl Snapshot {
@@ -191,6 +212,8 @@ pub struct TermPane {
     // Current grid size, tracked so resizes can rebuild a correct WindowSize.
     cols: usize,
     rows: usize,
+    // The 256-colour palette used to resolve cell colours to RGB. Built once.
+    palette: palette::Palette,
 }
 
 impl TermPane {
@@ -272,6 +295,7 @@ impl TermPane {
             io_thread: Some(io_thread),
             cols,
             rows,
+            palette: palette::Palette::xterm(), // standard xterm 256-colour table
         })
     }
 
@@ -313,12 +337,13 @@ impl TermPane {
     /// testing. Locks the `Term` briefly, copies out the visible cells, and
     /// releases — it never hands out a reference into shared state.
     pub fn snapshot(&self) -> Snapshot {
+        use alacritty_terminal::term::TermMode; // for the cursor-visibility flag
         let term = self.term.lock(); // read access to the grid
         let cols = term.columns(); // current column count
         let rows = term.screen_lines(); // current visible row count
         // Pre-fill a blank grid so every cell has a defined value even if the
         // iterator skips empties.
-        let mut grid = vec![vec![SnapCell { c: ' ' }; cols]; rows];
+        let mut grid = vec![vec![SnapCell::blank(); cols]; rows];
         // Walk the visible cells. `display_iter` yields each cell with its
         // point (line, column) in viewport coordinates.
         for cell in term.grid().display_iter() {
@@ -327,10 +352,85 @@ impl TermPane {
             // Guard the indices: the iterator stays in range, but bounds-check
             // anyway so a future engine change can never make this panic.
             if line >= 0 && (line as usize) < rows && col < cols {
-                grid[line as usize][col] = SnapCell { c: cell.c }; // copy the glyph
+                // Resolve this cell's colours (attribute flags folded in).
+                let (fg, bg) = self.resolve_colors(&cell); // fg/bg RGB
+                grid[line as usize][col] = SnapCell { c: cell.c, fg, bg };
             }
         }
-        Snapshot { cols, rows: grid }
+        // Capture the cursor position, but only when it is actually shown and
+        // the view is not scrolled back into history (a scrolled-back cursor is
+        // off-screen and must not be drawn).
+        let cursor = if term.mode().contains(TermMode::SHOW_CURSOR) && term.grid().display_offset() == 0 {
+            let p = term.grid().cursor.point; // cursor point in viewport coords
+            let line = p.line.0; // i32 line
+            let col = p.column.0; // usize column
+            if line >= 0 && (line as usize) < rows && col < cols {
+                Some(CursorPos { col, line: line as usize }) // on-screen: report it
+            } else {
+                None // out of the visible region
+            }
+        } else {
+            None // hidden or scrolled back
+        };
+        Snapshot { cols, rows: grid, cursor }
+    }
+
+    /// Resolve one cell's abstract foreground/background `Color`s to concrete
+    /// RGB, folding in the attribute flags. Returns `(fg, bg)`.
+    ///
+    /// Rules mirror common terminal behaviour: BOLD promotes an ANSI 0–7
+    /// foreground to its bright 8–15 variant; DIM darkens the foreground;
+    /// INVERSE swaps fg and bg; HIDDEN makes the glyph invisible (fg = bg).
+    fn resolve_colors(&self, cell: &alacritty_terminal::term::cell::Cell) -> (Rgb, Rgb) {
+        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::vte::ansi::Color;
+
+        // Resolve one abstract Color to RGB against our palette + defaults.
+        let resolve = |color: Color, is_bg: bool| -> Rgb {
+            match color {
+                Color::Spec(rgb) => [rgb.r, rgb.g, rgb.b], // a literal 24-bit colour
+                Color::Indexed(i) => self.palette.indexed(i), // 256-colour table
+                Color::Named(n) => {
+                    let idx = n as usize; // NamedColor's discriminant doubles as an index
+                    match idx {
+                        0..=15 => self.palette.indexed(idx as u8), // the 16 ANSI colours
+                        256 => DEFAULT_FG,                          // Foreground
+                        257 => DEFAULT_BG,                          // Background
+                        258 => palette::CURSOR,                     // Cursor colour
+                        267 => DEFAULT_FG,                          // BrightForeground
+                        268 => palette::dim(DEFAULT_FG),            // DimForeground
+                        259..=266 => palette::dim(self.palette.indexed((idx - 259) as u8)), // DimBlack..White
+                        _ => if is_bg { DEFAULT_BG } else { DEFAULT_FG }, // any other named default
+                    }
+                }
+            }
+        };
+
+        let flags = cell.flags; // attribute bitset for this cell
+        let mut fg = resolve(cell.fg, false); // base foreground
+        let mut bg = resolve(cell.bg, true); // base background
+
+        // BOLD brightens a base ANSI foreground (0–7 → 8–15), the common default.
+        if flags.contains(Flags::BOLD) {
+            match cell.fg {
+                Color::Named(n) if (n as usize) < 8 => fg = self.palette.indexed(n as u8 + 8),
+                Color::Indexed(i) if i < 8 => fg = self.palette.indexed(i + 8),
+                _ => {} // explicit/bright colours are left as-is
+            }
+        }
+        // DIM darkens the foreground.
+        if flags.contains(Flags::DIM) {
+            fg = palette::dim(fg);
+        }
+        // INVERSE swaps foreground and background (e.g. selections, `rev`).
+        if flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        // HIDDEN makes the glyph invisible by painting it in the background.
+        if flags.contains(Flags::HIDDEN) {
+            fg = bg;
+        }
+        (fg, bg)
     }
 
     /// Scroll the terminal's scrollback view by `delta` lines: positive scrolls
@@ -394,16 +494,20 @@ impl TermPane {
         for r in 0..rows {
             let idx = top + r as i32; // the grid line this output row maps to
             // Start blank; only fill if the line index is actually in the grid.
-            let mut line = vec![SnapCell { c: ' ' }; cols];
+            let mut line = vec![SnapCell::blank(); cols];
             if idx >= topmost && idx <= bottommost {
                 let row = &grid[Line(idx)]; // borrow the stored row
                 for c in 0..cols {
-                    line[c] = SnapCell { c: row[Column(c)].c }; // copy each glyph
+                    // Resolve colours here too so column-mode history reads (if
+                    // ever used for rendering) are also full-colour.
+                    let cell = &row[Column(c)];
+                    let (fg, bg) = self.resolve_colors(cell);
+                    line[c] = SnapCell { c: cell.c, fg, bg };
                 }
             }
             out.push(line); // append this (possibly blank) line
         }
-        Snapshot { cols, rows: out }
+        Snapshot { cols, rows: out, cursor: None }
     }
 
     /// Remove and return all pending high-level events (title/bell/exit/wakeup)

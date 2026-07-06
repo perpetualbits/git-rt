@@ -420,7 +420,6 @@ impl App {
         // value < 1.0 makes empty areas translucent (the window(s) behind show
         // through, compositor permitting). Glyphs and chrome stay fully opaque.
         let bg = Color::rgb(0x10, 0x10, 0x14).with_alpha(active.settings.background_opacity);
-        let fg = Color::rgb(0xd0, 0xd0, 0xd8); // default text colour (opaque)
         let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline (opaque)
 
         let size = active.window.inner_size(); // physical pixels
@@ -448,43 +447,69 @@ impl App {
         // clear above already is the background.)
         for (id, rect) in active.session.tree().rects(bounds) {
             let n = active.session.columns_of(id); // newspaper column count (1 = normal)
-            // Copy the pane's current grid and draw each non-blank cell.
+            // Copy the pane's current grid (glyphs + resolved colours + cursor).
             if let Some(pane) = active.session.pane(id) {
-                let snap = pane.snapshot(); // the visible screen (in column mode it is count*rows tall)
-                if n <= 1 {
-                    // --- ordinary single-column pane ---
-                    for (row_idx, row) in snap.rows.iter().enumerate() {
-                        for (col_idx, cell) in row.iter().enumerate() {
-                            if cell.c != ' ' {
-                                active.renderer.draw_char(rect.x, rect.y, col_idx, row_idx, cell.c, fg);
+                let snap = pane.snapshot(); // in column mode this is a count*rows-tall screen
+                let geom = active.session.column_layout(id, rect); // count/col_cells/rows/gap
+                // One column's height in rows. For a single pane the whole
+                // snapshot stacks directly, so we use a sentinel that keeps the
+                // mapping a no-op.
+                let per_col = if n <= 1 { usize::MAX } else { geom.rows.max(1) };
+                let step = (geom.col_cells + geom.gap) as f32 * cell_w; // px between column origins
+
+                // Map a snapshot row `r` to (its column's origin x, its sub-row).
+                // Single mode: rows stack at rect.x. Column mode: row r lands in
+                // newspaper column r/per_col at sub-row r%per_col.
+                let place = |r: usize| -> (f32, usize) {
+                    if n <= 1 {
+                        (rect.x, r) // stack directly
+                    } else {
+                        (rect.x + (r / per_col) as f32 * step, r % per_col) // tile into columns
+                    }
+                };
+
+                // Draw each cell: an opaque background quad only when the cell's
+                // background differs from the default (so ordinary text keeps the
+                // translucent window background), then the glyph in its colour.
+                for (r, row) in snap.rows.iter().enumerate() {
+                    if n > 1 && r / per_col >= geom.count as usize {
+                        break; // guard against a transient over-tall snapshot mid-resize
+                    }
+                    let (ox, sub) = place(r); // where this line draws
+                    for (col_idx, cell) in row.iter().enumerate() {
+                        if cell.bg != rt_engine::DEFAULT_BG {
+                            let c = cell.bg; // per-cell background colour
+                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, Color::rgb(c[0], c[1], c[2]));
+                        }
+                        if cell.c != ' ' {
+                            let c = cell.fg; // per-cell foreground colour
+                            active.renderer.draw_char(ox, rect.y, col_idx, sub, cell.c, Color::rgb(c[0], c[1], c[2]));
+                        }
+                    }
+                }
+
+                // Block cursor: fill the cell in the cursor colour, then redraw
+                // the glyph under it in that cell's background colour (inverse)
+                // so it stays legible.
+                if let Some(cur) = snap.cursor {
+                    let in_range = cur.line < snap.rows.len() && (n <= 1 || cur.line / per_col < geom.count as usize);
+                    if in_range {
+                        let (ox, sub) = place(cur.line); // cursor's on-screen slot
+                        let cc = rt_engine::CURSOR; // cursor block colour
+                        active.renderer.fill_cell(ox, rect.y, cur.col, sub, Color::rgb(cc[0], cc[1], cc[2]));
+                        if let Some(under) = snap.rows.get(cur.line).and_then(|rw| rw.get(cur.col)) {
+                            if under.c != ' ' {
+                                let ub = under.bg; // draw the glyph in the cell bg for contrast
+                                active.renderer.draw_char(ox, rect.y, cur.col, sub, under.c, Color::rgb(ub[0], ub[1], ub[2]));
                             }
                         }
                     }
-                } else {
-                    // --- newspaper-column pane ---
-                    // The app was given a `count*rows`-tall screen; we simply
-                    // re-tile its visible lines into `count` columns. Row r of
-                    // the tall screen lands in column r/rows at line r%rows —
-                    // transparent to the app (vim included), unlike a scrollback
-                    // trick that only full-height shells could exploit.
-                    let layout = active.session.column_layout(id, rect); // count/col_cells/rows/gap
-                    let step = (layout.col_cells + layout.gap) as f32 * cell_w; // px between column origins
-                    for (r, row) in snap.rows.iter().enumerate() {
-                        let nc = r / layout.rows; // which newspaper column this line lands in
-                        if nc >= layout.count as usize {
-                            break; // guard against a transient over-tall snapshot during resize
-                        }
-                        let line = r % layout.rows; // row within that column
-                        let ox = rect.x + nc as f32 * step; // this column's left pixel
-                        for (col_idx, cell) in row.iter().enumerate() {
-                            if cell.c != ' ' {
-                                active.renderer.draw_char(ox, rect.y, col_idx, line, cell.c, fg);
-                            }
-                        }
-                    }
-                    // Thin separators between columns, drawn in each gap.
-                    for nc in 1..layout.count as usize {
-                        let x = rect.x + nc as f32 * step - (layout.gap as f32 * 0.5) * cell_w; // gap centre
+                }
+
+                // Thin separators between newspaper columns, drawn in each gap.
+                if n > 1 {
+                    for nc in 1..geom.count as usize {
+                        let x = rect.x + nc as f32 * step - (geom.gap as f32 * 0.5) * cell_w; // gap centre
                         active.renderer.fill_rect(x, rect.y, 1.0, rect.h, sep); // 1px vertical rule
                     }
                 }

@@ -149,8 +149,15 @@ rt/
 - ☑ **Visually verified**: launched against the live Wayland display, captured
   the window — the bash prompt renders through the atlas with the blue focus
   border. See `docs/screenshots/first-light.png`.
-- ☐ Multi-pane visual check (split rendering); cursor block; colours/attrs from
-  the grid (currently one fg colour); tab strip drawing.
+- ☑ Grid colours: xterm 256-colour palette in rt-engine resolves every cell's
+  fg/bg (bold→bright, dim, inverse, hidden folded in). Renderer draws per-cell
+  backgrounds (opaque only when non-default, so translucency is preserved) and
+  per-cell foregrounds. **Verified**: `docs/screenshots/colors.png` (256-colour
+  cube + grayscale + ANSI line).
+- ☑ Block cursor: drawn at the terminal cursor (when shown & not scrolled back),
+  inverse glyph on top; maps correctly in newspaper-column mode too.
+- ☐ Multi-pane visual check (split rendering); tab strip drawing; underline/
+  italic/strikeout attributes; a right-click context menu (Terminator-style).
 
 ### M5b — Newspaper columns (rt-original feature)  ◐  (VISUALLY VERIFIED)
 - ☑ Engine seam: history-aware `snapshot_lines(top,rows)` + `line_bounds()` +

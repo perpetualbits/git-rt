@@ -270,3 +270,36 @@ appearance bindings resolve. Workspace: 34 tests green.
 
 **Next in this feature:** the KWin `org_kde_kwin_blur` request (KDE-only bonus,
 untestable here — I have no KDE session).
+
+## 2026-07-06 — Session 1: full colour + block cursor
+
+User: do grid colours + cursor before packaging; full-colour programs (e.g.
+spiral_stress) can't show their colours yet, and there's no cursor.
+
+**Colour resolution (rt-engine/src/palette.rs).** alacritty_terminal stores each
+cell's colour abstractly (`Color::{Named,Spec,Indexed}`) and ships NO palette —
+that's the front-end's job. So rt builds a standard xterm 256-colour palette (16
+ANSI + 6×6×6 cube + 24 greys) and resolves every cell to RGB in `snapshot`,
+folding in attribute flags: BOLD promotes ANSI 0–7 fg to bright 8–15, DIM
+darkens, INVERSE swaps fg/bg, HIDDEN paints fg=bg. `SnapCell` now carries
+resolved `fg`/`bg`; `Snapshot` carries an optional cursor position.
+
+**Renderer.** Draws a per-cell background quad ONLY when the cell's bg differs
+from the default — so ordinary text keeps the translucent window background while
+coloured cells get opaque colour. Foreground drawn per cell. Unified the single-
+and column-mode draw paths behind one `place(row)` mapping.
+
+**Block cursor.** Drawn at `term.grid().cursor.point` when SHOW_CURSOR and not
+scrolled back; fills the cell in the cursor colour and redraws the glyph under it
+in the cell's bg (inverse) so it stays legible. Maps through the same column
+logic, so it's correct in newspaper-column panes too.
+
+**Verified** (`docs/screenshots/colors.png`): a 256-colour background grid (cube
+gradients + grayscale ramp all correct), an ANSI line (bold-red bright,
+green/yellow/blue/cyan), and the block cursor at the prompt.
+
+Workspace: 34 tests green. Default build still Wayland-native (zero x11 crates).
+
+**Still monochrome-era leftovers to revisit:** underline/italic/strikeout
+attributes aren't drawn yet (colours/bold/dim/inverse/hidden are). No context
+menu yet (Terminator's right-click menu) — deferred per user.
