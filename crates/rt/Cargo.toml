@@ -54,3 +54,7 @@ env_logger = "0.11"                  # RUST_LOG-driven logging for the binary
 # versions must match winit's so the shared wl_surface object is compatible.
 wayland-client = "0.31"
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+# Clipboard + PRIMARY selection over the Wayland connection. Chosen over arboard
+# because arboard pulls X11 crates on Linux, which would break Wayland-native;
+# smithay-clipboard is pure Wayland and ties into the window's wl_display.
+smithay-clipboard = "0.7"

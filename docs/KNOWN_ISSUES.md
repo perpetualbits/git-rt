@@ -102,4 +102,10 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   verified still works with IME on; dead-key composition needs a compose-capable
   layout to observe (on the user's machine). Preedit is not yet *rendered*
   inline (follow-up).
-- ☐ **Copy/paste** — next.
+- ☑ **Copy/paste** (Wayland). Mouse drag-selects text (highlight verified,
+  `docs/screenshots/selection.png`); Ctrl+Shift+C copies to CLIPBOARD + PRIMARY;
+  Ctrl+Shift+V pastes; middle-click pastes PRIMARY; copy-on-select to PRIMARY.
+  Uses smithay-clipboard (pure Wayland — no X11 crates; arboard would add X11).
+  Selection is single-column panes for now (column-mode is a follow-up). The
+  clipboard round-trip couldn't be inject-tested in the sandbox (this compositor
+  lacks wlr-data-control; x11 dev build has no clipboard) — verify on-machine.

@@ -24,7 +24,7 @@ use glutin::display::GetGlDisplay;
 use glutin::prelude::*; // brings the Gl* traits (make_current, get_proc_address, …)
 use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
-use raw_window_handle::HasWindowHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -56,6 +56,48 @@ struct Active {
     mouse: (f32, f32),                    // last cursor position in physical pixels
     menu: Option<menu::Menu>,             // the open right-click context menu, if any
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
+    clipboard: Option<smithay_clipboard::Clipboard>, // Wayland clipboard + PRIMARY (None on x11 dev builds)
+    selection: Option<Selection>,         // the current mouse text selection, if any
+    selecting: bool,                      // true while the left button is held for a drag-select
+}
+
+/// A rectangular-by-lines text selection within one pane, in that pane's grid
+/// cell coordinates. `anchor` is where the drag started, `head` is the current
+/// end; text runs linearly (row-major) between the two.
+#[derive(Clone, Copy)]
+struct Selection {
+    pane: rt_core::PaneId, // the pane the selection lives in
+    anchor: (usize, usize), // (col, row) where the drag began
+    head: (usize, usize),   // (col, row) current end of the drag
+}
+
+impl Selection {
+    /// Return the selection's endpoints ordered so `start` precedes `end` in
+    /// row-major reading order (top-to-bottom, left-to-right).
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        // Compare by (row, col) so multi-line selections read correctly.
+        let a = (self.anchor.1, self.anchor.0); // (row, col)
+        let b = (self.head.1, self.head.0);
+        if a <= b {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Whether cell `(col, row)` falls inside the selection.
+    fn contains(&self, col: usize, row: usize) -> bool {
+        let (start, end) = self.ordered(); // start precedes end
+        let (sc, sr) = start;
+        let (ec, er) = end;
+        if row < sr || row > er {
+            return false; // outside the row span
+        }
+        // First and last rows are bounded by the columns; middle rows are full.
+        let lo = if row == sr { sc } else { 0 };
+        let hi = if row == er { ec } else { usize::MAX };
+        col >= lo && col <= hi
+    }
 }
 
 /// The winit application object. Holds only the font bytes until `resumed`
@@ -242,6 +284,16 @@ impl ApplicationHandler for App {
         // IMEs work: composed text arrives via WindowEvent::Ime(Commit).
         window.set_ime_allowed(true);
 
+        // Wayland clipboard (+ PRIMARY selection), tied to the window's display.
+        // None on an x11 dev build (smithay-clipboard is Wayland-only).
+        // SAFETY: the display pointer comes from winit's live Wayland display.
+        let clipboard = match window.display_handle().map(|h| h.as_raw()) {
+            Ok(RawDisplayHandle::Wayland(d)) => {
+                Some(unsafe { smithay_clipboard::Clipboard::new(d.display.as_ptr()) })
+            }
+            _ => None, // not Wayland (x11 dev build): clipboard unavailable
+        };
+
         // Size the renderer/viewport to the window's physical pixels.
         let size = window.inner_size(); // physical pixel size
         renderer.resize(size.width as f32, size.height as f32);
@@ -324,6 +376,9 @@ impl ApplicationHandler for App {
             mouse: (0.0, 0.0),
             menu: None,
             ime_preedit: false,
+            clipboard,
+            selection: None,
+            selecting: false,
         });
         // Debug/verification hook: RT_MENU opens the context menu at startup so
         // its rendering can be screenshotted without synthetic mouse input.
@@ -419,7 +474,17 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
-                if let Some(m) = active.menu.as_mut() {
+                if active.selecting {
+                    // Extend the selection to the cell under the pointer.
+                    if let Some((pane, col, row)) = Self::cell_at(active, active.mouse.0, active.mouse.1) {
+                        if let Some(sel) = active.selection.as_mut() {
+                            if sel.pane == pane {
+                                sel.head = (col, row); // move the drag end
+                                active.window.request_redraw();
+                            }
+                        }
+                    }
+                } else if let Some(m) = active.menu.as_mut() {
                     let (cw, ch) = active.renderer.cell_size(); // cell metrics for hit layout
                     if m.set_hover(active.mouse.0, active.mouse.1, cw, ch) {
                         active.window.request_redraw(); // hovered row changed
@@ -436,16 +501,14 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // Mouse button presses: right opens the context menu; left either
-            // activates a menu item (if open) or is ignored for now.
-            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => match button {
-                MouseButton::Right => {
+            // Mouse buttons: right opens the menu; left drives menu/tab/focus and
+            // starts/ends a text selection; middle pastes the PRIMARY selection.
+            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
+                (ElementState::Pressed, MouseButton::Right) => {
                     log::debug!("right-click at {:?} → open menu", active.mouse);
                     // Focus the pane under the cursor first, so the menu's
-                    // actions (Split, Close, Columns…) apply to the pane you
-                    // right-clicked — not whichever pane happened to be focused.
+                    // actions apply to the pane you right-clicked.
                     active.session.focus_at(active.mouse.0, active.mouse.1);
-                    // Open the menu at the cursor, clamped inside the window.
                     let (cw, ch) = active.renderer.cell_size();
                     let size = active.window.inner_size();
                     let mut m = menu::Menu::new(active.mouse.0, active.mouse.1);
@@ -453,10 +516,9 @@ impl ApplicationHandler for App {
                     active.menu = Some(m);
                     active.window.request_redraw();
                 }
-                MouseButton::Left => {
+                (ElementState::Pressed, MouseButton::Left) => {
                     if let Some(m) = active.menu.take() {
-                        // A menu is open: a click anywhere closes it; if it
-                        // landed on an item, run that item's action.
+                        // Menu open: click activates the hovered item (or closes).
                         let (cw, ch) = active.renderer.cell_size();
                         let action = m.hit(active.mouse.0, active.mouse.1, cw, ch).and_then(|i| m.action_at(i));
                         active.window.request_redraw();
@@ -464,12 +526,11 @@ impl ApplicationHandler for App {
                             Self::apply_action(active, a); // may exit on the last pane
                         }
                     } else {
-                        // No menu. A click on a tab label selects that tab;
-                        // otherwise it click-to-focuses the pane under the cursor.
                         let size = active.window.inner_size();
                         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
                         let (mx, my) = active.mouse;
-                        // Find a tab whose label rect contains the click.
+                        // A tab label click switches tabs; else focus the pane and
+                        // begin a text selection at the clicked cell.
                         let clicked_tab = active
                             .session
                             .tab_bars(bounds)
@@ -478,14 +539,46 @@ impl ApplicationHandler for App {
                             .find(|t| t.rect.contains(mx, my))
                             .map(|t| t.first_pane);
                         if let Some(first_pane) = clicked_tab {
-                            active.session.focus_tab(first_pane); // switch to that tab
+                            active.session.focus_tab(first_pane);
                             active.window.request_redraw();
-                        } else if active.session.focus_at(mx, my) {
-                            active.window.request_redraw(); // repaint the focus border
+                        } else {
+                            active.session.focus_at(mx, my); // click-to-focus
+                            // Start a selection at this cell (cleared on release
+                            // if it stays a zero-length click).
+                            if let Some((pane, col, row)) = Self::cell_at(active, mx, my) {
+                                active.selection = Some(Selection { pane, anchor: (col, row), head: (col, row) });
+                                active.selecting = true;
+                            }
+                            active.window.request_redraw();
                         }
                     }
                 }
-                _ => {} // middle/other buttons: nothing yet
+                (ElementState::Released, MouseButton::Left) => {
+                    active.selecting = false; // drag finished
+                    // A zero-length selection was just a click: discard it, and
+                    // (copy-on-select) copy a real selection to PRIMARY.
+                    if let Some(sel) = active.selection {
+                        if sel.anchor == sel.head {
+                            active.selection = None;
+                        } else if let Some(text) = Self::selected_text(active) {
+                            if let Some(cb) = &active.clipboard {
+                                cb.store_primary(text); // PRIMARY for middle-click paste
+                            }
+                        }
+                        active.window.request_redraw();
+                    }
+                }
+                (ElementState::Pressed, MouseButton::Middle) => {
+                    // Middle-click pastes the PRIMARY selection (X/Wayland idiom).
+                    if let Some(cb) = &active.clipboard {
+                        if let Ok(text) = cb.load_primary() {
+                            if !text.is_empty() {
+                                active.session.feed_input(text.as_bytes());
+                            }
+                        }
+                    }
+                }
+                _ => {} // other buttons / releases: nothing
             },
 
             // Time to paint.
@@ -597,11 +690,81 @@ impl App {
             // Everything else is a session action.
             other => match active.session.apply(other) {
                 Some(SessionEvent::CloseWindow) => std::process::exit(0), // last pane closed
+                Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
+                Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
                 Some(SessionEvent::Redraw) => active.window.request_redraw(),
-                // No-op or clipboard (not yet wired to the OS): nothing to do.
-                _ => {}
+                None => {}
             },
         }
+    }
+
+    /// Paste the clipboard's text into the focused pane(s). No-op if the
+    /// clipboard is empty/unavailable.
+    fn do_paste(active: &mut Active) {
+        if let Some(cb) = &active.clipboard {
+            if let Ok(text) = cb.load() {
+                if !text.is_empty() {
+                    active.session.feed_input(text.as_bytes()); // respects broadcast mode
+                }
+            }
+        }
+    }
+
+    /// Copy the current selection to the clipboard (and PRIMARY for middle-click
+    /// paste). No-op if there is no selection.
+    fn do_copy(active: &mut Active) {
+        if let Some(text) = Self::selected_text(active) {
+            if !text.is_empty() {
+                if let Some(cb) = &active.clipboard {
+                    cb.store(text.clone()); // CLIPBOARD (Ctrl+Shift+V / apps)
+                    cb.store_primary(text); // PRIMARY (middle-click paste)
+                }
+            }
+        }
+    }
+
+    /// Extract the selected text from its pane's grid, row by row, trimming
+    /// trailing blanks and joining rows with newlines. `None` if no selection.
+    fn selected_text(active: &Active) -> Option<String> {
+        let sel = active.selection.as_ref()?; // the active selection
+        let snap = active.session.pane(sel.pane)?.snapshot(); // that pane's grid
+        let ((sc, sr), (ec, er)) = sel.ordered(); // start precedes end (row-major)
+        let mut out = String::new();
+        for row in sr..=er {
+            let Some(line) = snap.rows.get(row) else { break }; // row out of range
+            let last = line.len().saturating_sub(1); // last valid column
+            let c0 = if row == sr { sc.min(last) } else { 0 }; // first column on this row
+            let c1 = if row == er { ec.min(last) } else { last }; // last column on this row
+            if c0 <= c1 {
+                let s: String = line[c0..=c1].iter().map(|cell| cell.c).collect();
+                out.push_str(s.trim_end()); // drop trailing blanks
+            }
+            if row != er {
+                out.push('\n'); // newline between rows
+            }
+        }
+        Some(out)
+    }
+
+    /// Map a physical-pixel point to `(pane, col, row)` in that pane's grid, for
+    /// selection. Returns `None` for column-mode panes (their re-tiled layout
+    /// makes cell mapping ambiguous — selection there is a follow-up) or points
+    /// outside any pane.
+    fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
+        let size = active.window.inner_size();
+        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let (cw, ch) = active.renderer.cell_size();
+        for (id, rect) in active.session.tree().rects(bounds) {
+            if rect.contains(mx, my) {
+                if active.session.columns_of(id) > 1 {
+                    return None; // skip newspaper-column panes for now
+                }
+                let col = ((mx - rect.x) / cw).max(0.0) as usize; // cell column
+                let row = ((my - rect.y) / ch).max(0.0) as usize; // cell row
+                return Some((id, col, row));
+            }
+        }
+        None
     }
 
     /// Persist the current settings to the config file, logging (not failing) on
@@ -692,6 +855,9 @@ impl App {
             if let Some(pane) = active.session.pane(id) {
                 let snap = pane.snapshot(); // in column mode this is a count*rows-tall screen
                 let geom = active.session.column_layout(id, rect); // count/col_cells/rows/gap
+                // The selection, if it belongs to this (single-column) pane.
+                let pane_sel: Option<Selection> = active.selection.filter(|s| n <= 1 && s.pane == id);
+                let sel_bg = Color::rgb(0x33, 0x44, 0x66); // selection highlight colour
                 // One column's height in rows. For a single pane the whole
                 // snapshot stacks directly, so we use a sentinel that keeps the
                 // mapping a no-op.
@@ -718,7 +884,11 @@ impl App {
                     }
                     let (ox, sub) = place(r); // where this line draws
                     for (col_idx, cell) in row.iter().enumerate() {
-                        if cell.bg != rt_engine::DEFAULT_BG {
+                        // Selection highlight wins over the cell's own background;
+                        // otherwise draw an explicit (non-default) background.
+                        if pane_sel.map_or(false, |s| s.contains(col_idx, sub)) {
+                            active.renderer.fill_cell(ox, rect.y, col_idx, sub, sel_bg);
+                        } else if cell.bg != rt_engine::DEFAULT_BG {
                             let c = cell.bg; // per-cell background colour
                             active.renderer.fill_cell(ox, rect.y, col_idx, sub, Color::rgb(c[0], c[1], c[2]));
                         }
