@@ -166,6 +166,18 @@ rt/
   fallback. Starts single-column always.
 - ☐ Scroll indicator; selection across columns; column count in saved layouts.
 
+### M5c — Appearance: translucency + blur  ☑  (scrim verified; KWin blur unverified-on-KDE)
+- ☑ Translucency: premultiplied-alpha renderer; `background_opacity` setting;
+  `Ctrl+Alt+Up/Down`, `RT_OPACITY`. Opaque render verified unchanged.
+- ☑ Scrim (portable blur stand-in): neutral wash compresses legibility of what
+  shows through; `scrim_strength`; `Ctrl+Alt+Right/Left`, `RT_SCRIM`. Render
+  verified (`docs/screenshots/scrim.png`).
+- ☑ KWin blur request (`org_kde_kwin_blur`) in `crates/rt/src/blur.rs`: verified
+  SAFE no-op on non-KDE; **unverified on live KWin** (no KDE session). See
+  `docs/APPEARANCE.md`.
+- ☐ On-machine: confirm see-through + scrim over real content; confirm KWin blur
+  on a KDE box. Preferences panel with actual sliders (still config/keys/env now).
+
 ### M5 — Terminator features  ◐  (controller logic done + tested; GL wiring next)
 - ☑ Keybinding config parse (`rt-config`): Terminator accelerator syntax +
   default map + `Action` enum. 6 tests.
