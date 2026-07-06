@@ -380,22 +380,26 @@ impl TermPane {
         let term = self.term.lock(); // read access to the grid
         let cols = term.columns(); // current column count
         let rows = term.screen_lines(); // current visible row count
-        // Pre-fill a blank grid so every cell has a defined value even if the
-        // iterator skips empties.
-        let mut grid = vec![vec![SnapCell::blank(); cols]; rows];
-        // Walk the visible cells. `display_iter` yields each cell with its
-        // point (line, column) in viewport coordinates.
+        // How many lines the view is scrolled up into history. `display_iter`
+        // yields cells with their ABSOLUTE grid line (negative into history), so
+        // we add this offset to map them back onto viewport rows 0..rows.
+        let offset = term.grid().display_offset() as i32;
+        // Pre-fill a blank grid in the CONFIGURED background colour, so any cell
+        // the iterator doesn't cover (e.g. above the top of history) stays the
+        // translucent default rather than an opaque hardcoded colour.
+        let blank = SnapCell { c: ' ', fg: self.palette.fg, bg: self.palette.bg, attrs: CellAttrs::default() };
+        let mut grid = vec![vec![blank.clone(); cols]; rows];
+        // Walk the visible cells.
         for cell in term.grid().display_iter() {
-            let line = cell.point.line.0; // i32 line index within the viewport
+            let row = cell.point.line.0 + offset; // absolute line → viewport row (top = 0)
             let col = cell.point.column.0; // usize column index
-            // Guard the indices: the iterator stays in range, but bounds-check
-            // anyway so a future engine change can never make this panic.
-            if line >= 0 && (line as usize) < rows && col < cols {
+            // Guard the indices so scrolling or an engine change can't panic.
+            if row >= 0 && (row as usize) < rows && col < cols {
                 // Resolve this cell's colours (attribute flags folded in) and
                 // its drawing attributes (underline/italic/strikeout).
                 let (fg, bg) = self.resolve_colors(&cell); // fg/bg RGB
                 let attrs = Self::attrs_of(cell.flags); // underline/italic/strikeout
-                grid[line as usize][col] = SnapCell { c: cell.c, fg, bg, attrs };
+                grid[row as usize][col] = SnapCell { c: cell.c, fg, bg, attrs };
             }
         }
         // Capture the cursor position, but only when it is actually shown and

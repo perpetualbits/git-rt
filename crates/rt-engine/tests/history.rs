@@ -53,3 +53,36 @@ fn snapshot_lines_reads_scrollback_in_order() {
 fn row_text(row: &[rt_engine::SnapCell]) -> String {
     row.iter().map(|c| c.c).collect::<String>()
 }
+
+/// Scrolling up must reveal scrollback history, not blank it out. This guards
+/// the display_offset bug where scrolled cells (negative grid lines) were
+/// dropped, leaving the view mostly empty.
+#[test]
+fn scroll_up_reveals_history_not_blanks() {
+    let pane = TermPane::spawn(
+        Some(("/bin/sh".to_string(), vec!["-c".to_string(), "for i in $(seq 1 80); do echo LINE$i; done".to_string()])),
+        None,
+        80,
+        24,
+    )
+    .expect("pane spawns");
+
+    // Wait until the newest line is on screen.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if pane.snapshot().to_text().contains("LINE80") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Scroll up 30 lines into history.
+    pane.scroll(30);
+    let text = pane.snapshot().to_text();
+    // The scrolled view should be full of history, not blanked out.
+    let nonblank = text.lines().filter(|l| !l.trim().is_empty()).count();
+    assert!(nonblank > 15, "scrolled view is mostly blank ({nonblank} non-blank lines):\n{text}");
+    // And it should show older lines that were off-screen at the bottom.
+    assert!(text.contains("LINE50") || text.contains("LINE45") || text.contains("LINE40"),
+        "scrolled view missing history:\n{text}");
+}
