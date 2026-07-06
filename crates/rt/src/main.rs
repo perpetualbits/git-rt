@@ -147,15 +147,21 @@ impl ApplicationHandler for App {
         // --- create the window and choose a GL config --------------------
         let window_attrs = Window::default_attributes()
             .with_title("rt") // window title; per-pane titles update it later
+            .with_transparent(true) // REQUIRED for the compositor to honour our alpha
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0)); // sensible default
         let template = ConfigTemplateBuilder::new().with_alpha_size(8); // want an alpha channel
         // DisplayBuilder creates the window AND enumerates GL configs together,
         // which is the supported winit-0.30/glutin-0.32 pattern.
         let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attrs));
         let (window, gl_config) = match display_builder.build(event_loop, template, |configs| {
-            // Pick the config with the most samples (nicest); fall back to first.
+            // Pick a config that HAS an alpha channel first (needed for a
+            // transparent window), then, among equal alpha, the most samples.
             configs
-                .reduce(|a, b| if b.num_samples() > a.num_samples() { b } else { a })
+                .reduce(|a, b| {
+                    let better_alpha = b.alpha_size() > a.alpha_size(); // prefer any alpha
+                    let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
+                    if better_alpha || same_more_samples { b } else { a }
+                })
                 .expect("at least one GL config")
         }) {
             Ok((Some(window), config)) => (window, config), // got a window + config
@@ -648,19 +654,38 @@ impl App {
                     }
                 }
 
-                // Block cursor: fill the cell in the cursor colour, then redraw
-                // the glyph under it in that cell's background colour (inverse)
-                // so it stays legible.
+                // Cursor: shape depends on what the app requested (block/
+                // underline/beam) and on focus — an UNFOCUSED pane always shows a
+                // hollow outline (your request). A focused solid block is filled
+                // and the glyph under it is redrawn in the cell background so it
+                // stays legible; the other shapes sit over the normal glyph.
                 if let Some(cur) = snap.cursor {
                     let in_range = cur.line < snap.rows.len() && (n <= 1 || cur.line / per_col < geom.count as usize);
                     if in_range {
+                        use rt_engine::CursorShape;
                         let (ox, sub) = place(cur.line); // cursor's on-screen slot
-                        let cc = rt_engine::CURSOR; // cursor block colour
-                        active.renderer.fill_cell(ox, rect.y, cur.col, sub, Color::rgb(cc[0], cc[1], cc[2]));
-                        if let Some(under) = snap.rows.get(cur.line).and_then(|rw| rw.get(cur.col)) {
-                            if under.c != ' ' {
-                                let ub = under.bg; // draw the glyph in the cell bg for contrast
-                                active.renderer.draw_char(ox, rect.y, cur.col, sub, under.c, Color::rgb(ub[0], ub[1], ub[2]), under.attrs.bold, under.attrs.italic);
+                        let cc = rt_engine::CURSOR; // cursor colour
+                        let ccol = Color::rgb(cc[0], cc[1], cc[2]);
+                        let focused = id == focus; // is this the focused pane?
+                        if !focused {
+                            // Unfocused: hollow outline regardless of shape.
+                            active.renderer.cursor_hollow(ox, rect.y, cur.col, sub, ccol);
+                        } else {
+                            match cur.shape {
+                                CursorShape::Block => {
+                                    // Solid block + inverse glyph for contrast.
+                                    active.renderer.fill_cell(ox, rect.y, cur.col, sub, ccol);
+                                    if let Some(u) = snap.rows.get(cur.line).and_then(|rw| rw.get(cur.col)) {
+                                        if u.c != ' ' {
+                                            let ub = u.bg;
+                                            active.renderer.draw_char(ox, rect.y, cur.col, sub, u.c, Color::rgb(ub[0], ub[1], ub[2]), u.attrs.bold, u.attrs.italic);
+                                        }
+                                    }
+                                }
+                                CursorShape::HollowBlock => active.renderer.cursor_hollow(ox, rect.y, cur.col, sub, ccol),
+                                CursorShape::Underline => active.renderer.cursor_underline(ox, rect.y, cur.col, sub, ccol),
+                                CursorShape::Beam => active.renderer.cursor_beam(ox, rect.y, cur.col, sub, ccol),
+                                CursorShape::Hidden => {} // nothing (snapshot already filters, but be safe)
                             }
                         }
                     }

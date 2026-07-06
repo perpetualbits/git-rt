@@ -16,6 +16,7 @@
 
 mod palette; // xterm 256-colour palette + cell-colour resolution
 pub use palette::{Rgb, CURSOR, DEFAULT_BG, DEFAULT_FG}; // colours the renderer needs
+// (CursorShape/CursorPos are defined below and used by the renderer.)
 
 use std::borrow::Cow; // Msg::Input takes a Cow<[u8]>; we always own our bytes
 use std::collections::VecDeque; // FIFO queue of high-level events for the GUI to drain
@@ -76,12 +77,27 @@ impl SnapCell {
     }
 }
 
+/// The shape the terminal has requested for its cursor (via DECSCUSR). Editors
+/// use this to signal e.g. insert (a beam/bar) vs overwrite (a block/underline)
+/// mode. `HollowBlock` is what an *unfocused* terminal shows; `Hidden` means the
+/// app asked for no cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorShape {
+    Block,       // solid block, the usual default
+    Underline,   // a bar along the bottom of the cell (common for overwrite mode)
+    Beam,        // a thin vertical bar at the cell's left (common for insert mode)
+    HollowBlock, // an outline block
+    Hidden,      // draw nothing
+}
+
 /// Where the text cursor is within a snapshot, in the snapshot's own row/column
-/// coordinates. `None` when the cursor is hidden or the view is scrolled back.
+/// coordinates, plus the shape to draw it. `None` (on [`Snapshot`]) when the
+/// cursor is hidden or the view is scrolled back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorPos {
-    pub col: usize,  // column within the captured grid
-    pub line: usize, // row within the captured grid (0 = top of the snapshot)
+    pub col: usize,          // column within the captured grid
+    pub line: usize,         // row within the captured grid (0 = top of the snapshot)
+    pub shape: CursorShape,  // the shape the app requested for the cursor
 }
 
 /// An immutable snapshot of a pane's visible grid, produced for rendering or
@@ -386,13 +402,22 @@ impl TermPane {
         // the view is not scrolled back into history (a scrolled-back cursor is
         // off-screen and must not be drawn).
         let cursor = if term.mode().contains(TermMode::SHOW_CURSOR) && term.grid().display_offset() == 0 {
+            // Map the terminal's requested cursor shape to ours; a Hidden shape
+            // means "draw nothing".
+            let shape = match term.cursor_style().shape {
+                alacritty_terminal::vte::ansi::CursorShape::Block => CursorShape::Block,
+                alacritty_terminal::vte::ansi::CursorShape::Underline => CursorShape::Underline,
+                alacritty_terminal::vte::ansi::CursorShape::Beam => CursorShape::Beam,
+                alacritty_terminal::vte::ansi::CursorShape::HollowBlock => CursorShape::HollowBlock,
+                alacritty_terminal::vte::ansi::CursorShape::Hidden => CursorShape::Hidden,
+            };
             let p = term.grid().cursor.point; // cursor point in viewport coords
             let line = p.line.0; // i32 line
             let col = p.column.0; // usize column
-            if line >= 0 && (line as usize) < rows && col < cols {
-                Some(CursorPos { col, line: line as usize }) // on-screen: report it
+            if shape != CursorShape::Hidden && line >= 0 && (line as usize) < rows && col < cols {
+                Some(CursorPos { col, line: line as usize, shape }) // on-screen: report it
             } else {
-                None // out of the visible region
+                None // hidden shape or out of the visible region
             }
         } else {
             None // hidden or scrolled back

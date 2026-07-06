@@ -71,3 +71,18 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
 - ☐ **Opacity/Blur menu items need a compositing compositor.** They change the
   window's alpha/scrim; with an opaque window or nothing behind it, there's no
   visible effect. Not a dispatch bug.
+
+## Cursor & transparency (2026-07-06)
+- ☑ **Cursor shape honours the terminal + focus.** rt now reads
+  `Term::cursor_style()` (DECSCUSR) and draws Block / Underline / Beam / hidden
+  accordingly — so an editor's insert (beam) vs overwrite (underline) cursor
+  shows correctly. An **unfocused** pane always draws a hollow outline; the
+  focused pane draws the requested shape (solid block by default). Verified:
+  `docs/screenshots/cursor-focus.png`, `docs/screenshots/cursor-underline.png`.
+- ☑ **Transparency was ignored** because the window was never marked transparent.
+  Fixed: `Window::with_transparent(true)` + the GL config selection now prefers an
+  alpha-capable config. This should make both the opacity slider AND the scrim's
+  see-through effect work on a compositing Wayland compositor. (True Gaussian
+  blur still only on KDE; COSMIC/GNOME have no blur protocol — use the scrim.)
+  Not visually verifiable in this sandbox (no compositing capture); please
+  confirm on your machine with e.g. `RT_OPACITY=0.8 RT_SCRIM=0.4`.

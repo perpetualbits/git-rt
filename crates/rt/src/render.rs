@@ -444,6 +444,35 @@ impl Renderer {
         self.fill_rect(x, y, self.cell_w, self.cell_h, color); // solid fill
     }
 
+    /// Draw a hollow (outline) cell — the cursor an *unfocused* terminal shows,
+    /// regardless of its configured shape.
+    pub fn cursor_hollow(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w; // cell left
+        let y = oy + row as f32 * self.cell_h; // cell top
+        let t = (self.cell_h / 16.0).max(1.0); // outline thickness
+        self.fill_rect(x, y, self.cell_w, t, color); // top edge
+        self.fill_rect(x, y + self.cell_h - t, self.cell_w, t, color); // bottom edge
+        self.fill_rect(x, y, t, self.cell_h, color); // left edge
+        self.fill_rect(x + self.cell_w - t, y, t, self.cell_h, color); // right edge
+    }
+
+    /// Draw an underline cursor: a thick bar along the bottom of the cell (what
+    /// editors typically show for overwrite mode).
+    pub fn cursor_underline(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w; // cell left
+        let th = (self.cell_h / 8.0).max(2.0); // a chunky bar, distinct from a text underline
+        let y = oy + row as f32 * self.cell_h + self.cell_h - th; // sit on the cell bottom
+        self.fill_rect(x, y, self.cell_w, th, color);
+    }
+
+    /// Draw a beam cursor: a thin vertical bar at the cell's left (insert mode).
+    pub fn cursor_beam(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
+        let x = ox + col as f32 * self.cell_w; // cell left
+        let y = oy + row as f32 * self.cell_h; // cell top
+        let bw = (self.cell_w / 8.0).max(2.0); // bar width
+        self.fill_rect(x, y, bw, self.cell_h, color);
+    }
+
     /// Draw a 1-cell character at cell column/row within a pane whose top-left
     /// pixel is `(ox, oy)`. Skips blanks. `fg` is the glyph colour; `bold`/
     /// `italic` select the heavier / oblique faces (each falling back to the
