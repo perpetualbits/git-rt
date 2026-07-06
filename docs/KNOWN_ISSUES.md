@@ -52,3 +52,19 @@ Running list so nothing gets forgotten. Status: ☐ open · ◐ in progress · �
   sandbox (no ydotoold; winit ignores xdotool's synthetic X events), so the
   open-on-right-click is confirmed by construction; `RT_MENU=1` opens it at
   startup for inspection.
+
+## Focus & menu targeting (2026-07-06)
+- ☑ **Focus stuck on last-created pane; no click-to-focus.** Focus only moved via
+  Alt+arrows. Added `Session::focus_at(px,py)`: **left-click focuses the pane
+  under the cursor**, and **right-click focuses it before opening the menu** — so
+  the menu's Split/Close/Columns act on the pane you clicked, not whichever was
+  focused. Unit-tested (`click_to_focus_selects_pane_under_point`). This also
+  explains the earlier "menu items don't work": Close etc. WERE working, just on
+  the focused (last) pane rather than the right-clicked one.
+- ☐ **Focus-follows-mouse** not implemented (easy opt-in via a setting + the
+  existing `focus_at` on CursorMoved) — left as a future option.
+- ☐ **New Tab has no visible tab strip.** It works (adds a tab, switches to it)
+  but with no tab bar it looks like the pane was replaced. Needs a tab-strip UI.
+- ☐ **Opacity/Blur menu items need a compositing compositor.** They change the
+  window's alpha/scrim; with an opaque window or nothing behind it, there's no
+  visible effect. Not a dispatch bug.

@@ -390,6 +390,10 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => match button {
                 MouseButton::Right => {
                     log::debug!("right-click at {:?} → open menu", active.mouse);
+                    // Focus the pane under the cursor first, so the menu's
+                    // actions (Split, Close, Columns…) apply to the pane you
+                    // right-clicked — not whichever pane happened to be focused.
+                    active.session.focus_at(active.mouse.0, active.mouse.1);
                     // Open the menu at the cursor, clamped inside the window.
                     let (cw, ch) = active.renderer.cell_size();
                     let size = active.window.inner_size();
@@ -399,14 +403,19 @@ impl ApplicationHandler for App {
                     active.window.request_redraw();
                 }
                 MouseButton::Left => {
-                    // A click anywhere closes the menu; if it landed on an item,
-                    // run that item's action (same path as its keybinding).
                     if let Some(m) = active.menu.take() {
+                        // A menu is open: a click anywhere closes it; if it
+                        // landed on an item, run that item's action.
                         let (cw, ch) = active.renderer.cell_size();
                         let action = m.hit(active.mouse.0, active.mouse.1, cw, ch).and_then(|i| m.action_at(i));
                         active.window.request_redraw();
                         if let Some(a) = action {
                             Self::apply_action(active, a); // may exit on the last pane
+                        }
+                    } else {
+                        // No menu: click-to-focus the pane under the cursor.
+                        if active.session.focus_at(active.mouse.0, active.mouse.1) {
+                            active.window.request_redraw(); // repaint the focus border
                         }
                     }
                 }

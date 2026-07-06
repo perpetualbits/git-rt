@@ -164,6 +164,25 @@ fn columns_action_changes_count_and_pty_width() {
 }
 
 #[test]
+fn click_to_focus_selects_pane_under_point() {
+    // Window 1000x800; split left|right so pane0 owns x<~497, pane1 owns x>~503.
+    let (mut session, _logs) = make();
+    let p0 = session.focus();
+    let p1 = session.apply(Action::SplitVert).map(|_| ()).and(Some(())).map(|_| session.focus()).unwrap();
+    // After the split, focus is on the new right pane (p1).
+    assert_eq!(session.focus(), p1);
+    // Click in the left half → focus moves to pane0.
+    assert!(session.focus_at(100.0, 400.0));
+    assert_eq!(session.focus(), p0);
+    // Click in the right half → focus moves back to pane1.
+    assert!(session.focus_at(900.0, 400.0));
+    assert_eq!(session.focus(), p1);
+    // A click far outside any pane hits nothing and leaves focus unchanged.
+    assert!(!session.focus_at(5000.0, 5000.0));
+    assert_eq!(session.focus(), p1);
+}
+
+#[test]
 fn close_window_action_is_forwarded() {
     let (mut session, _logs) = make();
     assert_eq!(session.apply(Action::CloseWindow), Some(SessionEvent::CloseWindow));

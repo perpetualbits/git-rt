@@ -180,6 +180,24 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         self.panes.get(&id)
     }
 
+    /// Move focus to the pane whose rectangle contains the point `(px, py)` (in
+    /// the same physical-pixel space as the window bounds). Returns `true` if a
+    /// pane was found there (whether or not focus actually changed).
+    ///
+    /// This is what powers click-to-focus and "the menu acts on the pane you
+    /// right-clicked": the GUI calls it on a mouse press with the cursor
+    /// position. Only visible panes are considered (inactive tab pages have no
+    /// rectangle), which is exactly right — you can't click what you can't see.
+    pub fn focus_at(&mut self, px: f32, py: f32) -> bool {
+        for (id, rect) in self.tree.rects(self.bounds) {
+            if rect.contains(px, py) {
+                self.focus = id; // adopt the clicked pane as the focus
+                return true;
+            }
+        }
+        false // the point hit no pane (e.g. a divider gutter)
+    }
+
     /// Dispatch a semantic action. Returns an optional [`SessionEvent`] the GUI
     /// shell must handle (close window, clipboard). This is the single entry
     /// point the keymap feeds, keeping all state mutation in one auditable place.
