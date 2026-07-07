@@ -84,6 +84,9 @@ struct Active {
     heat: std::collections::HashMap<rt_core::PaneId, f32>, // per-pane CPU load (heat instrument)
     heat_ticks: std::collections::HashMap<rt_core::PaneId, u64>, // last session CPU ticks per pane
     heat_last: Instant,                   // wall-clock of the last /proc heat sample
+    lat_phase: f32,                       // phase of the latency frame's undulation
+    stall: f32,                           // latency-spike severity (decays); flares on a late wake
+    last_wake: Instant,                   // wall-clock of the previous event-loop wake
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
@@ -552,6 +555,9 @@ impl ApplicationHandler for App {
             heat: std::collections::HashMap::new(),
             heat_ticks: std::collections::HashMap::new(),
             heat_last: Instant::now(),
+            lat_phase: 0.0,
+            stall: 0.0,
+            last_wake: Instant::now(),
             last_click: None,
             click_count: 0,
             egui_ctx,
@@ -927,6 +933,18 @@ impl ApplicationHandler for App {
     /// so terminal output appears without the user touching the keyboard.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(active) = self.active.as_mut() else { return };
+        // Latency instrument: the loop is scheduled to wake ~every 16ms; a wake
+        // that arrives much later means a CPU hogger stole the frame. Measure the
+        // overrun, flare the frame proportionally, and breathe the undulation.
+        let now = Instant::now();
+        let wake_dt = now.duration_since(active.last_wake).as_secs_f32().min(0.5);
+        active.last_wake = now;
+        let overrun = wake_dt - 0.016; // vs the 16ms WaitUntil budget
+        if overrun > 0.010 {
+            active.stall = active.stall.max((overrun / 0.05).clamp(0.0, 1.0)); // keep the worst recent hitch
+        }
+        active.lat_phase = (active.lat_phase + 0.12 * wake_dt).fract(); // calm breath
+        active.stall *= (-wake_dt / 0.6).exp(); // decay toward calm
         // Drain events from every live pane. Output/title/bell means repaint; a
         // pane whose shell exited is collected for closing after the loop (we
         // can't mutate the session while iterating its panes).
@@ -991,6 +1009,10 @@ impl ApplicationHandler for App {
         // Keep repainting while any border flow is still moving, so it eases to a
         // stop (and decays) instead of freezing mid-orbit when output pauses.
         if active.meters.values().any(|m| m.rate > 0.5) {
+            dirty = true;
+        }
+        // And while a latency flare is fading, so the spike animates out.
+        if active.stall > 0.02 {
             dirty = true;
         }
         // While the search bar is open, keep its results current as new output
@@ -1931,6 +1953,19 @@ impl App {
                     painter.circle_filled(p, 3.4, core); // bright centre
                 }
             }
+            // Latency: the whole-window frame, drawn last so it wins the outer
+            // ring. Short violet segments each coloured by the undulation, with a
+            // fast bright flare travelling round when a deadline was missed.
+            let (ww, wh) = (size.width as f32 / ppp, size.height as f32 / ppp);
+            const LAT_SEGS: u32 = 96;
+            for i in 0..LAT_SEGS {
+                let t0 = i as f32 / LAT_SEGS as f32;
+                let t1 = (i + 1) as f32 / LAT_SEGS as f32;
+                let p0 = flow_point(1.0, 1.0, ww - 2.0, wh - 2.0, t0);
+                let p1 = flow_point(1.0, 1.0, ww - 2.0, wh - 2.0, t1);
+                let col = latency_color(t0, active.lat_phase, active.stall);
+                painter.line_segment([p0, p1], egui::Stroke::new(2.0, col));
+            }
         }
         let output = ctx.end_pass();
         active.egui_state.handle_platform_output(&active.window, output.platform_output);
@@ -2000,6 +2035,30 @@ impl App {
         active.search_pane = None;
         active.window.request_redraw();
     }
+}
+
+/// Colour of the latency frame at perimeter position `pos` (0..1): a calm
+/// purple-blue-violet undulation, plus a bright fast-moving flare scaled by
+/// `stall` (a recent deadline miss). Ported from rt-mux.
+fn latency_color(pos: f32, phase: f32, stall: f32) -> egui::Color32 {
+    use std::f32::consts::TAU;
+    let wave = 0.5 + 0.5 * (TAU * (pos * 2.0 + phase)).sin(); // two slow lobes drifting
+    let base = 0.20 + 0.30 * wave;
+    let spike = if stall > 0.01 {
+        let sp = (phase * 4.0).fract(); // the flare laps faster than the calm wave
+        let mut d = (pos - sp).abs();
+        if d > 0.5 {
+            d = 1.0 - d;
+        }
+        stall * (-d * d / (2.0 * 0.06 * 0.06)).exp() // gaussian bump
+    } else {
+        0.0
+    };
+    let v = (base + spike).clamp(0.0, 1.0);
+    let r = (56.0 + 128.0 * v + spike * 120.0).min(255.0) as u8;
+    let g = (32.0 + 80.0 * v + spike * 110.0).min(255.0) as u8;
+    let b = (88.0 + 152.0 * v + spike * 40.0).min(255.0) as u8;
+    egui::Color32::from_rgb(r, g, b)
 }
 
 /// Planck/blackbody colour for a CPU load (fraction of one core): idle glows a
