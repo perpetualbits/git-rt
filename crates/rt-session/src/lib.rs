@@ -117,6 +117,10 @@ pub struct Session<B: Backend, F: FnMut(PaneId, usize, usize) -> B> {
 /// Vertical padding added to the cell height to size a per-pane titlebar strip.
 const TITLEBAR_PAD: f32 = 4.0;
 
+/// Inner padding (px) between a pane's edge and its terminal text, so the pane
+/// border / heat tint / latency frame never overlap the first characters.
+const PANE_PAD: f32 = 5.0;
+
 impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
     /// Create a session with a single initial pane filling `bounds`.
     ///
@@ -511,14 +515,21 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
         }
     }
 
-    /// The content rectangle of a pane whose full rectangle is `rect`: the same
-    /// box minus the titlebar strip reserved at its top. This is the single
-    /// definition of "where a pane's terminal grid lives"; both the layout
-    /// (PTY sizing) and the renderer (drawing/hit-testing) route through it so a
-    /// titlebar can never desync the grid from what the mouse hits.
+    /// The content rectangle of a pane whose full rectangle is `rect`: the box
+    /// minus the titlebar strip at its top and a small inner padding on every
+    /// side (so the border / heat tint / latency frame never sit on the text).
+    /// This is the single definition of "where a pane's terminal grid lives";
+    /// both the layout (PTY sizing) and the renderer (drawing/hit-testing) route
+    /// through it so nothing can desync the grid from what the mouse hits.
     pub fn content_rect(&self, rect: Rect) -> Rect {
-        let h = self.titlebar_h(); // reserved header height (0 if disabled)
-        Rect::new(rect.x, rect.y + h, rect.w, (rect.h - h).max(0.0))
+        let p = PANE_PAD;
+        let top = self.titlebar_h() + p; // titlebar (0 if off) + top padding
+        Rect::new(
+            rect.x + p,
+            rect.y + top,
+            (rect.w - 2.0 * p).max(0.0),
+            (rect.h - top - p).max(0.0),
+        )
     }
 
     /// Update the character-cell pixel size (after a font change) so subsequent

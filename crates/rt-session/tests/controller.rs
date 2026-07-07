@@ -183,16 +183,17 @@ fn columns_action_changes_count_and_pty_width() {
     session.apply(Action::ColumnsMore);
     session.apply(Action::ColumnsMore);
     assert_eq!(session.columns_of(first), 4);
-    // The PTY should now be one column WIDE and count*rows TALL: width =
-    // (100 - gaps 2*(4-1)=6)/4 = 23; height = 4 columns * 40 rows = 160. This
-    // taller screen is what lets a full-screen app (vim) columnize transparently.
-    assert_eq!(logs.borrow()[0].borrow().size, (23, 160));
+    // The PTY should now be one column WIDE and count*rows TALL. With the 5px
+    // inner padding the content is 99x39 cells: width = (99 - gaps 2*(4-1)=6)/4 =
+    // 23; height = 4 columns * 39 rows = 156. This taller screen is what lets a
+    // full-screen app (vim) columnize transparently.
+    assert_eq!(logs.borrow()[0].borrow().size, (23, 156));
     // Ctrl+, floors at 1 no matter how many times pressed.
     for _ in 0..5 {
         session.apply(Action::ColumnsFewer);
     }
     assert_eq!(session.columns_of(first), 1); // never below 1
-    assert_eq!(logs.borrow()[0].borrow().size, (100, 40)); // back to full width and normal height
+    assert_eq!(logs.borrow()[0].borrow().size, (99, 39)); // full content (minus 5px inner padding)
 }
 
 #[test]
