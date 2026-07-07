@@ -10,13 +10,20 @@ pub fn ui(ctx: &egui::Context, close: &mut bool) {
         .collapsible(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                // Monospace so the aligned key columns and example code line up.
-                ui.add(
-                    egui::Label::new(egui::RichText::new(MANUAL).monospace().size(13.0))
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                );
-            });
+            // Reserve room for the separator + Close button, then let the scroll
+            // area fill the rest — otherwise (with auto_shrink off) it would eat
+            // the button's space and push it below the window.
+            const RESERVE: f32 = 36.0;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height((ui.available_height() - RESERVE).max(80.0))
+                .show(ui, |ui| {
+                    // Monospace so the aligned key columns and example code line up.
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(MANUAL).monospace().size(13.0))
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
             ui.separator();
             if ui.button("Close  (F1 / Esc)").clicked() {
                 *close = true;
