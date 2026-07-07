@@ -23,7 +23,7 @@
 //! are all mullion's; the PTY layer is all rt-engine's; this file is only the
 //! seam between them.
 
-use std::collections::HashMap; // tile id -> pane, and tile id -> title
+use std::collections::{HashMap, HashSet}; // pane/title maps + routable free cells
 use std::ffi::CString; // mkfifo path
 use std::fs::{File, OpenOptions}; // the fifo endpoints
 use std::io::{self, Read, Stdout, Write}; // stdout backend + Result + pipe I/O
@@ -45,6 +45,10 @@ const MAX_LAPS_PER_SEC: f32 = 0.6;
 
 /// Bytes/second across a wire that reads as "fully busy" for its flow animation.
 const WIRE_BUSY_BYTES: f32 = 4096.0;
+/// Packets travelling along a wire at once.
+const WIRE_PACKETS: u32 = 3;
+/// Gaussian width of a wire packet (in normalised path position).
+const WIRE_SIGMA: f32 = 0.06;
 /// Speed of the latency frame's calm undulation, in laps/second (slow breath).
 const LAT_SPEED: f32 = 0.12;
 /// Time constant for a latency spike to fade back to calm.
@@ -58,15 +62,19 @@ const MISS_SLOP: f32 = 0.010;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers}; // input events (mullion's crossterm)
 
 use mullion::backend::{Backend, CrosstermBackend}; // Backend trait (size) + the real terminal backend
-use mullion::border::{draw_box, render_rim, render_shared, Borders, BorderStyle, CornerStyle, LineWeight}; // borders + rim animation
+use mullion::border::{draw_box, render_rim, Borders, BorderStyle, CornerStyle, LineWeight}; // borders + rim animation
 use mullion::buffer::Buffer; // the cell buffer we paint into
 use mullion::capabilities::Capabilities; // terminal feature probe (colour depth, unicode…)
 use mullion::ease::gaussian; // bump shape for the flowing packets
+use mullion::float::free_cells_in_window; // routable cells between panes
 use mullion::geometry::Rect; // tile rectangles
+use mullion::label::Side; // socket edges
 use mullion::layout::{solve, Constraint, Node, Orientation, TileId}; // the layout tree + solver
+use mullion::route::{render as render_connectors, route_all, Connector, RouteRequest}; // wire routing
+use mullion::socket::{draw_socket, Flow, Socket}; // patch-bay jacks
 use mullion::style::{Color, Modifier, Style}; // cell colours + attributes
 use mullion::terminal::{EventReader, Terminal}; // double-buffer driver + threaded input
-use mullion::tree::{focus_override, Direction, Tree}; // focus/zoom wrapper + focus-thickening
+use mullion::tree::{Direction, Tree}; // focus/zoom wrapper
 
 use rt_engine::{PaneEvent, TermPane}; // the terminal engine (PTY + alacritty grid)
 
@@ -592,7 +600,45 @@ impl Mux {
         });
     }
 
-    /// Paint one frame: draw the shared tile borders, then blit every pane's
+    /// Overlay a green flow along a routed wire's `path` (already drawn as dim
+    /// base glyphs), scaled by the wire's live throughput. Packets travel
+    /// source→destination: an idle wire stays dim, a busy one shows bright green
+    /// packets marching across — the literal bytes on the pipe.
+    fn draw_wire_flow(buf: &mut Buffer, path: &[(u16, u16)], phase: f32, rate: f32) {
+        if path.len() < 2 {
+            return;
+        }
+        let activity = (rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
+        let last = (path.len() - 1) as f32;
+        let (bw, bh) = (buf.area.width, buf.area.height);
+        for (j, &(x, y)) in path.iter().enumerate() {
+            if x >= bw || y >= bh {
+                continue; // never index outside the buffer
+            }
+            let pos = j as f32 / last; // 0 at the source .. 1 at the destination
+            // Nearest of the marching packets (linear, not wrapped — a wire is a
+            // line with a direction, not a loop).
+            let mut best = 0.0f32;
+            for k in 0..WIRE_PACKETS {
+                let pp = (phase + k as f32 / WIRE_PACKETS as f32).fract();
+                let g = gaussian(pos - pp, WIRE_SIGMA);
+                if g > best {
+                    best = g;
+                }
+            }
+            let i = best * (0.15 + 0.85 * activity);
+            if i <= 0.06 {
+                continue; // leave the dim base wire colour between packets
+            }
+            let r = (0x18 as f32 + 0x34 as f32 * i) as u8;
+            let g = (0x44 as f32 + 0xb8 as f32 * i) as u8;
+            let b = (0x24 as f32 + 0x34 as f32 * i) as u8;
+            let cell = buf.get_mut(x, y);
+            cell.style = cell.style.fg(Color::Rgb(r, g, b)); // recolour, keep the glyph
+        }
+    }
+
+    /// Paint one frame: draw the floating pane boxes and routed wires, then blit
     /// snapshot into its content rectangle, overlay titles, and mark the focused
     /// pane's cursor. Finally draw a one-line command hint at the very bottom.
     fn render(&mut self, buf: &mut Buffer) {
@@ -613,81 +659,124 @@ impl Mux {
         );
         self.area = tiling; // remember for next frame's directional focus
 
-        // A calm rounded frame; the focused tile is thickened via `focus_override`.
-        let border_style = BorderStyle {
-            weight: LineWeight::Light,
-            corners: CornerStyle::Rounded,
-            style: Style::default().fg(Color::Rgb(0x50, 0x50, 0x64)),
-        };
         let focus = self.tree.focus();
-        let overrides = focus_override(&self.tree, LineWeight::Heavy); // thicken the focused border
-        // Full tile rectangles (border included) for the instrument rings, keyed
-        // by id so we can match them to the content rects below.
-        let tiles: HashMap<TileId, Rect> =
-            solve(self.tree.effective_root_mut(), tiling).into_iter().collect();
-        // Draw shared single-cell seams + outer frame, and get each tile's interior.
-        let rects = render_shared(buf, self.tree.effective_root_mut(), tiling, &border_style, &overrides);
+        // Each solved tile inset by one cell → a floating pane box, leaving gutters
+        // between panes for wires to route through (the wires.rs aesthetic).
+        let tiles = solve(self.tree.effective_root_mut(), tiling);
+        let boxes: Vec<(TileId, Rect)> = tiles
+            .iter()
+            .filter_map(|&(id, t)| {
+                let b = inset(t, 1);
+                (b.width >= 3 && b.height >= 3).then_some((id, b))
+            })
+            .collect();
+        let obstacles: Vec<Rect> = boxes.iter().map(|&(_, r)| r).collect();
 
-        for (id, rect) in rects {
-            if rect.width == 0 || rect.height == 0 {
-                continue; // a tile squeezed to nothing this frame
+        // ── Wires first (drawn under the panes) ─────────────────────────────
+        if !self.wires.is_empty() {
+            // Cells not covered by any pane box are routable.
+            let free: HashSet<(u16, u16)> =
+                free_cells_in_window(tiling, &obstacles, 0, tiling).into_iter().collect();
+            let box_of = |id: TileId| boxes.iter().find(|&&(i, _)| i == id).map(|&(_, r)| r);
+            // One routing request per wire; keep which wire each maps to.
+            let mut reqs = Vec::new();
+            let mut active: Vec<usize> = Vec::new();
+            for (wi, w) in self.wires.iter().enumerate() {
+                let (Some(sb), Some(db)) = (box_of(w.src), box_of(w.dst)) else { continue };
+                let (so, di) = (out_socket(sb.height), in_socket(db.height));
+                let (Some(start), Some(goal)) = (so.attach(sb), di.attach(db)) else { continue };
+                reqs.push(RouteRequest::new(start, goal, so.outward().opposite(), di.outward().opposite()));
+                active.push(wi);
             }
-            // Instrument first: flow the output-activity packets around the border
-            // ring (reads `meters`; runs before the pane borrow and before the
-            // title so the title draws on top of it).
-            if let Some(&tile) = tiles.get(&id) {
-                self.draw_output_flow(buf, id, tile);
-            }
-            let Some(pane) = self.panes.get_mut(&id) else { continue }; // no engine for this tile
-            // Size the PTY to its content rectangle (rt-engine resizes the grid
-            // synchronously, so the snapshot below already reflects it).
-            pane.resize((rect.width as usize).max(1), (rect.height as usize).max(1));
-            let snap = pane.snapshot(); // char + fg/bg + attrs grid
-
-            // Blit the grid cell-for-cell into the tile.
-            for (r, row) in snap.rows.iter().enumerate() {
-                let y = rect.y + r as u16;
-                if y >= rect.bottom() {
-                    break; // past the tile's bottom
-                }
-                for (c, cell) in row.iter().enumerate() {
-                    let x = rect.x + c as u16;
-                    if x >= rect.right() {
-                        break; // past the tile's right edge
-                    }
-                    buf.set_char(x, y, cell.c, style_of(cell)); // the actual cells-into-cells write
-                }
-            }
-
-            // Focused pane: mark the cursor cell with reverse video (a block cursor).
-            if Some(id) == focus {
-                if let Some(cur) = snap.cursor {
-                    let cx = rect.x + cur.col as u16;
-                    let cy = rect.y + cur.line as u16;
-                    if cx < rect.right() && cy < rect.bottom() {
-                        let cell = buf.get_mut(cx, cy);
-                        cell.style = cell.style.add_modifier(Modifier::REVERSE);
-                    }
+            // Route them together (nudges parallels apart, biases away crossings).
+            let conns = route_all(&free, &reqs, 4, 8);
+            let connectors: Vec<Connector> = conns.iter().flatten().cloned().collect();
+            let base = vec![Style::default().fg(Color::Rgb(0x18, 0x44, 0x24)); connectors.len()]; // dim green
+            let canvas = Rect::new(0, 0, full.width, full.height);
+            render_connectors(buf, canvas, (0, 0), &connectors, &base, &obstacles, LineWeight::Light);
+            // Green flow along each routed wire, scaled by its live throughput.
+            for (j, c) in conns.iter().enumerate() {
+                if let Some(conn) = c {
+                    let w = &self.wires[active[j]];
+                    Self::draw_wire_flow(buf, &conn.path, w.phase, w.rate);
                 }
             }
+        }
 
-            // Title overlaid on the top border (like tmux/Terminator).
-            if rect.y >= 1 {
-                let title = self.titles.get(&id).map(String::as_str).unwrap_or("");
-                let label = if title.is_empty() {
-                    format!(" shell {id} ")
+        // ── Panes on top ────────────────────────────────────────────────────
+        for &(id, bx) in &boxes {
+            let focused = Some(id) == focus;
+            // Focused pane: heavier, brighter box.
+            let bstyle = BorderStyle {
+                weight: if focused { LineWeight::Heavy } else { LineWeight::Light },
+                corners: CornerStyle::Rounded,
+                style: Style::default().fg(if focused {
+                    Color::Rgb(0x74, 0x78, 0x95)
                 } else {
-                    format!(" {title} ")
-                };
-                let maxw = rect.width.saturating_sub(2) as usize; // room between the corners
-                let label: String = label.chars().take(maxw).collect();
-                let tstyle = if Some(id) == focus {
-                    Style::default().fg(Color::Rgb(0xe6, 0xe6, 0xf0)).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Rgb(0x9a, 0x9a, 0xaa))
-                };
-                buf.set_string(rect.x + 1, rect.y - 1, &label, tstyle); // sits in the top border row
+                    Color::Rgb(0x44, 0x46, 0x58)
+                }),
+            };
+            draw_box(buf, bx, Borders::ALL, &bstyle);
+            self.draw_output_flow(buf, id, bx); // green output-activity ring
+            // Jack notches: input on the left edge, output on the right.
+            let connected = |kind: Flow| {
+                self.wires.iter().any(|w| match kind {
+                    Flow::Out => w.src == id,
+                    _ => w.dst == id,
+                })
+            };
+            let sock = Style::default().fg(Color::Rgb(0x40, 0xa8, 0x54));
+            draw_socket(buf, bx, &in_socket(bx.height), connected(Flow::In), sock);
+            draw_socket(buf, bx, &out_socket(bx.height), connected(Flow::Out), sock);
+
+            // Blit the pane's grid into the box interior.
+            let cw = bx.width.saturating_sub(2);
+            let ch = bx.height.saturating_sub(2);
+            let (cx0, cy0) = (bx.x + 1, bx.y + 1);
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.resize((cw as usize).max(1), (ch as usize).max(1));
+                let snap = pane.snapshot();
+                for (ry, row) in snap.rows.iter().enumerate() {
+                    let y = cy0 + ry as u16;
+                    if y >= cy0 + ch {
+                        break;
+                    }
+                    for (rx, cell) in row.iter().enumerate() {
+                        let x = cx0 + rx as u16;
+                        if x >= cx0 + cw {
+                            break;
+                        }
+                        buf.set_char(x, y, cell.c, style_of(cell));
+                    }
+                }
+                // Cursor of the focused pane (reverse-video block).
+                if focused {
+                    if let Some(cur) = snap.cursor {
+                        let ccx = cx0 + cur.col as u16;
+                        let ccy = cy0 + cur.line as u16;
+                        if ccx < cx0 + cw && ccy < cy0 + ch {
+                            let cell = buf.get_mut(ccx, ccy);
+                            cell.style = cell.style.add_modifier(Modifier::REVERSE);
+                        }
+                    }
+                }
             }
+            // Title on the top border.
+            let title = self
+                .titles
+                .get(&id)
+                .map(String::as_str)
+                .filter(|t| !t.is_empty())
+                .unwrap_or("shell");
+            let label = format!(" {title} ");
+            let maxw = bx.width.saturating_sub(4) as usize;
+            let label: String = label.chars().take(maxw).collect();
+            let tstyle = if focused {
+                Style::default().fg(Color::Rgb(0xe6, 0xe6, 0xf0)).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(0x9a, 0x9a, 0xaa))
+            };
+            buf.set_string(bx.x + 2, bx.y, &label, tstyle);
         }
 
         // Bottom status line: the command cheatsheet, or the wiring prompt.
@@ -712,6 +801,21 @@ impl Mux {
         let line: String = line.chars().take(full.width as usize).collect();
         buf.set_string(full.x, full.bottom() - 1, &line, status);
     }
+}
+
+/// Shrink a rect by `n` cells on every side (saturating).
+fn inset(r: Rect, n: u16) -> Rect {
+    Rect::new(r.x + n, r.y + n, r.width.saturating_sub(2 * n), r.height.saturating_sub(2 * n))
+}
+
+/// The output jack: a socket at mid-height on the box's right edge.
+fn out_socket(h: u16) -> Socket {
+    Socket::new(Side::Right, h / 2, Flow::Out, 0)
+}
+
+/// The input jack: a socket at mid-height on the box's left edge.
+fn in_socket(h: u16) -> Socket {
+    Socket::new(Side::Left, h / 2, Flow::In, 0)
 }
 
 /// Translate one engine cell (`char` + `Rgb` fg/bg + attribute flags) into a
