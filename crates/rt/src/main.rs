@@ -192,6 +192,7 @@ struct Active {
     jacks: SharedJacks,                   // per-pane patch-bay pipe jacks (shared with the spawn closure)
     wires: Vec<Wire>,                     // active patch-bay connections
     wiring_from: Option<(rt_core::PaneId, Stream)>, // the armed wire source, mid-gesture
+    drag_cursor: Option<(f32, f32)>,      // live cursor (physical px) while dragging a wire
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
@@ -681,6 +682,7 @@ impl ApplicationHandler for App {
             jacks,
             wires: Vec::new(),
             wiring_from: None,
+            drag_cursor: None,
             last_click: None,
             click_count: 0,
             egui_ctx,
@@ -900,7 +902,11 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
-                if let Some(handle) = active.dragging_divider.clone() {
+                if active.wiring_from.is_some() {
+                    // Rubber-band the in-progress wire to the cursor.
+                    active.drag_cursor = Some(active.mouse);
+                    active.window.request_redraw();
+                } else if let Some(handle) = active.dragging_divider.clone() {
                     // Resize the split: turn the mouse position along the split's
                     // axis into a first-child ratio.
                     let axis = if handle.horizontal { active.mouse.0 } else { active.mouse.1 };
@@ -938,6 +944,18 @@ impl ApplicationHandler for App {
             // starts/ends a text selection; middle pastes the PRIMARY selection.
             WindowEvent::MouseInput { state, button, .. } => match (state, button) {
                 (ElementState::Pressed, MouseButton::Right) => {
+                    // Right-click cancels a pending wire, or disconnects the output
+                    // jack under the cursor (before falling through to the menu).
+                    if active.wiring_from.take().is_some() {
+                        active.drag_cursor = None;
+                        active.window.request_redraw();
+                        return;
+                    }
+                    if let Some((id, stream)) = Self::jack_at(active, active.mouse.0, active.mouse.1) {
+                        active.wires.retain(|w| !(w.src == id && w.stream == stream));
+                        active.window.request_redraw();
+                        return;
+                    }
                     log::debug!("right-click at {:?} → open menu", active.mouse);
                     // Focus the pane under the cursor first, so the menu's
                     // actions apply to the pane you right-clicked.
@@ -962,6 +980,15 @@ impl ApplicationHandler for App {
                         let size = active.window.inner_size();
                         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
                         let (mx, my) = active.mouse;
+                        // A press on an output jack starts a drag-to-wire. Checked
+                        // *before* the divider, since jacks sit on the pane edge
+                        // (which is also the divider) and should win.
+                        if let Some((src, stream)) = Self::jack_at(active, mx, my) {
+                            active.wiring_from = Some((src, stream));
+                            active.drag_cursor = Some((mx, my));
+                            active.window.request_redraw();
+                            return;
+                        }
                         // A press on a split divider starts a drag-to-resize
                         // (checked before tabs/focus/selection).
                         if let Some(handle) = active.session.divider_at(mx, my, bounds) {
@@ -1034,6 +1061,15 @@ impl ApplicationHandler for App {
                     }
                 }
                 (ElementState::Released, MouseButton::Left) => {
+                    // Completing a drag-to-wire: connect to the pane under the cursor.
+                    if let Some((src, stream)) = active.wiring_from.take() {
+                        if let Some(dst) = Self::pane_at(active, active.mouse.0, active.mouse.1) {
+                            Self::connect_wire(active, src, stream, dst);
+                        }
+                        active.drag_cursor = None;
+                        active.window.request_redraw();
+                        return;
+                    }
                     active.dragging_divider = None; // end any divider resize
                     active.selecting = false; // drag finished
                     // A zero-length selection was just a click: discard it, and
@@ -1200,6 +1236,37 @@ impl App {
             Some((src, s)) => Self::connect_wire(active, src, s, focus), // complete
         }
         active.window.request_redraw();
+    }
+
+    /// Which output jack (if any) the physical-pixel point `(mx, my)` hits: the
+    /// stdout jack sits at the right edge upper third, the stderr jack lower third.
+    fn jack_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, Stream)> {
+        let size = active.window.inner_size();
+        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        const R: f32 = 12.0; // grab radius in px
+        for (id, r) in active.session.visible_rects(bounds) {
+            let (ox, oy) = (r.x + r.w, r.y + r.h / 3.0);
+            if (mx - ox).hypot(my - oy) <= R {
+                return Some((id, Stream::Stdout));
+            }
+            let (ex, ey) = (r.x + r.w, r.y + 2.0 * r.h / 3.0);
+            if (mx - ex).hypot(my - ey) <= R {
+                return Some((id, Stream::Stderr));
+            }
+        }
+        None
+    }
+
+    /// The pane whose rectangle contains the physical-pixel point `(mx, my)`.
+    fn pane_at(active: &Active, mx: f32, my: f32) -> Option<rt_core::PaneId> {
+        let size = active.window.inner_size();
+        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        active
+            .session
+            .visible_rects(bounds)
+            .into_iter()
+            .find(|(_, r)| r.contains(mx, my))
+            .map(|(id, _)| id)
     }
 
     /// Add a wire `src`.`stream` → `dst`.stdin if both panes have jacks and it is
@@ -2258,6 +2325,28 @@ impl App {
                 jack(jack_pos(r, 0), has_in, egui::Color32::from_rgb(0x88, 0x88, 0x98));
                 jack(jack_pos(r, 1), has_out, egui::Color32::from_rgb(0x40, 0xc0, 0x54));
                 jack(jack_pos(r, 2), has_err, egui::Color32::from_rgb(0xd0, 0x54, 0x30));
+            }
+            // Rubber-band the in-progress mouse wire from its source jack to the
+            // cursor (a dashed bezier, so it reads like the finished wire).
+            if let (Some((src, stream)), Some((cx, cy))) = (active.wiring_from, active.drag_cursor) {
+                if let Some(sr) = rect_of(src) {
+                    let p0 = jack_pos(sr, if stream == Stream::Stdout { 1 } else { 2 });
+                    let p3 = egui::pos2(cx / ppp, cy / ppp);
+                    let ext = ((p3.x - p0.x).abs() * 0.4 + 40.0).min(180.0);
+                    let p1 = egui::pos2(p0.x + ext, p0.y);
+                    let p2 = egui::pos2(p3.x - ext, p3.y);
+                    let (hr, hg, hb) = if stream == Stream::Stdout { (0x40, 0xc0, 0x54) } else { (0xd0, 0x54, 0x30) };
+                    let col = egui::Color32::from_rgba_unmultiplied(hr, hg, hb, 180);
+                    let mut prev = p0;
+                    for i in 1..=40 {
+                        let t = i as f32 / 40.0;
+                        let pt = cubic_bezier(p0, p1, p2, p3, t);
+                        if i % 2 == 0 {
+                            painter.line_segment([prev, pt], egui::Stroke::new(1.6, col)); // dashed
+                        }
+                        prev = pt;
+                    }
+                }
             }
             // Latency: the whole-window frame, drawn last so it wins the outer
             // ring. Short violet segments each coloured by the undulation, with a
