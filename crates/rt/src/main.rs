@@ -2428,14 +2428,34 @@ impl App {
             let cb = content_bounds(size);
             let (fx, fy) = (cb.x / ppp, cb.y / ppp);
             let (fw, fh) = (cb.w / ppp, cb.h / ppp);
-            const LAT_SEGS: u32 = 96;
-            for i in (0..LAT_SEGS).take_while(|_| inst_latency) {
-                let t0 = i as f32 / LAT_SEGS as f32;
-                let t1 = (i + 1) as f32 / LAT_SEGS as f32;
-                let p0 = flow_point(fx, fy, fw, fh, t0);
-                let p1 = flow_point(fx, fy, fw, fh, t1);
-                let col = latency_color(t0, active.lat_phase, active.stall);
-                painter.line_segment([p0, p1], egui::Stroke::new(2.0, col));
+            if inst_latency {
+                // Walk each edge explicitly, corner-to-corner, so the corners are
+                // always exact segment endpoints (an even sampling of the whole
+                // perimeter straddles two corners and chords across them).
+                let per = 2.0 * (fw + fh);
+                // (corner point, cumulative distance from the top-left, clockwise).
+                let corners = [
+                    (egui::pos2(fx, fy), 0.0),
+                    (egui::pos2(fx + fw, fy), fw),
+                    (egui::pos2(fx + fw, fy + fh), fw + fh),
+                    (egui::pos2(fx, fy + fh), 2.0 * fw + fh),
+                    (egui::pos2(fx, fy), per), // back to the start
+                ];
+                const SUB: u32 = 26; // segments per edge
+                for e in 0..4 {
+                    let (pa, da) = corners[e];
+                    let (pb, db) = corners[e + 1];
+                    let mut prev = pa;
+                    for s in 1..=SUB {
+                        let f = s as f32 / SUB as f32;
+                        let pt = egui::pos2(pa.x + (pb.x - pa.x) * f, pa.y + (pb.y - pa.y) * f);
+                        // Colour at the segment midpoint's perimeter position.
+                        let mid_t = (da + (db - da) * (f - 0.5 / SUB as f32)) / per;
+                        let col = latency_color(mid_t, active.lat_phase, active.stall);
+                        painter.line_segment([prev, pt], egui::Stroke::new(2.0, col));
+                        prev = pt;
+                    }
+                }
             }
         }
         let output = ctx.end_pass();
@@ -2567,7 +2587,7 @@ fn blackbody(kelvin: f32) -> (f32, f32, f32) {
 /// Standoff (physical px) between the window edge and the terminal content, so
 /// the edge-living features — heat border, patch-bay jacks, latency frame, and
 /// the outermost text cells — have room and aren't clipped by the window edge.
-const WINDOW_MARGIN: f32 = 16.0;
+const WINDOW_MARGIN: f32 = 8.0;
 
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background
