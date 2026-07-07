@@ -17,6 +17,14 @@ mod preferences; // egui preferences dialog
 mod render; // the GL glyph-atlas renderer
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
+use std::cell::RefCell; // shared jacks map between the spawn closure and Active
+use std::ffi::CString; // mkfifo path
+use std::fs::{File, OpenOptions}; // the fifo endpoints
+use std::io::{Read, Write}; // pipe I/O
+use std::os::unix::ffi::OsStrExt; // OsStr -> bytes for CString
+use std::os::unix::fs::OpenOptionsExt; // custom_flags for O_NONBLOCK
+use std::path::{Path, PathBuf}; // fifo paths
+use std::rc::Rc; // shared jacks map
 use std::time::{Duration, Instant}; // frame pacing for async PTY updates
 
 use glutin::config::ConfigTemplateBuilder;
@@ -40,7 +48,97 @@ use rt_session::{Broadcast, Session, SessionEvent};
 
 /// The concrete session type used by the app: real PTY panes, spawned by a
 /// boxed closure (boxed so the `Session`'s factory type is nameable in a field).
-type AppSession = Session<TermPane, Box<dyn FnMut(usize, usize) -> TermPane>>;
+type AppSession = Session<TermPane, Box<dyn FnMut(rt_core::PaneId, usize, usize) -> TermPane>>;
+
+/// The shared map of per-pane patch-bay jacks. Shared (`Rc<RefCell<…>>`) between
+/// the spawn closure (which creates a pane's jacks) and [`Active`] (which pumps
+/// and renders them); winit is single-threaded so this never contends.
+type SharedJacks = Rc<RefCell<std::collections::HashMap<rt_core::PaneId, Jacks>>>;
+
+/// Which of a pane's output streams a wire draws from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Stdout, // $RT_OUT — green
+    Stderr, // $RT_ERR — red
+}
+
+/// One live patch-bay connection: bytes from `src`'s output stream jack are
+/// written to `dst`'s input jack. Throughput drives the wire's flow animation.
+struct Wire {
+    src: rt_core::PaneId,
+    stream: Stream,
+    dst: rt_core::PaneId,
+    rate: f32,  // smoothed bytes/second
+    phase: f32, // flow position along the wire (laps)
+    moved: u32, // bytes carried since the last tick
+}
+
+/// A pane's side-channel pipe endpoints — patch-bay jacks separate from the tty.
+/// `$RT_OUT`/`$RT_ERR` a program writes to (rt reads); `$RT_IN` rt writes to (a
+/// program reads). Held open `O_RDWR|O_NONBLOCK` so a program never blocks.
+struct Jacks {
+    out_path: PathBuf,
+    err_path: PathBuf,
+    in_path: PathBuf,
+    out_read: File,
+    err_read: File,
+    in_write: File,
+}
+
+impl Jacks {
+    /// Create the three fifos for pane `id` under `dir` and open rt's ends.
+    fn new(dir: &Path, id: rt_core::PaneId) -> std::io::Result<Jacks> {
+        let out_path = dir.join(format!("{}.out", id.0));
+        let err_path = dir.join(format!("{}.err", id.0));
+        let in_path = dir.join(format!("{}.in", id.0));
+        mkfifo(&out_path)?;
+        mkfifo(&err_path)?;
+        mkfifo(&in_path)?;
+        let open = |p: &Path| {
+            OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(p)
+        };
+        Ok(Jacks {
+            out_read: open(&out_path)?,
+            err_read: open(&err_path)?,
+            in_write: open(&in_path)?,
+            out_path,
+            err_path,
+            in_path,
+        })
+    }
+
+    /// The environment variables advertising these jacks to the pane's shell.
+    fn env(&self) -> Vec<(String, String)> {
+        vec![
+            ("RT_OUT".to_string(), self.out_path.to_string_lossy().into_owned()),
+            ("RT_ERR".to_string(), self.err_path.to_string_lossy().into_owned()),
+            ("RT_IN".to_string(), self.in_path.to_string_lossy().into_owned()),
+        ]
+    }
+}
+
+impl Drop for Jacks {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.out_path);
+        let _ = std::fs::remove_file(&self.err_path);
+        let _ = std::fs::remove_file(&self.in_path);
+    }
+}
+
+/// Create a fifo at `path` (mode 0600); an existing fifo is fine.
+fn mkfifo(path: &Path) -> std::io::Result<()> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "fifo path has a NUL"))?;
+    // SAFETY: `c` is a valid NUL-terminated C string for the call's duration.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
 
 /// One pane's output-activity instrument state (ported from rt-mux): a smoothed
 /// output rate and an accumulated flow phase. The border flow's speed and
@@ -58,6 +156,10 @@ const BUSY_WAKEUPS: f32 = 60.0;
 const FLOW_MAX_LAPS: f32 = 0.6;
 /// Green packets orbiting each pane's border.
 const FLOW_PACKETS: u32 = 4;
+/// Bytes/second across a wire that reads as "fully busy" for its flow animation.
+const WIRE_BUSY_BYTES: f32 = 4096.0;
+/// Packets travelling along a wire at once.
+const WIRE_PACKETS: u32 = 3;
 
 /// Everything that only exists once a window and GL context are created (which
 /// happens on the first `resumed`). Kept in an `Option` on the `App` so we can
@@ -87,6 +189,9 @@ struct Active {
     lat_phase: f32,                       // phase of the latency frame's undulation
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
+    jacks: SharedJacks,                   // per-pane patch-bay pipe jacks (shared with the spawn closure)
+    wires: Vec<Wire>,                     // active patch-bay connections
+    wiring_from: Option<(rt_core::PaneId, Stream)>, // the armed wire source, mid-gesture
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
@@ -447,15 +552,30 @@ impl ApplicationHandler for App {
             settings.palette,
         )));
         let palette_spawn = palette.clone();
+        // Patch-bay: a per-session temp dir holds the pipe fifos, and a shared map
+        // holds each pane's jacks — filled by the spawn closure, read by Active.
+        let jacks_dir = std::env::temp_dir().join(format!("rt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&jacks_dir);
+        let jacks: SharedJacks = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let jacks_spawn = jacks.clone();
         // The factory spawns a shell-backed pane at the requested cell size. A
         // spawn failure here is fatal (no PTY available) — we surface it by
         // panicking with a clear message rather than rendering a broken pane.
-        let spawn: Box<dyn FnMut(usize, usize) -> TermPane> = Box::new(move |cols, rows| {
+        let spawn: Box<dyn FnMut(rt_core::PaneId, usize, usize) -> TermPane> = Box::new(move |id, cols, rows| {
             // If RT_EXEC is set, run it then keep an interactive shell open.
             let shell = exec.as_ref().map(|cmd| {
                 ("/bin/sh".to_string(), vec!["-c".to_string(), format!("{cmd}; exec /bin/sh -i")])
             });
-            let mut pane = TermPane::spawn(shell, None, cols.max(1), rows.max(1))
+            // Create this pane's patch-bay jacks and advertise them to the shell.
+            let env = match Jacks::new(&jacks_dir, id) {
+                Ok(j) => {
+                    let e = j.env();
+                    jacks_spawn.borrow_mut().insert(id, j);
+                    e
+                }
+                Err(_) => Vec::new(), // no jacks: the pane still runs, just unwireable
+            };
+            let mut pane = TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env)
                 .expect("failed to spawn a PTY/shell for a pane");
             if let Ok(p) = palette_spawn.lock() {
                 pane.set_palette(p.clone()); // apply the current colours
@@ -558,6 +678,9 @@ impl ApplicationHandler for App {
             lat_phase: 0.0,
             stall: 0.0,
             last_wake: Instant::now(),
+            jacks,
+            wires: Vec::new(),
+            wiring_from: None,
             last_click: None,
             click_count: 0,
             egui_ctx,
@@ -600,6 +723,26 @@ impl ApplicationHandler for App {
                 active.search_open = true;
                 active.search_query = q; // e.g. RT_SEARCH=echo
                 Self::run_search(active, true); // populate matches + highlight
+            }
+        }
+        // Debug/verification hook: RT_WIRE_DEMO builds a live patch-bay scene —
+        // split, wire pane1.stdout → pane2.stdin, and run a producer + reader — so
+        // the wiring can be verified/screenshotted without synthetic input.
+        if std::env::var("RT_WIRE_DEMO").is_ok() {
+            if let Some(active) = self.active.as_mut() {
+                let p1 = active.session.focus();
+                active.session.apply(rt_config::Action::SplitVert); // → pane2
+                active.session.apply(rt_config::Action::SplitVert); // → pane3 (focused)
+                let p3 = active.session.focus();
+                // Wire the leftmost pane's stdout to the rightmost pane's stdin so
+                // the bezier arcs over the middle pane.
+                Self::connect_wire(active, p1, Stream::Stdout, p3);
+                if let Some(pane) = active.session.pane(p1) {
+                    pane.write(b"while true; do echo tick $(date +%T); sleep 0.4; done | tee $RT_OUT\n");
+                }
+                if let Some(pane) = active.session.pane(p3) {
+                    pane.write(b"cat $RT_IN\n");
+                }
             }
         }
         // Poll so we keep re-checking PTYs for async output even without input.
@@ -999,6 +1142,16 @@ impl ApplicationHandler for App {
             active.meters.remove(&id); // forget the closed pane's instrument state
             active.heat.remove(&id);
             active.heat_ticks.remove(&id);
+            active.jacks.borrow_mut().remove(&id); // Drop -> remove its fifos
+            active.wires.retain(|w| w.src != id && w.dst != id); // unplug its wires
+            if matches!(active.wiring_from, Some((s, _)) if s == id) {
+                active.wiring_from = None;
+            }
+        }
+        // Move bytes across the patch-bay wires; repaint if anything flowed or is
+        // still flowing (so the wire packets animate).
+        if Self::pump_wires(active) || active.wires.iter().any(|w| w.rate > 1.0) {
+            dirty = true;
         }
         // Refresh the CPU-heat readings (~2 Hz); repaint if a fresh sample lands
         // and any pane is warm, so the temperature border stays live even for a
@@ -1038,6 +1191,27 @@ impl App {
     /// Window-level appearance actions (opacity/scrim) are handled here because
     /// the session owns no window handle; everything else goes to the session.
     /// A `CloseWindow` result exits the process (the OS reaps the child PTYs).
+    /// Keyboard wire gesture: with nothing armed, arm from the focused pane's
+    /// `stream` jack; with something armed, complete to the focused pane's input.
+    fn wire_gesture(active: &mut Active, stream: Stream) {
+        let focus = active.session.focus();
+        match active.wiring_from.take() {
+            None => active.wiring_from = Some((focus, stream)), // arm
+            Some((src, s)) => Self::connect_wire(active, src, s, focus), // complete
+        }
+        active.window.request_redraw();
+    }
+
+    /// Add a wire `src`.`stream` → `dst`.stdin if both panes have jacks and it is
+    /// not a self-loop.
+    fn connect_wire(active: &mut Active, src: rt_core::PaneId, stream: Stream, dst: rt_core::PaneId) {
+        let jm = active.jacks.borrow();
+        if src != dst && jm.contains_key(&src) && jm.contains_key(&dst) {
+            drop(jm);
+            active.wires.push(Wire { src, stream, dst, rate: 0.0, phase: 0.0, moved: 0 });
+        }
+    }
+
     fn apply_action(active: &mut Active, action: rt_config::Action) {
         use rt_config::Action;
         match action {
@@ -1101,6 +1275,24 @@ impl App {
                 active.search_matches.clear();
                 active.search_index = 0;
                 active.search_pane = Some(active.session.focus());
+                active.window.request_redraw();
+            }
+            // Patch-bay: arm a wire from the focused pane's stream jack, or (if one
+            // is already armed) complete it to the focused pane's input.
+            Action::WireStdout => Self::wire_gesture(active, Stream::Stdout),
+            Action::WireStderr => Self::wire_gesture(active, Stream::Stderr),
+            Action::Unwire => {
+                let f = active.session.focus();
+                active.wires.retain(|w| w.src != f && w.dst != f);
+                active.window.request_redraw();
+            }
+            Action::PipeInto => {
+                // Split, then wire the (old) focused pane's stdout into the new one.
+                let src = active.session.focus();
+                if let Some(SessionEvent::Redraw) = active.session.apply(rt_config::Action::SplitVert) {
+                    let dst = active.session.focus();
+                    Self::connect_wire(active, src, Stream::Stdout, dst);
+                }
                 active.window.request_redraw();
             }
             Action::Fullscreen => {
@@ -1856,6 +2048,49 @@ impl App {
         );
     }
 
+    /// Move bytes across every patch-bay wire: read each pane's output-stream
+    /// jacks and forward to the input jack of every pane wired downstream. Reads
+    /// always (even unwired) so a program writing `$RT_OUT` never blocks. Returns
+    /// whether any bytes moved (to keep the wire flow animating).
+    fn pump_wires(active: &mut Active) -> bool {
+        let jacks = active.jacks.clone(); // Rc clone; independent of `active`'s fields
+        let src_ids: Vec<rt_core::PaneId> = jacks.borrow().keys().copied().collect();
+        let mut moved = false;
+        let mut buf = [0u8; 8192];
+        for src in src_ids {
+            for stream in [Stream::Stdout, Stream::Stderr] {
+                loop {
+                    // Read one chunk from this pane's chosen jack (non-blocking).
+                    let n = {
+                        let mut jm = jacks.borrow_mut();
+                        let Some(j) = jm.get_mut(&src) else { break };
+                        let fd = match stream {
+                            Stream::Stdout => &mut j.out_read,
+                            Stream::Stderr => &mut j.err_read,
+                        };
+                        match fd.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    };
+                    moved = true;
+                    let chunk = buf[..n].to_vec();
+                    // Fan out to every wire leaving this pane on this stream.
+                    for w in active.wires.iter_mut().filter(|w| w.src == src && w.stream == stream) {
+                        let mut jm = jacks.borrow_mut();
+                        if let Some(dj) = jm.get_mut(&w.dst) {
+                            let _ = dj.in_write.write_all(&chunk); // best-effort
+                            w.moved = w.moved.saturating_add(n as u32);
+                        }
+                    }
+                }
+            }
+        }
+        moved
+    }
+
     /// Sample `/proc` (~2 Hz) to update each pane's CPU load — the heat
     /// instrument. Load is summed over the pane's session (shell + children), so
     /// whatever it's running counts. Returns whether it actually sampled this
@@ -1917,6 +2152,14 @@ impl App {
             let act = (m.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
             m.phase = (m.phase + act * FLOW_MAX_LAPS * dt).fract();
         }
+        // Advance each wire's byte-rate and flow phase (packets = the actual bytes).
+        for w in active.wires.iter_mut() {
+            let inst = w.moved as f32 / dt.max(1e-3);
+            w.moved = 0;
+            w.rate = w.rate * 0.75 + inst * 0.25;
+            let act = (w.rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
+            w.phase = (w.phase + act * FLOW_MAX_LAPS * dt).fract();
+        }
         // Pane rectangles in physical pixels.
         let size = active.window.inner_size();
         let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
@@ -1952,6 +2195,69 @@ impl App {
                     painter.circle_filled(p, 9.0, glow); // soft halo
                     painter.circle_filled(p, 3.4, core); // bright centre
                 }
+            }
+            // ── Patch-bay: jacks on each pane + animated wires between them ────
+            // Jack position (points) on a pane rect: 0=stdin (left mid),
+            // 1=stdout (right upper), 2=stderr (right lower).
+            let jack_pos = |r: &rt_core::Rect, which: u8| -> egui::Pos2 {
+                let (x, y, w, h) = (r.x / ppp, r.y / ppp, r.w / ppp, r.h / ppp);
+                match which {
+                    0 => egui::pos2(x, y + h * 0.5),
+                    1 => egui::pos2(x + w, y + h / 3.0),
+                    _ => egui::pos2(x + w, y + 2.0 * h / 3.0),
+                }
+            };
+            let rect_of = |id: rt_core::PaneId| rects.iter().find(|&&(i, _)| i == id).map(|(_, r)| r);
+            // Wires first (under the jacks): a smooth cubic bezier from the source
+            // stream jack to the destination stdin jack, with stream-coloured flow
+            // packets travelling along it — the packets are the literal bytes.
+            for w in &active.wires {
+                let (Some(sr), Some(dr)) = (rect_of(w.src), rect_of(w.dst)) else { continue };
+                let p0 = jack_pos(sr, if w.stream == Stream::Stdout { 1 } else { 2 });
+                let p3 = jack_pos(dr, 0);
+                let ext = ((p3.x - p0.x).abs() * 0.4 + 40.0).min(180.0); // control-point reach
+                let p1 = egui::pos2(p0.x + ext, p0.y);
+                let p2 = egui::pos2(p3.x - ext, p3.y);
+                let hue = if w.stream == Stream::Stdout { (0x40, 0xc0, 0x54) } else { (0xd0, 0x54, 0x30) };
+                let act = (w.rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
+                const N: u32 = 56;
+                let mut prev = p0;
+                for i in 1..=N {
+                    let t = i as f32 / N as f32;
+                    let pt = cubic_bezier(p0, p1, p2, p3, t);
+                    // Brightness = nearest travelling packet, scaled by throughput.
+                    let mut best = 0.0f32;
+                    for k in 0..WIRE_PACKETS {
+                        let pp = (w.phase + k as f32 / WIRE_PACKETS as f32).fract();
+                        let d = (t - pp).abs();
+                        best = best.max((-d * d / (2.0 * 0.05 * 0.05)).exp());
+                    }
+                    let b = 0.22 + 0.78 * best * (0.30 + 0.70 * act);
+                    let col = egui::Color32::from_rgb(
+                        (hue.0 as f32 * b) as u8,
+                        (hue.1 as f32 * b) as u8,
+                        (hue.2 as f32 * b) as u8,
+                    );
+                    painter.line_segment([prev, pt], egui::Stroke::new(2.0, col));
+                    prev = pt;
+                }
+            }
+            // Jack dots on every pane (filled ● when a wire uses them).
+            for (id, r) in &rects {
+                let has_in = active.wires.iter().any(|w| w.dst == *id);
+                let has_out = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
+                let has_err = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
+                let jack = |p: egui::Pos2, filled: bool, col: egui::Color32| {
+                    painter.circle_filled(p, 4.5, egui::Color32::from_black_alpha(180)); // dark backing
+                    if filled {
+                        painter.circle_filled(p, 3.5, col);
+                    } else {
+                        painter.circle_stroke(p, 3.2, egui::Stroke::new(1.4, col));
+                    }
+                };
+                jack(jack_pos(r, 0), has_in, egui::Color32::from_rgb(0x88, 0x88, 0x98));
+                jack(jack_pos(r, 1), has_out, egui::Color32::from_rgb(0x40, 0xc0, 0x54));
+                jack(jack_pos(r, 2), has_err, egui::Color32::from_rgb(0xd0, 0x54, 0x30));
             }
             // Latency: the whole-window frame, drawn last so it wins the outer
             // ring. Short violet segments each coloured by the undulation, with a
@@ -2091,6 +2397,17 @@ fn blackbody(kelvin: f32) -> (f32, f32, f32) {
         (138.517_73 * (t - 10.0).ln() - 305.044_8).clamp(0.0, 255.0)
     };
     (r, g, b)
+}
+
+/// A point on the cubic Bézier `p0→p3` (control points `p1`, `p2`) at `t` in
+/// 0..1 — used to draw the smooth patch-bay wires.
+fn cubic_bezier(p0: egui::Pos2, p1: egui::Pos2, p2: egui::Pos2, p3: egui::Pos2, t: f32) -> egui::Pos2 {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    egui::pos2(
+        a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+        a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+    )
 }
 
 /// The point at normalised position `t` (0..1, clockwise from the top-left)

@@ -35,8 +35,8 @@ impl Backend for MockBackend {
 
 /// A spawner that hands out mock backends and stashes each one's log in a shared
 /// vector, so the test can examine all panes created during a run.
-fn spawner(logs: Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>) -> impl FnMut(usize, usize) -> MockBackend {
-    move |cols, rows| {
+fn spawner(logs: Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>) -> impl FnMut(rt_core::PaneId, usize, usize) -> MockBackend {
+    move |_id: rt_core::PaneId, cols, rows| {
         // Create this pane's log, pre-seeded with its initial size.
         let log = Rc::new(RefCell::new(PaneLog { writes: Vec::new(), size: (cols, rows) }));
         logs.borrow_mut().push(log.clone()); // remember it for the test
@@ -47,7 +47,7 @@ fn spawner(logs: Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>) -> impl FnMut(usize, us
 /// Build a session over a 1000x800 window with 10x20 cells and return it plus
 /// the shared list of per-pane logs.
 fn make() -> (
-    Session<MockBackend, impl FnMut(usize, usize) -> MockBackend>,
+    Session<MockBackend, impl FnMut(rt_core::PaneId, usize, usize) -> MockBackend>,
     Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>,
 ) {
     let logs = Rc::new(RefCell::new(Vec::new())); // collects each pane's log

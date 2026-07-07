@@ -91,6 +91,14 @@ pub enum Action {
     ResizeDown,
     /// Cycle the focused pane through input groups (for Broadcast::Group).
     GroupCycle,
+    /// Patch-bay: arm/complete a wire from the focused pane's stdout jack.
+    WireStdout,
+    /// Patch-bay: arm/complete a wire from the focused pane's stderr jack.
+    WireStderr,
+    /// Patch-bay: disconnect every wire touching the focused pane.
+    Unwire,
+    /// Patch-bay: split and wire the focused pane's stdout into the new pane.
+    PipeInto,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -363,6 +371,11 @@ impl Keymap {
             ("<Shift><Control>r", Action::Rotate),       // rotate the enclosing split
             ("<Shift><Control>a", Action::SplitAuto),    // split along the longer axis
             ("<Shift><Control>g", Action::GroupCycle),   // cycle the pane's input group
+            // Patch-bay wiring.
+            ("<Shift><Control>y", Action::WireStdout),   // wire stdout jack
+            ("<Shift><Control>u", Action::WireStderr),   // wire stderr jack
+            ("<Shift><Control>k", Action::Unwire),       // disconnect focused pane
+            ("<Shift><Control>p", Action::PipeInto),     // split + pipe stdout in
         ];
         let mut map = Keymap::default(); // empty binding list
         for (accel, action) in defaults {

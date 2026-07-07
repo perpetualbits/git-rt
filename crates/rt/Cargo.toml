@@ -65,3 +65,5 @@ wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 # because arboard pulls X11 crates on Linux, which would break Wayland-native;
 # smithay-clipboard is pure Wayland and ties into the window's wl_display.
 smithay-clipboard = "0.7"
+# For the patch-bay pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).
+libc = "0.2"

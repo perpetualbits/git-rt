@@ -99,7 +99,7 @@ pub enum SessionEvent {
 /// Generic over `B: Backend` and a factory `F` that spawns a new backend given
 /// a size. The factory indirection is what lets tests inject mock panes while
 /// production injects real PTYs.
-pub struct Session<B: Backend, F: FnMut(usize, usize) -> B> {
+pub struct Session<B: Backend, F: FnMut(PaneId, usize, usize) -> B> {
     tree: Tree,                        // the split/tab layout
     panes: HashMap<PaneId, B>,         // one backend per live leaf
     groups: HashMap<PaneId, u32>,      // pane -> group id (for Broadcast::Group)
@@ -117,7 +117,7 @@ pub struct Session<B: Backend, F: FnMut(usize, usize) -> B> {
 /// Vertical padding added to the cell height to size a per-pane titlebar strip.
 const TITLEBAR_PAD: f32 = 4.0;
 
-impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
+impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
     /// Create a session with a single initial pane filling `bounds`.
     ///
     /// `cell` is the pixel size of one character cell, used to convert pane
@@ -128,7 +128,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         // Size the first backend to fill the window.
         let (cols, rows) = cells_in(bounds, cell); // full-window cell dimensions
         let mut panes = HashMap::new(); // the pane->backend table
-        panes.insert(first, spawn(cols, rows)); // spawn and register pane 0
+        panes.insert(first, spawn(first, cols, rows)); // spawn and register pane 0
         Session {
             tree,
             panes,
@@ -433,7 +433,11 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
             | Action::ZoomOut
             | Action::ZoomReset
             | Action::Fullscreen
-            | Action::Search => None,
+            | Action::Search
+            | Action::WireStdout
+            | Action::WireStderr
+            | Action::Unwire
+            | Action::PipeInto => None,
         }
     }
 
@@ -561,7 +565,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
         if let Some(new_id) = self.tree.split(self.focus, orient) {
             // Size the new pane from its freshly computed rectangle.
             let (cols, rows) = self.pane_cells(new_id); // its cell dimensions
-            let backend = (self.spawn)(cols, rows); // create its PTY
+            let backend = (self.spawn)(new_id, cols, rows); // create its PTY
             self.panes.insert(new_id, backend); // register it
             self.focus = new_id; // focus follows the split
             self.relayout(self.bounds); // the sibling shrank; resize everyone
@@ -617,7 +621,7 @@ impl<B: Backend, F: FnMut(usize, usize) -> B> Session<B, F> {
     fn new_tab(&mut self) {
         if let Some(new_id) = self.tree.new_tab(self.focus) {
             let (cols, rows) = self.pane_cells(new_id); // new tab's size
-            let backend = (self.spawn)(cols, rows); // spawn its PTY
+            let backend = (self.spawn)(new_id, cols, rows); // spawn its PTY
             self.panes.insert(new_id, backend); // register
             self.focus = new_id; // focus the new tab
             self.relayout(self.bounds); // reflow
