@@ -82,6 +82,51 @@ use rt_engine::{PaneEvent, TermPane}; // the terminal engine (PTY + alacritty gr
 /// `Ctrl-a`; pressing it twice sends a literal `Ctrl-a` to the focused shell.
 const PREFIX: char = 'a';
 
+/// The built-in manual (Ctrl-a ? or F1). UPPERCASE lines are section headings.
+const MANUAL: &str = "\
+rt-mux — a text-mode terminal multiplexer with instrumented borders and an
+inter-pane fd patch-bay.  The prefix is Ctrl-a; press it, then a command key.
+
+PANES
+  C-a %      split side by side        C-a \"     split stacked
+  C-a o      focus next               C-a arrows/hjkl   directional focus
+  C-a z      zoom / restore           C-a r     rotate the split
+  C-a x      close focused pane       C-a q     quit
+  mouse      click a pane to focus
+
+SCROLLBACK SEARCH
+  C-a /      open search;  type to search;  Enter/Down next, Up prev, Esc close
+
+BORDER INSTRUMENTS  (each pane's border is a live gauge)
+  Output   green packets orbit the border; speed = that pane's output rate.
+  Heat     the border's colour is the pane's CPU temperature (blackbody):
+           dim deep-red idle -> orange -> yellow -> white-hot -> blue-white.
+
+THE PATCH-BAY  (wire terminals' fds together)
+  Each pane advertises three pipe jacks to its shell, separate from the tty:
+      $RT_OUT  a program writes (stdout jack, right edge, green)
+      $RT_ERR  a program writes (stderr jack, right edge, red)
+      $RT_IN   a program reads  (stdin  jack, left edge, grey)
+  Wire an output jack to another pane's input jack; the moving packets on the
+  drawn wire ARE the bytes crossing it.
+    keyboard:  C-a w  arm a wire from stdout,  C-a e  from stderr; then move
+               focus to the target and press w/e again to connect.
+               C-a u  disconnect focused pane.   C-a |  split + pipe stdout in.
+    mouse:     drag from a jack to another pane;  right-click a jack to unplug.
+
+EXAMPLES  (type in the panes; wire as noted)
+  1. Output to another pane
+       A:  seq 1 100 > $RT_OUT     wire A.stdout->B     B:  cat $RT_IN
+  2. Stream + filter downstream
+       A:  ping -c 20 localhost | tee $RT_OUT   wire A->B   B:  grep time= <$RT_IN
+  3. Split stdout and stderr
+       A:  ls /nope /etc >$RT_OUT 2>$RT_ERR    wire A.stdout->B, A.stderr->C
+  4. One-gesture pipeline
+       focus a producer, C-a |  (splits + wires stdout in); new pane:  sort -u <$RT_IN
+
+  Esc or q closes this manual.  Up/Down/PgUp/PgDn scroll.
+";
+
 /// Target frame period. We repaint the whole buffer every frame and let mullion
 /// diff it, mirroring aerie's `spiral_stress` loop; ~60 fps is smooth and the
 /// per-pane snapshot is cheap.
@@ -208,6 +253,10 @@ struct Mux {
     last_boxes: Vec<(TileId, Rect)>,
     /// Live cursor cell while dragging a wire with the mouse (rubber-band).
     drag_cursor: Option<(u16, u16)>,
+    /// Whether the built-in manual overlay is open.
+    manual_open: bool,
+    /// Scroll offset (top line) of the manual overlay.
+    manual_scroll: usize,
     /// Whether the scrollback-search bar is open.
     search_open: bool,
     /// The current search query.
@@ -262,6 +311,8 @@ impl Mux {
             wiring_from: None,
             last_boxes: Vec::new(),
             drag_cursor: None,
+            manual_open: false,
+            manual_scroll: 0,
             search_open: false,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -377,6 +428,24 @@ impl Mux {
     /// Keys pass straight through to the focused shell *unless* they follow the
     /// prefix, in which case they are multiplexer commands (split/focus/zoom/…).
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // The manual overlay captures every key while it is open.
+        if self.manual_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.manual_open = false,
+                KeyCode::Down | KeyCode::Char('j') => self.manual_scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => self.manual_scroll = self.manual_scroll.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.manual_scroll += 10,
+                KeyCode::PageUp => self.manual_scroll = self.manual_scroll.saturating_sub(10),
+                _ => {}
+            }
+            return true;
+        }
+        // F1 (no prefix) toggles the manual.
+        if key.code == KeyCode::F(1) {
+            self.manual_open = true;
+            self.manual_scroll = 0;
+            return true;
+        }
         // The scrollback-search bar captures every key while it is open.
         if self.search_open {
             self.handle_search_key(key);
@@ -437,6 +506,11 @@ impl Mux {
                 KeyCode::Char('|') => self.pipe_into_new_pane(),
                 // Scrollback search on the focused pane.
                 KeyCode::Char('/') => self.open_search(),
+                // Built-in manual.
+                KeyCode::Char('?') => {
+                    self.manual_open = true;
+                    self.manual_scroll = 0;
+                }
                 // Quit the whole multiplexer.
                 KeyCode::Char('q') => return false,
                 _ => {} // unknown command: ignore
@@ -1203,6 +1277,54 @@ impl Mux {
         }
         let line: String = line.chars().take(full.width as usize).collect();
         buf.set_string(full.x, full.bottom() - 1, &line, status);
+
+        // The manual overlay is drawn last, over everything.
+        if self.manual_open {
+            let area = buf.area;
+            let bg = Style::default().fg(Color::Rgb(0xd2, 0xd2, 0xdc)).bg(Color::Rgb(0x12, 0x14, 0x1c));
+            // Fill the panel background.
+            let blank: String = " ".repeat(area.width as usize);
+            for y in area.y..area.bottom() {
+                buf.set_string(area.x, y, &blank, bg);
+            }
+            draw_box(
+                buf,
+                area,
+                Borders::ALL,
+                &BorderStyle {
+                    weight: LineWeight::Light,
+                    corners: CornerStyle::Rounded,
+                    style: Style::default().fg(Color::Rgb(0x5c, 0x80, 0xb4)),
+                },
+            );
+            buf.set_string(
+                area.x + 2,
+                area.y,
+                " rt-mux — manual ",
+                Style::default().fg(Color::Rgb(0xff, 0xff, 0xff)).add_modifier(Modifier::BOLD),
+            );
+            let lines: Vec<&str> = MANUAL.lines().collect();
+            let inner_h = area.height.saturating_sub(2) as usize;
+            let inner_w = area.width.saturating_sub(4) as usize;
+            let max_scroll = lines.len().saturating_sub(inner_h);
+            self.manual_scroll = self.manual_scroll.min(max_scroll); // clamp
+            for (i, line) in lines.iter().skip(self.manual_scroll).take(inner_h).enumerate() {
+                let y = area.y + 1 + i as u16;
+                let text: String = line.chars().take(inner_w).collect();
+                // Section headings (start at column 0 with a capital) get an accent.
+                let is_heading = !line.starts_with(' ')
+                    && line.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+                let style = if is_heading {
+                    Style::default()
+                        .fg(Color::Rgb(0x8a, 0xd0, 0xff))
+                        .bg(Color::Rgb(0x12, 0x14, 0x1c))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    bg
+                };
+                buf.set_string(area.x + 2, y, &text, style);
+            }
+        }
     }
 }
 
