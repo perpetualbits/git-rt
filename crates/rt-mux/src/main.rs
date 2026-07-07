@@ -27,14 +27,26 @@ use std::collections::HashMap; // tile id -> pane, and tile id -> title
 use std::io::{self, Stdout}; // stdout backend + Result
 use std::time::{Duration, Instant}; // frame pacing
 
+/// Number of green "packets" spaced evenly around each pane's border ring. They
+/// sit still when the pane is idle and march when it produces output.
+const OUTPUT_PACKETS: u32 = 4;
+/// Width (in normalised ring position) of each packet's Gaussian bump.
+const PACKET_SIGMA: f32 = 0.035;
+/// Wakeups-per-second that reads as "fully busy" — the flow speed and brightness
+/// saturate here so a torrent of output doesn't spin absurdly fast.
+const BUSY_WAKEUPS: f32 = 60.0;
+/// Laps-per-second the flow travels at full activity (visually calm, not dizzy).
+const MAX_LAPS_PER_SEC: f32 = 0.6;
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers}; // input events (mullion's crossterm)
 
 use mullion::backend::{Backend, CrosstermBackend}; // Backend trait (size) + the real terminal backend
-use mullion::border::{render_shared, BorderStyle, CornerStyle, LineWeight}; // shared-seam borders
+use mullion::border::{render_rim, render_shared, BorderStyle, CornerStyle, LineWeight}; // shared-seam borders + rim animation
 use mullion::buffer::Buffer; // the cell buffer we paint into
 use mullion::capabilities::Capabilities; // terminal feature probe (colour depth, unicode…)
+use mullion::ease::gaussian; // bump shape for the flowing packets
 use mullion::geometry::Rect; // tile rectangles
-use mullion::layout::{Constraint, Node, Orientation, TileId}; // the layout tree
+use mullion::layout::{solve, Constraint, Node, Orientation, TileId}; // the layout tree + solver
 use mullion::style::{Color, Modifier, Style}; // cell colours + attributes
 use mullion::terminal::{EventReader, Terminal}; // double-buffer driver + threaded input
 use mullion::tree::{focus_override, Direction, Tree}; // focus/zoom wrapper + focus-thickening
@@ -50,6 +62,20 @@ const PREFIX: char = 'a';
 /// per-pane snapshot is cheap.
 const FRAME: Duration = Duration::from_millis(16);
 
+/// The live "instrument" state for one pane's border: a smoothed output rate and
+/// the accumulated flow phase (how far the green packets have marched). Phase
+/// advances by the rate, so a busy pane flows and an idle one is frozen — the
+/// motion *is* the measurement, not decoration.
+#[derive(Default, Clone, Copy)]
+struct Meter {
+    /// Wakeups counted since the last tick (reset each tick).
+    wakeups: u32,
+    /// Exponentially-smoothed output activity in wakeups/second.
+    rate: f32,
+    /// Accumulated flow position in laps (only the fractional part matters).
+    phase: f32,
+}
+
 /// The whole multiplexer: the mullion layout tree, one engine pane per leaf, the
 /// per-pane titles, and the small amount of interaction state.
 struct Mux {
@@ -60,6 +86,10 @@ struct Mux {
     panes: HashMap<TileId, TermPane>,
     /// Latest OSC/shell title per pane, shown in its titlebar.
     titles: HashMap<TileId, String>,
+    /// Per-pane border instrument state (output-activity flow).
+    meters: HashMap<TileId, Meter>,
+    /// Timestamp of the previous frame, for the animation's wall-clock `dt`.
+    last_frame: Instant,
     /// Monotonic id allocator for new tiles (never reused, so stale ids are inert).
     next_id: TileId,
     /// True while we are between the prefix key and its command key.
@@ -77,6 +107,8 @@ impl Mux {
             tree: Tree::new(Node::Tile(1)), // start with one leaf, id 1
             panes: HashMap::new(),
             titles: HashMap::new(),
+            meters: HashMap::new(),
+            last_frame: Instant::now(),
             next_id: 2, // 1 is taken by the first pane
             prefix_armed: false,
             area,
@@ -141,6 +173,7 @@ impl Mux {
         }
         self.panes.remove(&id); // Drop -> PTY shutdown + thread join
         self.titles.remove(&id);
+        self.meters.remove(&id); // forget its instrument state
         self.tree.ensure_focus_valid(); // reseat focus onto a survivor
         self.tree.ensure_zoom_valid();
         root_was_target || self.panes.is_empty()
@@ -231,7 +264,12 @@ impl Mux {
                             self.titles.insert(id, t); // update the titlebar text
                         }
                         PaneEvent::Exited => exited.push(id), // shell exited: close later
-                        _ => {} // Bell / Wakeup: a full-repaint loop needs no action
+                        PaneEvent::Wakeup => {
+                            // New output was parsed → one unit of activity for the
+                            // border flow (the honest, zero-cost throughput proxy).
+                            self.meters.entry(id).or_default().wakeups += 1;
+                        }
+                        PaneEvent::Bell => {} // (a bell burst will drive the flow later)
                     }
                 }
             }
@@ -243,6 +281,62 @@ impl Mux {
             }
         }
         false
+    }
+
+    /// Advance the border instruments by `dt` seconds: convert each pane's
+    /// wakeup count into a smoothed rate and march its flow phase by that rate.
+    /// A silent pane's phase does not move (idle borders are frozen); a busy
+    /// pane's marches, saturating at [`MAX_LAPS_PER_SEC`].
+    fn tick(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return; // no time passed (or the clock went backwards): nothing to do
+        }
+        for meter in self.meters.values_mut() {
+            // Instantaneous rate this frame, then an exponential moving average so
+            // the flow eases in/out instead of strobing frame-to-frame.
+            let instant = meter.wakeups as f32 / dt;
+            meter.wakeups = 0;
+            meter.rate = meter.rate * 0.75 + instant * 0.25;
+            // Map activity (0..=BUSY) to a lap speed, and advance the phase.
+            let activity = (meter.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
+            meter.phase = (meter.phase + activity * MAX_LAPS_PER_SEC * dt).fract();
+        }
+    }
+
+    /// Draw the flowing green output instrument onto pane `id`'s border ring
+    /// (`tile` is its full rectangle, border included). Packets are Gaussian
+    /// bumps spaced around the perimeter; their brightness scales with activity
+    /// so an idle pane shows dim static dots and a busy one bright marching ones.
+    fn draw_output_flow(&self, buf: &mut Buffer, id: TileId, tile: Rect) {
+        let Some(meter) = self.meters.get(&id) else { return };
+        let phase = meter.phase; // where the packets are this frame
+        let activity = (meter.rate / BUSY_WAKEUPS).clamp(0.0, 1.0); // 0=idle .. 1=busy
+        // No gaps: the title is drawn *after* this pass, so it naturally sits on top.
+        render_rim(buf, tile, &[], |pos, cur| {
+            // Nearest packet to this perimeter position, measured as a circular
+            // distance so bumps cross the corners seamlessly.
+            let mut best = 0.0f32;
+            for k in 0..OUTPUT_PACKETS {
+                let p = (phase + k as f32 / OUTPUT_PACKETS as f32).fract();
+                let mut d = (pos - p).abs();
+                if d > 0.5 {
+                    d = 1.0 - d; // wrap the ring
+                }
+                let g = gaussian(d, PACKET_SIGMA);
+                if g > best {
+                    best = g;
+                }
+            }
+            if best <= 0.04 {
+                return None; // between packets: leave the border its base colour
+            }
+            // Green intensity: brighter with both the bump and the pane's activity.
+            let i = best * (0.30 + 0.70 * activity); // dim when idle, vivid when busy
+            let r = (0x14 as f32 + 0x2c as f32 * i) as u8;
+            let g = (0x30 as f32 + 0xc0 as f32 * i) as u8;
+            let b = (0x1c as f32 + 0x2c as f32 * i) as u8;
+            Some(cur.fg(Color::Rgb(r, g, b)))
+        });
     }
 
     /// Paint one frame: draw the shared tile borders, then blit every pane's
@@ -262,12 +356,22 @@ impl Mux {
         };
         let focus = self.tree.focus();
         let overrides = focus_override(&self.tree, LineWeight::Heavy); // thicken the focused border
+        // Full tile rectangles (border included) for the instrument rings, keyed
+        // by id so we can match them to the content rects below.
+        let tiles: HashMap<TileId, Rect> =
+            solve(self.tree.effective_root_mut(), tiling).into_iter().collect();
         // Draw shared single-cell seams + outer frame, and get each tile's interior.
         let rects = render_shared(buf, self.tree.effective_root_mut(), tiling, &border_style, &overrides);
 
         for (id, rect) in rects {
             if rect.width == 0 || rect.height == 0 {
                 continue; // a tile squeezed to nothing this frame
+            }
+            // Instrument first: flow the output-activity packets around the border
+            // ring (reads `meters`; runs before the pane borrow and before the
+            // title so the title draws on top of it).
+            if let Some(&tile) = tiles.get(&id) {
+                self.draw_output_flow(buf, id, tile);
             }
             let Some(pane) = self.panes.get_mut(&id) else { continue }; // no engine for this tile
             // Size the PTY to its content rectangle (rt-engine resizes the grid
@@ -534,29 +638,45 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let mut mux = Mux::new(area)?;
     let input = EventReader::new(); // background input thread (never blocked by a slow draw)
 
+    let mut first = true; // force the very first paint
     loop {
         let start = Instant::now();
-        // Handle every queued input event this frame (a burst collapses into one frame).
+        // Handle every queued input event this frame (a burst collapses into one
+        // frame). Any input means we must repaint.
+        let mut dirty = first;
         for ev in input.drain() {
-            match ev {
-                Event::Key(k) => {
-                    if !mux.handle_key(k) {
-                        return Ok(()); // a command asked to quit
-                    }
+            dirty = true; // a key, a resize, anything → repaint
+            if let Event::Key(k) = ev {
+                if !mux.handle_key(k) {
+                    return Ok(()); // a command asked to quit
                 }
-                // Resize is handled implicitly: `Terminal::draw` re-reads the size
-                // and reallocates; we just read `buf.area` next frame.
-                _ => {}
             }
         }
         // Titles / child exits. If every shell exited, we're done.
         if mux.poll_panes() {
             return Ok(());
         }
-        // Repaint the whole buffer; mullion diffs and flushes only what changed.
-        term.draw(|buf| mux.render(buf))?;
-        // Pace to the frame budget (sleep the remainder).
-        std::thread::sleep(FRAME.saturating_sub(start.elapsed()));
+        // Advance the instruments by real wall-clock time (framerate-independent).
+        let now = Instant::now();
+        let dt = now.duration_since(mux.last_frame).as_secs_f32().min(0.1); // clamp a stall
+        mux.last_frame = now;
+        mux.tick(dt);
+        // "Busy" = fresh output this frame, or the flow still visibly moving. An
+        // idle multiplexer has frozen borders, so it need not repaint at all —
+        // which is what keeps its own CPU (and thus latency) near zero.
+        let busy = mux.meters.values().any(|m| m.wakeups > 0 || m.rate > 0.5);
+        dirty = dirty || busy;
+
+        if dirty {
+            // Repaint; mullion diffs and flushes only the changed cells.
+            term.draw(|buf| mux.render(buf))?;
+        }
+
+        // Pace: a tight frame while anything is animating, a lazy tick when idle
+        // (still responsive to the next keypress or burst of output).
+        let budget = if busy { FRAME } else { Duration::from_millis(33) };
+        std::thread::sleep(budget.saturating_sub(start.elapsed()));
+        first = false;
     }
 }
 
