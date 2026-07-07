@@ -208,6 +208,16 @@ struct Mux {
     last_boxes: Vec<(TileId, Rect)>,
     /// Live cursor cell while dragging a wire with the mouse (rubber-band).
     drag_cursor: Option<(u16, u16)>,
+    /// Whether the scrollback-search bar is open.
+    search_open: bool,
+    /// The current search query.
+    search_query: String,
+    /// Hits for `search_query` in `search_pane`.
+    search_matches: Vec<rt_engine::SearchMatch>,
+    /// Which hit is "current" (highlighted brighter, scrolled to).
+    search_index: usize,
+    /// The pane the current matches belong to (the focused pane when opened).
+    search_pane: Option<TileId>,
     /// Session temp directory holding all the fifos.
     dir: PathBuf,
     /// Per-pane border instrument state (output-activity flow).
@@ -252,6 +262,11 @@ impl Mux {
             wiring_from: None,
             last_boxes: Vec::new(),
             drag_cursor: None,
+            search_open: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_index: 0,
+            search_pane: None,
             dir,
             meters: HashMap::new(),
             last_frame: Instant::now(),
@@ -362,6 +377,11 @@ impl Mux {
     /// Keys pass straight through to the focused shell *unless* they follow the
     /// prefix, in which case they are multiplexer commands (split/focus/zoom/…).
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // The scrollback-search bar captures every key while it is open.
+        if self.search_open {
+            self.handle_search_key(key);
+            return true;
+        }
         // Is this the prefix chord (Ctrl-a)?
         let is_prefix = matches!(key.code, KeyCode::Char(PREFIX))
             && key.modifiers.contains(KeyModifiers::CONTROL);
@@ -405,6 +425,18 @@ impl Mux {
                 // completes the wire src -> dst.in. Re-firing on the same pane cancels.
                 KeyCode::Char('w') => self.wire_gesture(Stream::Stdout),
                 KeyCode::Char('e') => self.wire_gesture(Stream::Stderr),
+                // Unwire: disconnect every wire touching the focused pane.
+                KeyCode::Char('u') => {
+                    if let Some(f) = self.tree.focus() {
+                        self.wires.retain(|w| w.src != f && w.dst != f);
+                    }
+                }
+                // Pipe: split, then wire the (old) focused pane's stdout into the
+                // new pane's stdin — a cross-pane pipeline. Run a consumer reading
+                // $RT_IN in the new pane (e.g. `grep foo < $RT_IN`).
+                KeyCode::Char('|') => self.pipe_into_new_pane(),
+                // Scrollback search on the focused pane.
+                KeyCode::Char('/') => self.open_search(),
                 // Quit the whole multiplexer.
                 KeyCode::Char('q') => return false,
                 _ => {} // unknown command: ignore
@@ -450,6 +482,84 @@ impl Mux {
         }
     }
 
+    /// Split off a new pane and wire the *previously* focused pane's stdout into
+    /// it — a cross-pane pipeline. The new pane is a fresh shell; run a consumer
+    /// on `$RT_IN` there (e.g. `grep pattern < $RT_IN`).
+    fn pipe_into_new_pane(&mut self) {
+        let Some(src) = self.tree.focus() else { return };
+        self.split(Orientation::Horizontal); // split() focuses the new pane
+        if let Some(dst) = self.tree.focus() {
+            self.connect_wire(src, Stream::Stdout, dst);
+        }
+    }
+
+    /// Open the scrollback-search bar for the focused pane.
+    fn open_search(&mut self) {
+        self.search_open = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_index = 0;
+        self.search_pane = self.tree.focus();
+    }
+
+    /// Close the search bar and clear its state.
+    fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_index = 0;
+        self.search_pane = None;
+    }
+
+    /// Handle a key while the search bar is open: edit the query, or navigate.
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_search(),
+            KeyCode::Enter | KeyCode::Down => self.search_step(1),
+            KeyCode::Up => self.search_step(-1),
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.run_search(true);
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query.push(c);
+                self.run_search(true);
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-run the query against the search pane. `jump` (a fresh query) resets to
+    /// the first hit and scrolls to it; otherwise the position is kept.
+    fn run_search(&mut self, jump: bool) {
+        let Some(id) = self.search_pane else { return };
+        self.search_matches = match self.panes.get(&id) {
+            Some(p) => p.search(&self.search_query, false), // case-insensitive
+            None => Vec::new(),
+        };
+        if jump {
+            self.search_index = 0;
+            if let (Some(m), Some(p)) = (self.search_matches.first(), self.panes.get(&id)) {
+                p.scroll_to_line(m.line);
+            }
+        } else {
+            self.search_index = self.search_index.min(self.search_matches.len().saturating_sub(1));
+        }
+    }
+
+    /// Move to the next (`+1`) or previous (`-1`) hit, wrapping, and scroll to it.
+    fn search_step(&mut self, dir: isize) {
+        let n = self.search_matches.len();
+        if n == 0 {
+            return;
+        }
+        self.search_index = ((self.search_index as isize + dir).rem_euclid(n as isize)) as usize;
+        let line = self.search_matches[self.search_index].line;
+        if let Some(p) = self.search_pane.and_then(|id| self.panes.get(&id)) {
+            p.scroll_to_line(line);
+        }
+    }
+
     /// Mouse: left-press on an output jack starts a drag-wire (rubber-band
     /// follows the cursor); release over a pane connects to its input jack.
     /// Left-press elsewhere focuses the pane under the cursor; right-press
@@ -479,10 +589,18 @@ impl Mux {
                 self.drag_cursor = None;
                 return;
             }
-            MouseEventKind::Down(MouseButton::Right) if self.wiring_from.is_some() => {
-                self.wiring_from = None;
-                self.drag_cursor = None;
-                return;
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Cancel a pending wire, or disconnect the output jack under the
+                // cursor (fan-out/merge management).
+                if self.wiring_from.take().is_some() {
+                    self.drag_cursor = None;
+                    return;
+                }
+                if let Some((id, stream)) = self.jack_at(mx, my) {
+                    self.wires.retain(|w| !(w.src == id && w.stream == stream));
+                    return;
+                }
+                // else: fall through and forward to the app
             }
             _ => {}
         }
@@ -965,6 +1083,23 @@ impl Mux {
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.resize((cw as usize).max(1), (ch as usize).max(1));
                 let snap = pane.snapshot();
+                // Search-match highlight cells for this pane (current hit brighter).
+                let mut hl: HashSet<(usize, usize)> = HashSet::new();
+                let mut hl_cur: HashSet<(usize, usize)> = HashSet::new();
+                if self.search_open && self.search_pane == Some(id) {
+                    let offset = pane.scroll_info().0 as i32; // lines scrolled up
+                    for (mi, m) in self.search_matches.iter().enumerate() {
+                        let row = m.line + offset; // absolute line → snapshot row
+                        if row < 0 {
+                            continue;
+                        }
+                        let row = row as usize;
+                        let set = if mi == self.search_index { &mut hl_cur } else { &mut hl };
+                        for c in m.col..m.col + m.len {
+                            set.insert((row, c));
+                        }
+                    }
+                }
                 for (ry, row) in snap.rows.iter().enumerate() {
                     let y = cy0 + ry as u16;
                     if y >= cy0 + ch {
@@ -975,7 +1110,16 @@ impl Mux {
                         if x >= cx0 + cw {
                             break;
                         }
-                        buf.set_char(x, y, cell.c, style_of(cell));
+                        // A search hit repaints the cell background (current hit
+                        // brighter amber, others dim).
+                        let st = if hl_cur.contains(&(ry, rx)) {
+                            style_of(cell).bg(Color::Rgb(0xbb, 0x99, 0x22))
+                        } else if hl.contains(&(ry, rx)) {
+                            style_of(cell).bg(Color::Rgb(0x5a, 0x4a, 0x10))
+                        } else {
+                            style_of(cell)
+                        };
+                        buf.set_char(x, y, cell.c, st);
                     }
                 }
                 // Cursor of the focused pane (reverse-video block).
@@ -1023,23 +1167,34 @@ impl Mux {
             }
         }
 
-        // Bottom status line: the command cheatsheet, or the wiring prompt.
+        // Bottom status line: search bar, wiring prompt, or command cheatsheet.
         let owned;
-        let (hint, status) = match self.wiring_from {
-            Some((src, stream)) => {
-                let s = match stream {
-                    Stream::Stdout => "stdout",
-                    Stream::Stderr => "stderr",
-                };
-                owned = format!(
-                    " WIRING {s} from shell {src} → click a pane (or focus it + C-a w/e) to connect · Esc/right-click cancels "
-                );
-                (owned.as_str(), Style::default().fg(Color::Rgb(0x20, 0x2a, 0x20)).bg(Color::Rgb(0x60, 0xc0, 0x60)))
+        let (hint, status) = if self.search_open {
+            let pos = if self.search_matches.is_empty() { 0 } else { self.search_index + 1 };
+            owned = format!(
+                " /{}   {}/{}   Enter/↓ next · ↑ prev · Esc close ",
+                self.search_query,
+                pos,
+                self.search_matches.len()
+            );
+            (owned.as_str(), Style::default().fg(Color::Rgb(0x22, 0x22, 0x14)).bg(Color::Rgb(0xcc, 0xb0, 0x40)))
+        } else {
+            match self.wiring_from {
+                Some((src, stream)) => {
+                    let s = match stream {
+                        Stream::Stdout => "stdout",
+                        Stream::Stderr => "stderr",
+                    };
+                    owned = format!(
+                        " WIRING {s} from shell {src} → click a pane (or focus it + C-a w/e) to connect · Esc/right-click cancels "
+                    );
+                    (owned.as_str(), Style::default().fg(Color::Rgb(0x20, 0x2a, 0x20)).bg(Color::Rgb(0x60, 0xc0, 0x60)))
+                }
+                None => (
+                    " C-a  %/\" split · |pipe · o/←→ focus · z zoom · w/e wire · u unwire · / search · x close · q quit ",
+                    Style::default().fg(Color::Rgb(0xc8, 0xc8, 0xd4)).bg(Color::Rgb(0x22, 0x22, 0x2c)),
+                ),
             }
-            None => (
-                " C-a  %/\" split · o/←→ focus · z zoom · r rotate · w/e wire out/err · x close · q quit · drag jacks to wire ",
-                Style::default().fg(Color::Rgb(0xc8, 0xc8, 0xd4)).bg(Color::Rgb(0x22, 0x22, 0x2c)),
-            ),
         };
         // Pad the row so the background spans the full width.
         let mut line = String::from(hint);
