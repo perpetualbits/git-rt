@@ -456,33 +456,64 @@ impl Mux {
     /// cancels a pending wire.
     fn handle_mouse(&mut self, m: MouseEvent) {
         let (mx, my) = (m.column, m.row);
+        // Wiring gestures own the mouse when they apply; otherwise the event is
+        // for the pane under the cursor.
         match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((src, stream)) = self.jack_at(mx, my) {
-                    self.wiring_from = Some((src, stream)); // begin a drag from this jack
-                    self.drag_cursor = Some((mx, my));
-                } else if let Some(id) = self.pane_at(mx, my) {
-                    self.tree.focus_set(id); // click-to-focus
-                }
+            // Left-press on an output jack begins a drag-wire.
+            MouseEventKind::Down(MouseButton::Left) if self.jack_at(mx, my).is_some() => {
+                self.wiring_from = self.jack_at(mx, my);
+                self.drag_cursor = Some((mx, my));
+                return;
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if self.wiring_from.is_some() {
-                    self.drag_cursor = Some((mx, my)); // rubber-band the wire
-                }
+            // Drag / release / right-press while wiring drive the rubber-band.
+            MouseEventKind::Drag(MouseButton::Left) if self.wiring_from.is_some() => {
+                self.drag_cursor = Some((mx, my));
+                return;
             }
-            MouseEventKind::Up(MouseButton::Left) => {
+            MouseEventKind::Up(MouseButton::Left) if self.wiring_from.is_some() => {
                 if let Some((src, stream)) = self.wiring_from.take() {
                     if let Some(dst) = self.pane_at(mx, my) {
-                        self.connect_wire(src, stream, dst); // drop on a pane → connect
+                        self.connect_wire(src, stream, dst);
                     }
-                    self.drag_cursor = None;
                 }
-            }
-            MouseEventKind::Down(MouseButton::Right) => {
-                self.wiring_from = None; // cancel a pending wire
                 self.drag_cursor = None;
+                return;
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.wiring_from.is_some() => {
+                self.wiring_from = None;
+                self.drag_cursor = None;
+                return;
             }
             _ => {}
+        }
+        // Not a wiring gesture: focus on press, then forward to the pane's app.
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            if let Some(id) = self.pane_at(mx, my) {
+                self.tree.focus_set(id);
+            }
+        }
+        self.forward_mouse(m, mx, my);
+    }
+
+    /// Forward a mouse event to the app in the pane under the cursor, translated
+    /// to that pane's local content coordinates — but only if the app enabled
+    /// mouse reporting (else the sequence would be garbage in a plain shell).
+    fn forward_mouse(&mut self, m: MouseEvent, mx: u16, my: u16) {
+        let Some(id) = self.pane_at(mx, my) else { return };
+        let Some(&(_, bx)) = self.last_boxes.iter().find(|&&(i, _)| i == id) else { return };
+        // Content region = box interior; ignore clicks on the border.
+        let (cx0, cy0) = (bx.x + 1, bx.y + 1);
+        if mx < cx0 || my < cy0 || mx + 1 >= bx.right() || my + 1 >= bx.bottom() {
+            return;
+        }
+        let (lcol, lrow) = (mx - cx0 + 1, my - cy0 + 1); // 1-based, pane-local
+        if let Some(pane) = self.panes.get(&id) {
+            if !pane.wants_mouse() {
+                return; // the app isn't listening for the mouse
+            }
+            if let Some(bytes) = encode_mouse(&m, lcol, lrow, pane.mouse_sgr()) {
+                pane.write(&bytes);
+            }
         }
     }
 
@@ -1266,6 +1297,53 @@ fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         out = v;
     }
     Some(out)
+}
+
+/// Re-encode a crossterm mouse event as an xterm mouse report for the pane's
+/// app, at 1-based pane-local `(col, row)`. Uses SGR (`ESC [ < … M/m`) when the
+/// app requested it, else the legacy X10 byte form. Bare motion is not forwarded.
+fn encode_mouse(m: &MouseEvent, col: u16, row: u16, sgr: bool) -> Option<Vec<u8>> {
+    // Button/action base code, and whether this is a release.
+    let (mut cb, release) = match m.kind {
+        MouseEventKind::Down(b) => (button_code(b), false),
+        MouseEventKind::Up(b) => (button_code(b), true),
+        MouseEventKind::Drag(b) => (button_code(b) + 32, false), // motion flag
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        MouseEventKind::Moved => return None, // don't spam bare motion
+    };
+    // Fold in keyboard modifiers (the xterm bit positions).
+    if m.modifiers.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if m.modifiers.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if m.modifiers.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+    if sgr {
+        // SGR: press/scroll end in 'M', release in 'm'; coordinates are decimal.
+        let end = if release { 'm' } else { 'M' };
+        Some(format!("\x1b[<{cb};{col};{row}{end}").into_bytes())
+    } else {
+        // Legacy X10: ESC [ M then three bytes offset by 32; release is button 3.
+        let b = if release { 3 } else { cb };
+        let cx = (col.saturating_add(32)).min(255) as u8;
+        let cy = (row.saturating_add(32)).min(255) as u8;
+        Some(vec![0x1b, b'[', b'M', (b + 32).min(255) as u8, cx, cy])
+    }
+}
+
+/// The xterm button code for a mouse button (before the motion/modifier bits).
+fn button_code(b: MouseButton) -> u16 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
 }
 
 /// The C0 control byte for `Ctrl`+`c`, or `None` if the combination has no

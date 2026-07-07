@@ -608,6 +608,24 @@ impl TermPane {
         term.mode().contains(TermMode::APP_CURSOR) // set by DECCKM (\e[?1h)
     }
 
+    /// Whether the program has enabled *any* mouse reporting (click, drag, or
+    /// motion). A host multiplexer should only forward mouse events to the pane
+    /// when this is true — otherwise the escape sequences would land as garbage
+    /// keystrokes in a plain shell.
+    pub fn wants_mouse(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        let term = self.term.lock();
+        term.mode().intersects(TermMode::MOUSE_MODE) // click | motion | drag
+    }
+
+    /// Whether the program requested SGR mouse encoding (mode 1006). Selects the
+    /// `ESC [ < … M/m` form over the legacy `ESC [ M` byte form.
+    pub fn mouse_sgr(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        let term = self.term.lock();
+        term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
     /// Whether the terminal is on its alternate screen (as full-screen TUIs like
     /// `vim`/`htop`/`less` use). Newspaper-column flow is meaningless there — the
     /// app owns the whole screen — so the renderer falls back to a single column
