@@ -42,6 +42,23 @@ use rt_session::{Broadcast, Session, SessionEvent};
 /// boxed closure (boxed so the `Session`'s factory type is nameable in a field).
 type AppSession = Session<TermPane, Box<dyn FnMut(usize, usize) -> TermPane>>;
 
+/// One pane's output-activity instrument state (ported from rt-mux): a smoothed
+/// output rate and an accumulated flow phase. The border flow's speed and
+/// brightness track real output — the motion *is* the measurement.
+#[derive(Default, Clone, Copy)]
+struct Meter {
+    wakeups: u32, // output events counted since the last tick
+    rate: f32,    // smoothed events/second
+    phase: f32,   // accumulated flow position (laps; only the fraction matters)
+}
+
+/// Output events/second that reads as "fully busy" (flow saturates here).
+const BUSY_WAKEUPS: f32 = 60.0;
+/// Laps/second the border flow travels at full activity.
+const FLOW_MAX_LAPS: f32 = 0.6;
+/// Green packets orbiting each pane's border.
+const FLOW_PACKETS: u32 = 4;
+
 /// Everything that only exists once a window and GL context are created (which
 /// happens on the first `resumed`). Kept in an `Option` on the `App` so we can
 /// build it lazily and tear it down on suspend.
@@ -62,6 +79,8 @@ struct Active {
     selecting: bool,                      // true while the left button is held for a drag-select
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
     bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
+    meters: std::collections::HashMap<rt_core::PaneId, Meter>, // per-pane output-activity instrument
+    last_meter_tick: Instant,             // wall-clock of the last instrument advance
     last_click: Option<(Instant, (f32, f32))>, // time + position of the last left-press
     click_count: u8,                      // 1=single, 2=double (word), 3=triple (line)
     egui_ctx: egui::Context,              // egui immediate-mode context (chrome/dialogs)
@@ -525,6 +544,8 @@ impl ApplicationHandler for App {
             selecting: false,
             dragging_divider: None,
             bell_flash: None,
+            meters: std::collections::HashMap::new(),
+            last_meter_tick: Instant::now(),
             last_click: None,
             click_count: 0,
             egui_ctx,
@@ -920,7 +941,12 @@ impl ApplicationHandler for App {
                             active.bell_flash = Some(Instant::now() + Duration::from_millis(150));
                             dirty = true;
                         }
-                        _ => dirty = true, // Wakeup → needs a redraw
+                        _ => {
+                            // Wakeup → new output; count it for the pane's border
+                            // flow instrument and schedule a redraw.
+                            active.meters.entry(id).or_default().wakeups += 1;
+                            dirty = true;
+                        }
                     }
                 }
             }
@@ -946,6 +972,12 @@ impl ApplicationHandler for App {
                 }
                 _ => dirty = true, // a pane closed; repaint the survivors
             }
+            active.meters.remove(&id); // forget the closed pane's instrument state
+        }
+        // Keep repainting while any border flow is still moving, so it eases to a
+        // stop (and decays) instead of freezing mid-orbit when output pauses.
+        if active.meters.values().any(|m| m.rate > 0.5) {
+            dirty = true;
         }
         // While the search bar is open, keep its results current as new output
         // streams into the searched pane (so a running command's fresh lines are
@@ -1647,13 +1679,14 @@ impl App {
 
         active.renderer.end_frame(); // upload + draw call
 
-        // egui overlay (preferences dialog), painted on top of the terminal.
+        // One egui pass per frame: the preferences dialog, or the search bar, or
+        // (when no dialog is up) the always-on border instruments.
         if active.prefs_open {
             Self::paint_egui(active);
-        }
-        // The scrollback-search bar, also an egui overlay, painted on top.
-        if active.search_open {
+        } else if active.search_open {
             Self::paint_search(active);
+        } else {
+            Self::paint_instruments(active);
         }
 
         // Present the frame.
@@ -1787,6 +1820,62 @@ impl App {
         );
     }
 
+    /// Draw the per-pane output-activity instrument as an egui overlay: glowing
+    /// green packets orbiting each pane's border, their speed and brightness
+    /// scaled by that pane's live output rate (ported from rt-mux). Runs its own
+    /// egui pass; called only when no dialog is up, so there is one pass a frame.
+    fn paint_instruments(active: &mut Active) {
+        // Advance the flow by real wall-clock time.
+        let now = Instant::now();
+        let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
+        active.last_meter_tick = now;
+        for m in active.meters.values_mut() {
+            let inst = m.wakeups as f32 / dt.max(1e-3);
+            m.wakeups = 0;
+            m.rate = m.rate * 0.75 + inst * 0.25;
+            let act = (m.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
+            m.phase = (m.phase + act * FLOW_MAX_LAPS * dt).fract();
+        }
+        // Pane rectangles in physical pixels.
+        let size = active.window.inner_size();
+        let bounds = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+        let rects = active.session.visible_rects(bounds);
+
+        // egui pass: a background painter drawing the orbiting packets.
+        let raw = active.egui_state.take_egui_input(&active.window);
+        let ctx = active.egui_ctx.clone();
+        ctx.begin_pass(raw);
+        let ppp = ctx.pixels_per_point().max(0.5); // physical px → egui points
+        {
+            let painter =
+                ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("rt_instr")));
+            for (id, rect) in &rects {
+                let m = active.meters.get(id).copied().unwrap_or_default();
+                let act = (m.rate / BUSY_WAKEUPS).clamp(0.0, 1.0);
+                let (x, y, w, h) = (rect.x / ppp, rect.y / ppp, rect.w / ppp, rect.h / ppp);
+                for k in 0..FLOW_PACKETS {
+                    let t = (m.phase + k as f32 / FLOW_PACKETS as f32).fract();
+                    let p = flow_point(x, y, w, h, t);
+                    let a = 0.30 + 0.70 * act; // dim when idle, vivid when busy
+                    let glow = egui::Color32::from_rgba_unmultiplied(0x28, 0xc0, 0x48, (a * 110.0) as u8);
+                    let core = egui::Color32::from_rgba_unmultiplied(0x66, 0xff, 0x7a, (a * 255.0) as u8);
+                    painter.circle_filled(p, 9.0, glow); // soft halo
+                    painter.circle_filled(p, 3.4, core); // bright centre
+                }
+            }
+        }
+        let output = ctx.end_pass();
+        active.egui_state.handle_platform_output(&active.window, output.platform_output);
+        let ppp2 = output.pixels_per_point;
+        let primitives = ctx.tessellate(output.shapes, ppp2);
+        active.egui_painter.paint_and_update_textures(
+            [size.width, size.height],
+            ppp2,
+            &primitives,
+            &output.textures_delta,
+        );
+    }
+
     /// Re-run the current search query against the focused pane and replace the
     /// stored hits. When `jump` is true (the query just changed) it resets to the
     /// first hit and scrolls it into view; when false (a live refresh as new
@@ -1842,6 +1931,23 @@ impl App {
         active.search_index = 0;
         active.search_pane = None;
         active.window.request_redraw();
+    }
+}
+
+/// The point at normalised position `t` (0..1, clockwise from the top-left)
+/// around the perimeter of the rectangle `(x, y, w, h)` — used to place the
+/// orbiting output-flow packets. All in egui points.
+fn flow_point(x: f32, y: f32, w: f32, h: f32, t: f32) -> egui::Pos2 {
+    let per = 2.0 * (w + h); // perimeter length
+    let d = t.rem_euclid(1.0) * per; // distance travelled along it
+    if d < w {
+        egui::pos2(x + d, y) // top edge, left → right
+    } else if d < w + h {
+        egui::pos2(x + w, y + (d - w)) // right edge, top → bottom
+    } else if d < 2.0 * w + h {
+        egui::pos2(x + w - (d - w - h), y + h) // bottom edge, right → left
+    } else {
+        egui::pos2(x, y + h - (d - 2.0 * w - h)) // left edge, bottom → top
     }
 }
 
