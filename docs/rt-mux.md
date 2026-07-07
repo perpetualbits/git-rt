@@ -59,13 +59,45 @@ terminal share one battle-tested core with zero duplicated terminal logic.
 cargo run -p rt-mux
 ```
 
+## Border instruments — the borders *mean* something
+
+Every pane border is a live readout, not decoration (the aerie `rim-latency`
+philosophy: motion is measurement). Three instruments share the geometry because
+they measure different physics:
+
+- **Output (green flow).** Packets march around each pane's ring; brightness and
+  speed ∝ that pane's output rate (`PaneEvent::Wakeup`). Idle = frozen dim dots,
+  busy = bright marching green. You see which shells are working across the screen.
+- **Heat (planck/blackbody tint).** The border's *base* colour is the pane's CPU
+  temperature — dim deep-red idle → orange → yellow → white-hot → blue-white —
+  summed over the pane's session (shell + children) via a ~2 Hz `/proc` scan. The
+  green flow rides over this base, so one ring shows compute *and* output at once.
+- **Latency (violet window frame).** The outer frame calmly undulates
+  purple-blue-violet and flares when the render loop misses its deadline (a CPU
+  hogger stealing the frame). The mux's own pulse.
+
+## Patch-bay — wire shells' fds together
+
+The novel feature: terminals connect their fds to each other. Each pane exposes
+side-channel pipe jacks separate from the tty — `$RT_OUT` (a program writes,
+rt-mux reads) and `$RT_IN` (rt-mux writes, a program reads). `C-a w` arms a wire
+from the focused pane's output jack; move focus; `C-a w` again connects
+`src.out → dst.in`. rt-mux pumps the bytes and the **wire is drawn** — routed
+between the floating panes with mullion's `socket`/`route`/`junction`, with a
+green flow whose packets are the literal bytes on the pipe.
+
+```sh
+# in pane A:            in pane B (wired A.out → B.in):
+producer > $RT_OUT      consumer < $RT_IN
+```
+
 ## Status
 
-Working proof-of-concept. Verified (hosted inside tmux via `capture-pane`):
-single pane with title + focus border + status bar; live PTY I/O; side-by-side
-and stacked splits with correct light/heavy seam junctions; focus tracking and
-cycling; zoom/restore; close with split-collapse; clean quit.
+Working proof-of-concept, all verified inside tmux via `capture-pane`:
+single/multi-pane splits with light/heavy junctions, focus/zoom/close, live PTY
+I/O; the three border instruments (output green, heat planck, latency violet);
+and the patch-bay (data crosses A→B, drawn as a routed animated wire).
 
 Not yet ported from the GPU `rt`: scrollback search overlay, newspaper columns,
-mouse selection/URL open, groups/broadcast, the animated "bitstream" rim-glow
-border (mullion's `render_rim` / `Field::perimeter` — the obvious next flourish).
+mouse (selection/URL, and mouse-drag wiring), groups/broadcast. Wire polish:
+stderr as a distinct red jack, fan-out/merge, true cross-pane pipelines.
