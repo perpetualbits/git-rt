@@ -429,6 +429,12 @@ impl Renderer {
         unsafe {
             // Upload the coverage bitmap into the atlas at (x, y).
             self.gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
+            // R8 rows are tightly packed (stride == width). We must force
+            // UNPACK_ALIGNMENT=1 *here*, not just once at init: egui_glow (which
+            // now runs every frame for the instrument overlay) resets it to 4, and
+            // a stale 4 shears any glyph whose width isn't a multiple of 4 — the
+            // row-by-row skew that shows as edge artifacts on the right/bottom.
+            self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             self.gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
