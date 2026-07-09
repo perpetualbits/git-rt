@@ -2429,7 +2429,11 @@ impl App {
         let mut close = false; // set by the Close button
         // egui 0.35 frame API: begin_pass → build UI → end_pass.
         ctx.begin_pass(raw_input);
-        preferences::ui(&ctx, &mut settings, &mut close, &active.mono_families); // build the dialog
+        // Estimate scrollback memory against a full-width pane at the current
+        // font, so the dialog can warn before the slider picks an unrunnable size.
+        let cols = (content_bounds(active.window.inner_size()).w / active.renderer.cell_size().0).max(1.0) as usize;
+        let ram = total_ram_bytes();
+        preferences::ui(&ctx, &mut settings, &mut close, &active.mono_families, ram, cols); // build the dialog
         let output = ctx.end_pass();
         // Apply + persist any change the user made.
         if settings != active.settings {
@@ -3052,6 +3056,23 @@ fn window_size_for_grid(cols: usize, rows: usize, cell: (f32, f32), show_titleba
     let w = cols as f32 * cell.0 + cell.0 * 0.5 + pad_w + 2.0 * WINDOW_MARGIN;
     let h = rows as f32 * cell.1 + cell.1 * 0.5 + pad_h + 2.0 * WINDOW_MARGIN;
     winit::dpi::PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
+}
+
+/// Total system RAM in bytes (`MemTotal` from `/proc/meminfo`), or 0 if it can't
+/// be read. Excludes swap — the Preferences scrollback estimate is against
+/// physical RAM, since spilling a terminal buffer to swap is already a failure.
+fn total_ram_bytes() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                // Line looks like: "MemTotal:       65712345 kB"
+                let kb = l.strip_prefix("MemTotal:")?.split_whitespace().next()?;
+                kb.parse::<u64>().ok()
+            })
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
 }
 
 /// Format a line count compactly for the titlebar buffer meter: `950`, `12k`,
