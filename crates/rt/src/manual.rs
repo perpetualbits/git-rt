@@ -69,6 +69,18 @@ GROUPS  &  BROADCAST   (type once, reach many panes)
                   Off = focused pane; All = every pane; Group = same-group panes
 
 
+MOUSE
+  click            focus a pane (or focus-follows-mouse, see Preferences)
+  drag             select text; double-click = word, triple-click = line
+  wheel            scroll that pane's scrollback
+  middle-click     paste the PRIMARY selection
+  right-click      context menu        drag a gutter   resize the split
+  Ctrl+click       open a URL under the pointer
+  When the program in a pane asks for the mouse (vim, htop, tmux, less
+  --mouse, fzf, ...), rt forwards clicks, drags and the wheel to it instead.
+  Hold SHIFT to override that and use rt's own select / scroll / menu.
+
+
 BORDER INSTRUMENTS   (each pane's border is a live gauge; toggle in Preferences)
   Output   a green flow of packets orbits the border; speed and brightness
            track that pane's live output rate. Idle = still; busy = racing.

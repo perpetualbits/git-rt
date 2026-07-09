@@ -182,6 +182,7 @@ struct Active {
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
+    mouse_report: Option<(rt_core::PaneId, u16)>, // pane + xterm button code we're forwarding a press to
     dragging_divider: Option<rt_core::DragHandle>, // the split divider being dragged, if any
     bell_flash: Option<Instant>,          // expiry of the current visible-bell flash, if any
     meters: std::collections::HashMap<rt_core::PaneId, Meter>, // per-pane output-activity instrument
@@ -779,6 +780,7 @@ impl ApplicationHandler for App {
             bg_effect,
             selection: None,
             selecting: false,
+            mouse_report: None,
             dragging_divider: None,
             bell_flash: None,
             meters: std::collections::HashMap::new(),
@@ -1039,6 +1041,25 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as isize, // touchpads (~20px/line)
                 };
                 if lines != 0 {
+                    // If the app under the pointer wants the wheel (and Shift
+                    // isn't held to force scrollback), send it one report per
+                    // notch instead of scrolling rt's history.
+                    if !active.mods.shift_key() {
+                        let up = lines > 0;
+                        let notches = lines.unsigned_abs().min(8); // cap runaway touchpad deltas
+                        let mut forwarded = false;
+                        for _ in 0..notches {
+                            if Self::forward_mouse(active, MouseReport::Scroll(up), active.mouse.0, active.mouse.1) {
+                                forwarded = true;
+                            } else {
+                                break; // pane doesn't want the mouse: fall through to scrollback
+                            }
+                        }
+                        if forwarded {
+                            active.window.request_redraw();
+                            return;
+                        }
+                    }
                     let focus = active.session.focus(); // scroll the focused pane
                     // Drive the terminal's own scrollback; in column mode the
                     // whole tall viewport shifts, giving the cross-column flow.
@@ -1052,7 +1073,14 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
-                if active.wiring_from.is_some() {
+                if let Some((_, btn)) = active.mouse_report {
+                    // A forwarded button is held: report motion to the app as a
+                    // drag (Shift still suspends forwarding, e.g. to select).
+                    if !active.mods.shift_key() {
+                        Self::forward_mouse(active, MouseReport::Drag(btn), active.mouse.0, active.mouse.1);
+                        active.window.request_redraw();
+                    }
+                } else if active.wiring_from.is_some() {
                     // Rubber-band the in-progress wire to the cursor.
                     active.drag_cursor = Some(active.mouse);
                     active.window.request_redraw();
@@ -1103,6 +1131,15 @@ impl ApplicationHandler for App {
                     }
                     if let Some((id, stream)) = Self::jack_at(active, active.mouse.0, active.mouse.1) {
                         active.wires.retain(|w| !(w.src == id && w.stream == stream));
+                        active.window.request_redraw();
+                        return;
+                    }
+                    // A mouse-reporting app gets the right-press (Shift held opens
+                    // rt's menu instead, the standard terminal override).
+                    if !active.mods.shift_key()
+                        && Self::forward_mouse(active, MouseReport::Press(2), active.mouse.0, active.mouse.1)
+                    {
+                        active.session.focus_at(active.mouse.0, active.mouse.1);
                         active.window.request_redraw();
                         return;
                     }
@@ -1169,6 +1206,15 @@ impl ApplicationHandler for App {
                                     }
                                 }
                             }
+                            // If the pane's app wants the mouse, forward the press
+                            // to it instead of starting a selection (Shift held =
+                            // override, so you can always select over the app).
+                            if !active.mods.shift_key()
+                                && Self::forward_mouse(active, MouseReport::Press(0), mx, my)
+                            {
+                                active.window.request_redraw();
+                                return;
+                            }
                             // Determine the click count (single / double / triple)
                             // from timing + proximity to the previous press.
                             let now = Instant::now();
@@ -1211,6 +1257,11 @@ impl ApplicationHandler for App {
                     }
                 }
                 (ElementState::Released, MouseButton::Left) => {
+                    // If the matching press was forwarded to an app, forward the
+                    // release too and we're done.
+                    if Self::end_mouse_report(active) {
+                        return;
+                    }
                     // Completing a drag-to-wire: connect to the pane under the cursor.
                     if let Some((src, stream)) = active.wiring_from.take() {
                         if let Some(dst) = Self::pane_at(active, active.mouse.0, active.mouse.1) {
@@ -1236,6 +1287,14 @@ impl ApplicationHandler for App {
                     }
                 }
                 (ElementState::Pressed, MouseButton::Middle) => {
+                    // A mouse-reporting app gets the middle-press; otherwise (or
+                    // with Shift held) middle-click pastes the PRIMARY selection.
+                    if !active.mods.shift_key()
+                        && Self::forward_mouse(active, MouseReport::Press(1), active.mouse.0, active.mouse.1)
+                    {
+                        active.window.request_redraw();
+                        return;
+                    }
                     // Middle-click pastes the PRIMARY selection (X/Wayland idiom).
                     if let Some(cb) = &active.clipboard {
                         if let Ok(text) = cb.load_primary() {
@@ -1245,7 +1304,12 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                _ => {} // other buttons / releases: nothing
+                (ElementState::Released, MouseButton::Right)
+                | (ElementState::Released, MouseButton::Middle) => {
+                    // Forward the button-up to the app if its press was forwarded.
+                    Self::end_mouse_report(active);
+                }
+                _ => {} // other buttons / states: nothing
             },
 
             // Time to paint.
@@ -1619,6 +1683,68 @@ impl App {
             }
         }
         None
+    }
+
+    /// Forward a pointer action to the application in the pane under `(mx, my)`,
+    /// but only if that app has enabled mouse reporting. Returns `true` when it
+    /// consumed the event — the caller then stands rt's own chrome (selection,
+    /// scrollback, menu) down. Callers gate this on Shift NOT being held, so
+    /// Shift is the override that always gives you rt's selection/scroll.
+    fn forward_mouse(active: &mut Active, report: MouseReport, mx: f32, my: f32) -> bool {
+        // Which pane + 0-based cell is under the pointer? (None over a gutter or
+        // titlebar, or a multi-column pane cell_at declines to map.)
+        let (pane_id, col0, row0) = match Self::cell_at(active, mx, my) {
+            Some(t) => t,
+            None => return false,
+        };
+        // Encode + write inside a block so the pane borrow ends before we touch
+        // `active.mouse_report` (a disjoint field, but keep the borrows tidy).
+        let wrote = {
+            let Some(pane) = active.session.pane(pane_id) else { return false };
+            if !pane.wants_mouse() {
+                return false; // app hasn't requested the mouse: let rt handle it
+            }
+            let col = (col0 as u16).saturating_add(1); // xterm coordinates are 1-based
+            let row = (row0 as u16).saturating_add(1);
+            match encode_mouse(report, col, row, &active.mods, pane.mouse_sgr()) {
+                Some(bytes) => {
+                    pane.write(&bytes); // send the report to the app's stdin
+                    true
+                }
+                None => false,
+            }
+        };
+        if wrote {
+            // Remember a pressed button so motion reports as a drag and the
+            // release reaches the same pane; a release clears the memory.
+            match report {
+                MouseReport::Press(b) => active.mouse_report = Some((pane_id, b)),
+                MouseReport::Release(_) => active.mouse_report = None,
+                _ => {}
+            }
+        }
+        wrote
+    }
+
+    /// If a forwarded button press is still outstanding, forward its release to
+    /// the app and clear the state. Returns `true` if it handled the release.
+    /// Sends the release to the pane under the cursor, or — if the pointer has
+    /// left that pane — to the pane that got the press, so the app never misses
+    /// a button-up.
+    fn end_mouse_report(active: &mut Active) -> bool {
+        let Some((pid, btn)) = active.mouse_report.take() else { return false };
+        if !Self::forward_mouse(active, MouseReport::Release(btn), active.mouse.0, active.mouse.1) {
+            // Pointer left the pane: still tell the original pane the button is up.
+            if let Some(pane) = active.session.pane(pid) {
+                if pane.wants_mouse() {
+                    if let Some(bytes) = encode_mouse(MouseReport::Release(btn), 1, 1, &active.mods, pane.mouse_sgr()) {
+                        pane.write(&bytes);
+                    }
+                }
+            }
+        }
+        active.window.request_redraw();
+        true
     }
 
     /// Word boundaries around `(col, row)` for double-click selection: expand
@@ -2748,6 +2874,47 @@ fn window_size_for_grid(cols: usize, rows: usize, cell: (f32, f32), show_titleba
     let w = cols as f32 * cell.0 + cell.0 * 0.5 + pad_w + 2.0 * WINDOW_MARGIN;
     let h = rows as f32 * cell.1 + cell.1 * 0.5 + pad_h + 2.0 * WINDOW_MARGIN;
     winit::dpi::PhysicalSize::new(w.ceil() as u32, h.ceil() as u32)
+}
+
+/// A pointer action to report to the application running inside a pane.
+#[derive(Clone, Copy)]
+enum MouseReport {
+    Press(u16),   // button pressed; the u16 is the base xterm button code (0=L,1=M,2=R)
+    Release(u16), // button released
+    Drag(u16),    // pointer motion while a button is held
+    Scroll(bool), // wheel notch: true = up, false = down
+}
+
+/// Encode a pointer action as an xterm mouse report at 1-based `(col, row)`, in
+/// SGR form (`ESC [ < b ; col ; row M/m`) when the app enabled it, else the
+/// legacy X10 byte form. Mirrors rt-mux's encoder. Shift is rt's override key
+/// (the caller never forwards a Shift-held event), so only Alt/Ctrl fold into
+/// the button bits here.
+fn encode_mouse(report: MouseReport, col: u16, row: u16, mods: &ModifiersState, sgr: bool) -> Option<Vec<u8>> {
+    // Base button/action code, and whether this is a release.
+    let (mut cb, release) = match report {
+        MouseReport::Press(b) => (b, false),
+        MouseReport::Release(b) => (b, true),
+        MouseReport::Drag(b) => (b + 32, false),               // xterm motion flag
+        MouseReport::Scroll(up) => (if up { 64 } else { 65 }, false), // wheel codes
+    };
+    if mods.alt_key() {
+        cb += 8; // xterm Meta bit
+    }
+    if mods.control_key() {
+        cb += 16; // xterm Control bit
+    }
+    if sgr {
+        // SGR (mode 1006): decimal coords, press/scroll end in 'M', release in 'm'.
+        let end = if release { 'm' } else { 'M' };
+        Some(format!("\x1b[<{cb};{col};{row}{end}").into_bytes())
+    } else {
+        // Legacy X10: ESC [ M then three bytes, each offset by 32; release = code 3.
+        let b = if release { 3 } else { cb };
+        let cx = col.saturating_add(32).min(255) as u8;
+        let cy = row.saturating_add(32).min(255) as u8;
+        Some(vec![0x1b, b'[', b'M', (b + 32).min(255) as u8, cx, cy])
+    }
 }
 
 /// A point on the cubic Bézier `p0→p3` (control points `p1`, `p2`) at `t` in
