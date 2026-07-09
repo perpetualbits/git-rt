@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # System libraries the windowing / GL / font stack needs to compile.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libxcb1-dev libx11-dev \
+            libgl1-mesa-dev libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The default feature set is universal (Wayland + X11).
+      - name: Build (universal)
+        run: cargo build --workspace --locked
+
+      # The lean Wayland-only build must also stay green.
+      - name: Build (Wayland-only)
+        run: cargo build -p rt --no-default-features --locked
+
+      # Tests are headless (PTY + controller logic); no display server needed.
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # Clippy is informational: it reports lints without failing the build,
+      # so a new advisory doesn't block a merge on its own.
+      - name: Clippy (informational)
+        run: cargo clippy --workspace --all-targets --locked
+        continue-on-error: true
