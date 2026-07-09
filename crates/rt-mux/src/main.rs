@@ -299,8 +299,9 @@ impl Mux {
     /// Build the multiplexer with a single pane filling `area` (minus the outer
     /// border). Fails only if the first PTY cannot be spawned.
     fn new(area: Rect) -> io::Result<Self> {
-        // A per-session temp directory holds every pane's fifos.
-        let dir = std::env::temp_dir().join(format!("rt-mux-{}", std::process::id()));
+        // A per-session directory holds every pane's fifos (under $XDG_RUNTIME_DIR
+        // when set, so it's per-user tmpfs and auto-removed on logout).
+        let dir = mux_base().join(format!("rt-mux-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         let mut mux = Mux {
             tree: Tree::new(Node::Tile(1)), // start with one leaf, id 1
@@ -1714,9 +1715,55 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     }
 }
 
+impl Drop for Mux {
+    /// Remove the session's fifo directory on the way out. rt-mux exits by
+    /// returning from `main` (not `process::exit`), so this Drop reliably runs on
+    /// a normal quit; the startup sweep below covers crashes/kills.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Base directory for the per-session fifos. Prefer `$XDG_RUNTIME_DIR` (per-user
+/// tmpfs, mode 0700, auto-removed on logout); fall back to the temp dir.
+fn mux_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// On startup, reclaim `rt-mux-<pid>` fifo dirs left by sessions that died
+/// without cleanup (crash/kill). Scans `$XDG_RUNTIME_DIR` and the temp dir; only
+/// removes a dir when no live process owns its pid, so a running session's dir
+/// (or an unrelated pid-reuse) is never touched.
+fn sweep_stale_mux_dirs() {
+    let mut bases = vec![mux_base(), std::env::temp_dir()];
+    bases.dedup();
+    let me = std::process::id();
+    for base in bases {
+        let Ok(entries) = std::fs::read_dir(&base) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("rt-mux-"))
+                .and_then(|p| p.parse::<u32>().ok())
+            else {
+                continue; // not an `rt-mux-<pid>` dir
+            };
+            if pid == me || Path::new(&format!("/proc/{pid}")).exists() {
+                continue; // ourselves, or a live owner
+            }
+            let _ = std::fs::remove_dir_all(entry.path()); // dead owner → reclaim
+        }
+    }
+}
+
 /// Set up the terminal, run the loop, and always restore the terminal on the way
 /// out (even if the loop returns an error).
 fn main() -> io::Result<()> {
+    sweep_stale_mux_dirs(); // reclaim dirs from dead sessions before we start
     let mut backend = CrosstermBackend::new(io::stdout());
     backend.apply_capabilities(&Capabilities::detect()); // truecolor/unicode probe
     backend.set_mouse_capture(true); // rt-mux uses the mouse for focus + drag-to-wire
