@@ -248,3 +248,39 @@ fn close_window_action_is_forwarded() {
     let (mut session, _logs) = make();
     assert_eq!(session.apply(Action::CloseWindow), Some(SessionEvent::CloseWindow));
 }
+
+/// Soak the create/destroy lifecycle: repeatedly split the tree three ways and
+/// close back down to the single starting pane, thousands of times. Normal use
+/// hits split/close once and moves on; this hammers it to surface tree/focus
+/// corruption or unbounded growth that only shows up over many cycles.
+#[test]
+fn soak_split_and_close_returns_to_baseline() {
+    let (mut session, _logs) = make();
+    let base = session.tree().all_panes().len();
+    assert_eq!(base, 1, "starts with one pane");
+    for i in 0..3000 {
+        // Build up: three splits in different directions → base + 3 panes.
+        session.apply(Action::SplitVert);
+        session.apply(Action::SplitHoriz);
+        session.apply(Action::SplitAuto);
+        assert_eq!(
+            session.tree().all_panes().len(),
+            base + 3,
+            "pane count wrong after splits at iter {i}"
+        );
+        // Tear back down. Three closes on a 4-pane tree never touch the last
+        // pane, so each returns Redraw (not CloseWindow) and re-seats focus.
+        for _ in 0..3 {
+            assert_eq!(session.apply(Action::CloseTerm), Some(SessionEvent::Redraw));
+        }
+        assert_eq!(
+            session.tree().all_panes().len(),
+            base,
+            "did not return to baseline at iter {i}"
+        );
+        // Focus must still land on a live pane (would panic on a dangling id).
+        session.feed_input(b"x");
+    }
+    // After thousands of cycles the tree is exactly where it started.
+    assert_eq!(session.tree().all_panes().len(), 1);
+}
