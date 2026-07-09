@@ -10,7 +10,14 @@ use rt_config::Settings;
 /// Build the preferences window for this frame. Mutates `settings` directly
 /// (sliders/checkboxes bind to its fields) and sets `close` true when the user
 /// dismisses the dialog. Call once per frame from the egui run closure.
-pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool, families: &[String]) {
+pub fn ui(
+    ctx: &egui::Context,
+    settings: &mut Settings,
+    close: &mut bool,
+    families: &[String],
+    mem_total_bytes: u64,
+    cols: usize,
+) {
     egui::Window::new("rt preferences")
         .collapsible(false)
         .resizable(false)
@@ -89,12 +96,41 @@ pub fn ui(ctx: &egui::Context, settings: &mut Settings, close: &mut bool, famili
             // Per-pane titlebars (title + size + group) vs the borderless look.
             ui.checkbox(&mut settings.show_titlebar, "Show per-pane titlebars");
             // Scrollback buffer size (lines kept above the screen). Logarithmic
-            // so the slider spans 1k…1M usefully. Applies to new terminals.
+            // so the slider spans 1k…20M usefully. Applies to new terminals.
             ui.add(
                 egui::Slider::new(&mut settings.scrollback, 1000..=Settings::MAX_SCROLLBACK)
                     .logarithmic(true)
                     .text("Scrollback (lines, new terminals)"),
             );
+            // Live memory estimate for a FULL buffer at the current pane width —
+            // PER PANE. This is the guardrail: sliding to the max can pick a size
+            // no machine can hold, so show the cost (and its share of RAM) in a
+            // colour that reddens as it approaches, before the user commits.
+            {
+                let per_line = cols.max(1) as u64 * rt_engine::CELL_BYTES as u64 + 32; // + row overhead
+                let full = (settings.scrollback as u64).saturating_mul(per_line);
+                let (val, unit) = if full >= 1_000_000_000 {
+                    (full as f64 / 1e9, "GB")
+                } else {
+                    (full as f64 / 1e6, "MB")
+                };
+                let frac = if mem_total_bytes > 0 { full as f64 / mem_total_bytes as f64 } else { 0.0 };
+                // Grey when comfortable, amber past a quarter of RAM, red past half.
+                let colour = if frac > 0.5 {
+                    egui::Color32::from_rgb(0xe0, 0x60, 0x50)
+                } else if frac > 0.25 {
+                    egui::Color32::from_rgb(0xe0, 0xc0, 0x50)
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                let text = if mem_total_bytes > 0 {
+                    format!("≈ {val:.1} {unit} per pane if full — {:.0}% of RAM, at {cols} cols", frac * 100.0)
+                } else {
+                    format!("≈ {val:.1} {unit} per pane if full, at {cols} cols")
+                };
+                ui.colored_label(colour, text);
+                ui.colored_label(colour, "each pane keeps its own buffer — N panes ⇒ N× this");
+            }
 
             ui.add_space(6.0);
             ui.heading("Border instruments");

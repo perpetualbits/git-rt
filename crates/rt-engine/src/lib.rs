@@ -33,6 +33,12 @@ use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 /// default). rt's front-end overrides this from the user's Preferences.
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
 
+/// Bytes one grid cell occupies (alacritty's `Cell`). The front-end multiplies
+/// this by columns × lines to estimate the memory a full scrollback would use,
+/// so the Preferences slider can warn before the user picks a size their RAM
+/// can't hold. Computed from the real type so it tracks upstream changes.
+pub const CELL_BYTES: usize = std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
+
 /// High-level events a pane can surface to the GUI, distilled from
 /// `alacritty_terminal`'s richer event enum down to what rt's UI actually acts
 /// on. Draining these (via [`TermPane::drain_events`]) replaces Terminator's
