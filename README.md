@@ -8,6 +8,8 @@ a custom OpenGL glyph renderer and an egui chrome layer.
 One binary runs on both backends and prefers **native Wayland** when a Wayland
 session is present (never XWayland), falling back to X11 otherwise.
 
+![rt with four panes — a process monitor, a directory listing in a custom orange/purple scheme, an inline image, and a live reaction-diffusion demo — with lit border instruments and patch-bay wires running between panes](docs/screenshots/rt.png)
+
 ## Features
 
 - **Panes & tabs** — split any way, keyboard- or mouse-driven, Terminator keybindings.
