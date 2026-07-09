@@ -2290,11 +2290,24 @@ impl App {
             };
             if bar_h > 0.0 {
                 let focused = id == focus;
-                // Strip background + a dark hairline separating it from the grid.
-                let bar_bg = if focused { Color::rgb(0x35, 0x3b, 0x4a) } else { Color::rgb(0x24, 0x26, 0x2e) };
+                // Header colours derived from the user's scheme: the pane
+                // background nudged toward the foreground. Interpolating between
+                // two real colours means it can never clip at the extremes — a
+                // black/white scheme just yields a grey — so the header is always
+                // a valid, scheme-native tint, distinct from the terminal body,
+                // with readable text. Focused panes get more tint + full-strength
+                // text; unfocused ones a whisper of tint + dimmed text.
+                let bg = active.settings.background; // [u8; 3], Copy
+                let fg = active.settings.foreground;
+                let mix = |a: [u8; 3], b: [u8; 3], t: f32| {
+                    let c = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round().clamp(0.0, 255.0) as u8;
+                    Color::rgb(c(0), c(1), c(2))
+                };
+                let bar_bg = mix(bg, fg, if focused { 0.20 } else { 0.10 });
+                let sep = mix(bg, fg, 0.40); // hairline: a touch more toward fg → a visible edge
                 active.renderer.fill_rect(full.x, full.y, full.w, bar_h, bar_bg);
-                active.renderer.fill_rect(full.x, full.y + bar_h - 1.0, full.w, 1.0, Color::rgb(0x12, 0x12, 0x18));
-                let text_col = if focused { Color::rgb(0xe6, 0xe6, 0xf0) } else { Color::rgb(0x9a, 0x9a, 0xa6) };
+                active.renderer.fill_rect(full.x, full.y + bar_h - 1.0, full.w, 1.0, sep);
+                let text_col = if focused { Color::rgb(fg[0], fg[1], fg[2]) } else { mix(fg, bg, 0.40) };
                 let pad = 6.0; // horizontal inset inside the strip
                 let text_top = full.y + (bar_h - cell_h) * 0.5; // vertically centre the glyph line
                 let mut left_x = full.x + pad; // running left cursor (px)
