@@ -144,6 +144,61 @@ fn mkfifo(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Base directory for the per-session patch-bay fifos. Prefer `$XDG_RUNTIME_DIR`
+/// (per-user tmpfs, mode 0700, auto-removed by the session manager on logout);
+/// fall back to the system temp dir when it isn't set.
+fn jacks_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// This process's patch-bay directory: `<base>/rt-<pid>`.
+fn jacks_dir_for(pid: u32) -> PathBuf {
+    jacks_base().join(format!("rt-{pid}"))
+}
+
+/// Remove this process's whole patch-bay directory (fifos + dir). Called right
+/// before every `process::exit`, which skips the [`Jacks`] `Drop` — so without
+/// this each session would leave its `rt-<pid>` dir behind.
+fn cleanup_own_jacks() {
+    let _ = std::fs::remove_dir_all(jacks_dir_for(std::process::id()));
+}
+
+/// Exit cleanly, removing our patch-bay directory first. Use this instead of a
+/// bare `process::exit(0)` at the app's exit points.
+fn exit_clean() -> ! {
+    cleanup_own_jacks();
+    std::process::exit(0);
+}
+
+/// On startup, sweep away `rt-<pid>` patch-bay dirs left by sessions that have
+/// since died — a crash, a kill, or any exit that skipped cleanup. Scans both
+/// the current base and the temp dir (to catch dirs from older builds that used
+/// `/tmp`). A dir is removed only when no live process owns its pid, so a live
+/// session's dir (or an unrelated process that reused the pid) is never touched.
+fn sweep_stale_jacks() {
+    let mut bases = vec![jacks_base(), std::env::temp_dir()];
+    bases.dedup();
+    let me = std::process::id();
+    for base in bases {
+        let Ok(entries) = std::fs::read_dir(&base) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("rt-")).and_then(|p| p.parse::<u32>().ok())
+            else {
+                continue; // not an `rt-<pid>` dir
+            };
+            // Keep our own dir and any dir whose pid is still alive.
+            if pid == me || Path::new(&format!("/proc/{pid}")).exists() {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(entry.path()); // dead owner → reclaim (EPERM ignored)
+        }
+    }
+}
+
 /// One pane's output-activity instrument state (ported from rt-mux): a smoothed
 /// output rate and an accumulated flow phase. The border flow's speed and
 /// brightness track real output — the motion *is* the measurement.
@@ -669,7 +724,7 @@ impl ApplicationHandler for App {
         let palette_spawn = palette.clone();
         // Patch-bay: a per-session temp dir holds the pipe fifos, and a shared map
         // holds each pane's jacks — filled by the spawn closure, read by Active.
-        let jacks_dir = std::env::temp_dir().join(format!("rt-{}", std::process::id()));
+        let jacks_dir = jacks_dir_for(std::process::id());
         let _ = std::fs::create_dir_all(&jacks_dir);
         let jacks: SharedJacks = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let jacks_spawn = jacks.clone();
@@ -1029,7 +1084,7 @@ impl ApplicationHandler for App {
             // ordering faults (a segfault on Wayland, an X11 GetGeometry panic on
             // the x11 dev build). The OS reclaims everything; the PTY children get
             // SIGHUP. This matches SessionEvent::CloseWindow below.
-            WindowEvent::CloseRequested => std::process::exit(0),
+            WindowEvent::CloseRequested => exit_clean(),
 
             // Track modifier state so key events can build correct chords.
             WindowEvent::ModifiersChanged(new_mods) => {
@@ -1445,7 +1500,7 @@ impl ApplicationHandler for App {
             match active.session.close_pane(id) {
                 Some(SessionEvent::CloseWindow) => {
                     self.active = None; // drop everything (PTYs shut down on Drop)
-                    std::process::exit(0); // clean exit
+                    exit_clean(); // remove our patch-bay dir, then exit
                 }
                 _ => dirty = true, // a pane closed; repaint the survivors
             }
@@ -1649,7 +1704,7 @@ impl App {
             }
             // Everything else is a session action.
             other => match active.session.apply(other) {
-                Some(SessionEvent::CloseWindow) => std::process::exit(0), // last pane closed
+                Some(SessionEvent::CloseWindow) => exit_clean(), // last pane closed; clean up first
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
                 Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
                 Some(SessionEvent::Redraw) => active.window.request_redraw(),
@@ -3232,6 +3287,8 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // Reclaim patch-bay dirs left by dead sessions (crashes/kills/older builds).
+    sweep_stale_jacks();
     // Build the winit event loop and hand it our application.
     let event_loop = build_event_loop();
     let mut app = App { font_db, mono_families, cli: parse_cli(), active: None };
