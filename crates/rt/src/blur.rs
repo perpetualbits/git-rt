@@ -105,9 +105,9 @@ pub fn try_enable_kwin_blur(window: &Window) {
     }
 
     // If the compositor did not advertise the blur manager, this is not KDE (or
-    // blur is disabled) — the scrim is doing the work instead.
+    // blur is disabled) — the window is just translucent then.
     let Some(manager) = state.manager else {
-        log::info!("KWin blur manager not advertised (non-KDE?); relying on the scrim");
+        log::info!("KWin blur manager not advertised (non-KDE?); translucent only");
         return;
     };
 

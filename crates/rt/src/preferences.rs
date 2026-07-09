@@ -37,7 +37,9 @@ pub fn ui(
 
             ui.separator();
             ui.heading("Appearance");
-            // Background opacity: 0.05 (see-through) .. 1.0 (opaque).
+            // Background opacity: 0.05 (see-through) .. 1.0 (opaque). Pair a
+            // low-ish opacity with a dark background colour and the blur below for
+            // a tasteful frosted look — legible text, only shapes/motion behind.
             ui.add(
                 egui::Slider::new(
                     &mut settings.background_opacity,
@@ -45,15 +47,11 @@ pub fn ui(
                 )
                 .text("Background opacity"),
             );
-            // Scrim: rt's portable blur stand-in (washes out what's behind).
-            ui.add(
-                egui::Slider::new(&mut settings.scrim_strength, 0.0..=Settings::MAX_SCRIM)
-                    .text("Background scrim"),
-            );
-            // True compositor blur where the protocol exists (KDE 6.7+, COSMIC,
-            // niri). Only takes effect while the background is translucent; a
-            // silent no-op elsewhere.
-            ui.checkbox(&mut settings.background_blur, "Background blur (if supported)");
+            // Compositor blur where the protocol exists (KDE 6.7+, COSMIC, niri).
+            // On/off only — the compositor picks the radius (the protocol exposes
+            // no strength). Takes effect only while the background is translucent;
+            // a silent no-op elsewhere.
+            ui.checkbox(&mut settings.background_blur, "Background blur (compositor; if supported)");
 
             ui.separator();
             ui.heading("Colours");

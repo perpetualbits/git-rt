@@ -61,31 +61,25 @@ fn appearance_settings_clamp() {
     use rt_config::Settings;
     let mut s = Settings::default();
     assert_eq!(s.background_opacity, 1.0); // opaque by default
-    assert_eq!(s.scrim_strength, 0.0); // no scrim by default
     // Opacity clamps to [MIN_OPACITY, 1.0].
     s.adjust_opacity(-5.0);
     assert_eq!(s.background_opacity, Settings::MIN_OPACITY); // floored, not negative
     s.adjust_opacity(5.0);
     assert_eq!(s.background_opacity, 1.0); // capped at fully opaque
-    // Scrim clamps to [0.0, MAX_SCRIM].
-    s.adjust_scrim(5.0);
-    assert_eq!(s.scrim_strength, Settings::MAX_SCRIM); // capped
-    s.adjust_scrim(-5.0);
-    assert_eq!(s.scrim_strength, 0.0); // floored at off
 }
 
 #[test]
 fn appearance_bindings_resolve() {
     use rt_config::{Action, Chord, Keymap};
     let map = Keymap::defaults();
-    // Ctrl+Alt+Down = more see-through; Ctrl+Alt+Right = stronger scrim.
+    // Ctrl+Alt+Down = more see-through; Ctrl+Alt+Up = more opaque.
     assert_eq!(
         map.action_for(&Chord::parse("<Control><Alt>Down").unwrap()),
         Some(Action::OpacityDown)
     );
     assert_eq!(
-        map.action_for(&Chord::parse("<Control><Alt>Right").unwrap()),
-        Some(Action::ScrimUp)
+        map.action_for(&Chord::parse("<Control><Alt>Up").unwrap()),
+        Some(Action::OpacityUp)
     );
 }
 
@@ -105,7 +99,6 @@ fn config_roundtrips_through_toml() {
     let cfg = Config {
         settings: Settings {
             background_opacity: 0.8,
-            scrim_strength: 0.3,
             focus_follows_mouse: true,
             ..Settings::default()
         },
@@ -113,7 +106,6 @@ fn config_roundtrips_through_toml() {
     let text = toml::to_string(&cfg).expect("serialises");
     let back: Config = toml::from_str(&text).expect("parses");
     assert_eq!(back.settings.background_opacity, 0.8);
-    assert_eq!(back.settings.scrim_strength, 0.3);
     assert!(back.settings.focus_follows_mouse);
     // A partial/empty file loads as defaults (serde(default)).
     let def: Config = toml::from_str("").expect("empty parses");
