@@ -500,11 +500,6 @@ impl ApplicationHandler for App {
                 settings.background_opacity = o.clamp(rt_config::Settings::MIN_OPACITY, 1.0);
             }
         }
-        if let Ok(v) = std::env::var("RT_SCRIM") {
-            if let Ok(s) = v.parse::<f32>() {
-                settings.scrim_strength = s.clamp(0.0, rt_config::Settings::MAX_SCRIM);
-            }
-        }
         if let Ok(v) = std::env::var("RT_FOCUS") {
             settings.focus_follows_mouse = matches!(v.as_str(), "sloppy" | "mouse" | "follow" | "1");
         }
@@ -624,13 +619,13 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        // Ask KWin to blur behind us (true background blur on KDE). No-op on
-        // COSMIC/GNOME/sway, where the portable scrim does the job instead.
+        // Ask KWin to blur behind us (true background blur on KDE). No-op
+        // elsewhere (COSMIC/GNOME/sway use the ext protocol below, or nothing).
         blur::try_enable_kwin_blur(&window);
         // Cross-compositor blur via the ext-background-effect-v1 staging protocol
         // (KDE 6.7+, COSMIC, niri). Only worth requesting while the background is
         // translucent — blur behind an opaque surface is wasted compositor work.
-        // None on compositors without the protocol; the scrim carries on there.
+        // None on compositors without the protocol (the window is just translucent).
         let bg_effect = bg_effect::BackgroundEffect::try_init(&window, want_blur(&settings));
 
         // Enable IME so dead keys / compose sequences (´+o→ó, ~+n→ñ, …) and full
@@ -1483,7 +1478,7 @@ impl App {
     /// is the single place actions are executed, called both by keybindings and
     /// by the context menu, so the two can never drift apart.
     ///
-    /// Window-level appearance actions (opacity/scrim) are handled here because
+    /// Window-level appearance actions (opacity) are handled here because
     /// the session owns no window handle; everything else goes to the session.
     /// A `CloseWindow` result exits the process (the OS reaps the child PTYs).
     /// Keyboard wire gesture: with nothing armed, arm from the focused pane's
@@ -1559,18 +1554,6 @@ impl App {
                 if let Some(fx) = &mut active.bg_effect {
                     fx.set_enabled(want_blur(&active.settings));
                 }
-                active.window.request_redraw();
-            }
-            Action::ScrimUp => {
-                let v = active.settings.adjust_scrim(0.05); // stronger wash
-                log::info!("scrim strength = {v:.2}");
-                Self::persist(&active.settings);
-                active.window.request_redraw();
-            }
-            Action::ScrimDown => {
-                let v = active.settings.adjust_scrim(-0.05); // weaker wash
-                log::info!("scrim strength = {v:.2}");
-                Self::persist(&active.settings);
                 active.window.request_redraw();
             }
             Action::ToggleFocusFollowsMouse => {
@@ -2059,17 +2042,6 @@ impl App {
         // background — we no longer draw an opaque per-pane fill, which under
         // translucency would double-blend and darken the see-through areas.
         active.renderer.begin_frame(bg); // translucent clear
-
-        // Scrim: a neutral wash over the whole window, drawn FIRST (behind all
-        // text), that compresses the contrast of whatever shows through the
-        // translucent background — rt's portable stand-in for background blur.
-        // A mid-neutral tone is used so it washes out legibility faster than it
-        // hides gross shapes/motion. At strength 0 this is a no-op.
-        let scrim = active.settings.scrim_strength; // 0.0 = off
-        if scrim > 0.0 {
-            let wash = Color::rgb(0x50, 0x50, 0x58).with_alpha(scrim); // mid neutral at the chosen strength
-            active.renderer.fill_rect(0.0, 0.0, size.width as f32, size.height as f32, wash);
-        }
 
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, cell_h) = active.renderer.cell_size(); // px per cell
@@ -3027,7 +2999,7 @@ const WINDOW_MARGIN: f32 = 8.0;
 
 /// The content rectangle: the window inset by [`WINDOW_MARGIN`] on every side.
 /// All layout (panes, instruments, jacks, hit-testing) uses this; the background
-/// clear/scrim still fill the whole window, so the margin shows the background.
+/// clear still fills the whole window, so the margin shows the background.
 /// Whether to ask the compositor for background blur: only when the user has it
 /// enabled AND the background is translucent (blur behind a fully opaque surface
 /// is invisible and wasted compositor work). The single source of truth for the

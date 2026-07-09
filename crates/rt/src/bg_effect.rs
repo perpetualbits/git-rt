@@ -153,9 +153,9 @@ impl BackgroundEffect {
             log::debug!("registry roundtrip failed; skipping background-effect blur");
             return None;
         }
-        // Not advertised → not a supporting compositor. The scrim/opacity carry on.
+        // Not advertised → not a supporting compositor. Opacity/colour carry on.
         let Some(manager) = state.manager.clone() else {
-            log::debug!("ext-background-effect-v1 not advertised; relying on the scrim");
+            log::debug!("ext-background-effect-v1 not advertised; window stays translucent only");
             return None;
         };
         // Roundtrip 2: the `capabilities` event arrives after the manager bind.

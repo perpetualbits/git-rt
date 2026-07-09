@@ -57,10 +57,6 @@ pub enum Action {
     OpacityUp,
     /// rt-specific: make the window background more translucent (see-through).
     OpacityDown,
-    /// rt-specific: strengthen the background scrim (less legible behind).
-    ScrimUp,
-    /// rt-specific: weaken the background scrim (more legible behind).
-    ScrimDown,
     /// rt-specific: toggle focus-follows-mouse (sloppy focus) on/off.
     ToggleFocusFollowsMouse,
     /// Open/close the preferences dialog.
@@ -113,19 +109,12 @@ pub struct Settings {
     /// the window(s) behind show through (compositor permitting). Clamped away
     /// from 0 so the window can never become completely invisible.
     pub background_opacity: f32,
-    /// Background scrim strength, `0.0..=0.95`. A neutral wash drawn over the
-    /// translucent background (behind the text) that compresses the *contrast*
-    /// of whatever shows through — so you can still see motion/shapes below but
-    /// its text becomes hard to read. `0.0` = no scrim. This is rt's portable
-    /// stand-in for background blur (see `docs/APPEARANCE.md`): a Wayland client
-    /// can't blur what's behind it, but it can wash out its legibility.
-    pub scrim_strength: f32,
     /// When true, ask the compositor to blur whatever is behind the translucent
     /// window (the `ext-background-effect-v1` staging protocol; KDE 6.7+, COSMIC,
-    /// niri). True background blur — unlike the `scrim`, which only washes out
-    /// contrast. A silent no-op on compositors without the protocol (GNOME, older
+    /// niri). A silent no-op on compositors without the protocol (GNOME, older
     /// KWin, X11), and skipped entirely while the background is fully opaque
-    /// (`background_opacity == 1.0`), where blur would be wasted work.
+    /// (`background_opacity == 1.0`), where blur would be wasted work. The blur
+    /// radius is the compositor's to choose — the protocol offers only on/off.
     pub background_blur: bool,
     /// When true, moving the mouse over a pane focuses it (sloppy focus). When
     /// false (default), focus changes only on click. In rt sloppy and strict
@@ -186,11 +175,10 @@ pub const DEFAULT_PALETTE: [[u8; 3]; 16] = [
 ];
 
 impl Default for Settings {
-    /// Sensible defaults: fully opaque, no scrim, click-to-focus.
+    /// Sensible defaults: fully opaque, click-to-focus.
     fn default() -> Self {
         Settings {
             background_opacity: 1.0,       // opaque until the user dials it down
-            scrim_strength: 0.0,           // no scrim until the user enables it
             background_blur: true,         // request compositor blur when translucent (no-op if unsupported)
             focus_follows_mouse: false,    // click-to-focus by default
             show_titlebar: true,           // Terminator-style per-pane titlebars on by default
@@ -211,9 +199,6 @@ impl Default for Settings {
 impl Settings {
     /// The smallest opacity we allow, so the window never vanishes entirely.
     pub const MIN_OPACITY: f32 = 0.05;
-    /// The strongest scrim we allow; above this almost nothing shows through, at
-    /// which point the user may as well raise opacity instead.
-    pub const MAX_SCRIM: f32 = 0.95;
     /// Upper bound for the scrollback slider. 20M lines suits listing/searching a
     /// whole filesystem, but a *full* buffer is heavy — very roughly ~1.5 GB per
     /// million 80-column lines — so the titlebar shows a used/max meter to watch
@@ -226,13 +211,6 @@ impl Settings {
         // Clamp so we stay in a usable, always-visible range.
         self.background_opacity = (self.background_opacity + delta).clamp(Self::MIN_OPACITY, 1.0);
         self.background_opacity
-    }
-
-    /// Nudge the scrim strength by `delta`, clamped to `[0.0, MAX_SCRIM]`.
-    /// Returns the new value. Used by the `ScrimUp`/`ScrimDown` actions.
-    pub fn adjust_scrim(&mut self, delta: f32) -> f32 {
-        self.scrim_strength = (self.scrim_strength + delta).clamp(0.0, Self::MAX_SCRIM); // stay in range
-        self.scrim_strength
     }
 }
 
@@ -385,8 +363,6 @@ impl Keymap {
             // Live background-opacity nudges (also settable in preferences).
             ("<Control><Alt>Up", Action::OpacityUp),     // more opaque
             ("<Control><Alt>Down", Action::OpacityDown), // more see-through
-            ("<Control><Alt>Right", Action::ScrimUp),    // stronger scrim (less legible behind)
-            ("<Control><Alt>Left", Action::ScrimDown),   // weaker scrim (more legible behind)
             // Font zoom (Terminator's zoom_in/out/normal). Ctrl+= and Ctrl++
             // both zoom in ('+' needs Shift on most layouts); Ctrl+- and Ctrl+0.
             ("<Control>equal", Action::ZoomIn),

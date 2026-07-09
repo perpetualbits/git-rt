@@ -138,7 +138,7 @@ EXAMPLES   (type these in the panes; wire them as noted)
 
 APPEARANCE   (Preferences: right-click menu -> Preferences...)
   font family & size (Ctrl+= / Ctrl+- / Ctrl+0 to zoom), colours & schemes,
-  background opacity and blur/scrim, per-pane titlebars, focus-follows-mouse,
+  background opacity and colours, compositor blur, per-pane titlebars, focus-follows-mouse,
   and toggles for each border instrument and the patch-bay jacks.
   F11   fullscreen        Ctrl+Shift+C / V   copy / paste
 
