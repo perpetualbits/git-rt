@@ -43,7 +43,7 @@ PANES
   Ctrl+Shift+A    split along the longer axis (auto)
   Ctrl+Shift+W    close the focused pane
   Ctrl+Shift+X    zoom / maximise the focused pane (toggle)
-  Ctrl+Shift+R    rotate: flip the enclosing split H <-> V
+  Ctrl+Shift+R    rotate the enclosing split 90 deg CCW (nested splits too)
   Alt+Arrows      move focus between panes
   Ctrl+Shift+Arrows   resize: grow the focused pane
   click / mouse   click-to-focus (or focus-follows-mouse in Preferences)
