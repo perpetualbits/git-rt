@@ -133,16 +133,37 @@ fn rotate_flips_the_enclosing_split() {
     let ra = before.iter().find(|(id, _)| *id == a).unwrap().1;
     let rb = before.iter().find(|(id, _)| *id == b).unwrap().1;
     assert!(ra.x < rb.x && (ra.y - rb.y).abs() < 0.001, "expected side-by-side to start");
-    // Rotate the split containing a.
+    // Rotate the split containing a. A true quarter-turn CCW sends the right
+    // pane up and the left pane down (right→top, left→bottom).
     assert!(tree.rotate(a));
     let after = tree.rects(window());
     let ra = after.iter().find(|(id, _)| *id == a).unwrap().1;
     let rb = after.iter().find(|(id, _)| *id == b).unwrap().1;
-    // Now they stack: a above b, sharing the x column.
-    assert!(ra.y < rb.y && (ra.x - rb.x).abs() < 0.001, "expected stacked after rotate");
+    // Now they stack: b (was right) on top, a (was left) below, sharing the x column.
+    assert!(rb.y < ra.y && (ra.x - rb.x).abs() < 0.001, "expected b above a after CCW rotate");
     // Rotating a lone pane does nothing (no parent split).
     let (mut solo, s) = Tree::new();
     assert!(!solo.rotate(s));
+}
+
+/// The recursion is visible in the geometry: TopBottom[TOP, LeftRight[BL,BR]]
+/// rotated CCW must place TOP on the left and stack BR over BL on the right —
+/// i.e. the nested split rotates along with the outer one.
+#[test]
+fn rotate_recurses_into_nested_splits() {
+    let (mut tree, top) = Tree::new();
+    let bottom = tree.split(top, Orientation::TopBottom).unwrap(); // TopBottom[top, bottom]
+    let br = tree.split(bottom, Orientation::LeftRight).unwrap(); // bottom → LeftRight[bl=bottom, br]
+    let bl = bottom;
+
+    assert!(tree.rotate(top)); // focus the top pane → rotate the whole window
+    let r = tree.rects(window());
+    let rect = |p| r.iter().find(|(id, _)| *id == p).unwrap().1;
+    let (rt, rbl, rbr) = (rect(top), rect(bl), rect(br));
+
+    assert!(rt.x < rbr.x, "TOP rotated to the left half");
+    assert!((rbr.x - rbl.x).abs() < 0.001, "BR and BL now share the right column");
+    assert!(rbr.y < rbl.y, "bottom-right rotated up to top-right, bottom-left below it");
 }
 
 #[test]

@@ -820,24 +820,54 @@ impl Tree {
         false
     }
 
-    /// Flip the orientation of the split that directly contains `pane`
-    /// (left/right ↔ top/bottom) — rt's take on Terminator's rotate. No-op if the
-    /// pane is unknown or its immediate parent is not a split (e.g. a lone root
-    /// leaf, or a direct tab child).
+    /// Rotate the split that directly contains `pane` a quarter-turn
+    /// counter-clockwise, as a rigid body: the split flips its axis *and* every
+    /// descendant split rotates with it, so the whole region turns like a
+    /// picture (top→left, right→top, bottom→right, left→bottom) instead of only
+    /// the outer divider flipping. rt's take on Terminator's rotate. No-op if
+    /// the pane is unknown or its immediate parent is not a split (e.g. a lone
+    /// root leaf, or a direct tab child).
+    ///
+    /// Focusing a top-level pane thus rotates the whole window; focusing a pane
+    /// deeper in the tree rotates just its enclosing sub-region.
     pub fn rotate(&mut self, pane: PaneId) -> bool {
         let mut path = Vec::new();
         if !Self::path_to(&self.root, pane, &mut path) || path.is_empty() {
             return false; // unknown, or the root leaf has no parent split
         }
         let parent = &path[..path.len() - 1]; // drop the last edge → the parent node
-        if let Some(Node::Split { orient, .. }) = self.node_at_mut(parent) {
-            *orient = match *orient {
-                Orientation::LeftRight => Orientation::TopBottom,
-                Orientation::TopBottom => Orientation::LeftRight,
-            };
-            return true;
+        if let Some(node) = self.node_at_mut(parent) {
+            if matches!(node, Node::Split { .. }) {
+                Self::rotate_ccw(node);
+                return true;
+            }
         }
         false
+    }
+
+    /// Rotate a subtree 90° counter-clockwise, in place. Each split flips its
+    /// orientation; a `LeftRight` split additionally reverses its child order
+    /// (its left child rotates down to the bottom, its right child up to the
+    /// top), whereas a `TopBottom` split keeps order (top→left, bottom→right).
+    /// Each child's `weight` rides along with its slot. Recurses through every
+    /// descendant split; leaves and tab groups rotate as opaque units.
+    ///
+    /// Four applications are the identity (a full turn), and the transform is
+    /// area-preserving: no pane is created, dropped, or resized in absolute
+    /// terms — it is exactly the geometric picture-rotation.
+    fn rotate_ccw(node: &mut Node) {
+        if let Node::Split { orient, children } = node {
+            for child in children.iter_mut() {
+                Self::rotate_ccw(&mut child.node);
+            }
+            match *orient {
+                Orientation::TopBottom => *orient = Orientation::LeftRight,
+                Orientation::LeftRight => {
+                    *orient = Orientation::TopBottom;
+                    children.reverse();
+                }
+            }
+        }
     }
 
     /// The gutter rectangles *between* split children, for the given window
@@ -1000,5 +1030,80 @@ impl Default for Tree {
     /// Provided so `Tree` slots into `#[derive(Default)]` structs cleanly.
     fn default() -> Self {
         Tree::new().0 // discard the returned first-pane id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a split node from `(weight, child)` pairs, for terse test trees.
+    fn split(orient: Orientation, kids: Vec<(f32, Node)>) -> Node {
+        Node::Split {
+            orient,
+            children: kids.into_iter().map(|(weight, node)| Child { weight, node }).collect(),
+        }
+    }
+
+    /// The scenario from the feature request: a square split top/bottom, the
+    /// bottom half split left/right. A rotate must turn the *whole picture* a
+    /// quarter-turn CCW, recursing into the nested split:
+    ///   TopBottom[ TOP, LeftRight[BL, BR] ]  →  LeftRight[ TOP, TopBottom[BR, BL] ]
+    /// i.e. top→left, bottom-right→top-right, bottom-left→bottom-right.
+    #[test]
+    fn rotate_ccw_recurses_like_a_picture() {
+        let (top, bl, br) = (PaneId(1), PaneId(2), PaneId(3));
+        let root = split(
+            Orientation::TopBottom,
+            vec![
+                (2.0, Node::Leaf(top)), // big top pane
+                (1.0, split(Orientation::LeftRight, vec![(1.0, Node::Leaf(bl)), (1.0, Node::Leaf(br))])),
+            ],
+        );
+        let mut tree = Tree { root, next_id: 4 };
+
+        // Focusing TOP (a direct child of root) rotates the whole window.
+        assert!(tree.rotate(top));
+
+        let Node::Split { orient, children } = &tree.root else { panic!("root is not a split") };
+        assert_eq!(*orient, Orientation::LeftRight, "outer split flipped to side-by-side");
+        assert!(matches!(children[0].node, Node::Leaf(id) if id == top), "TOP moved to the left");
+        assert_eq!(children[0].weight, 2.0, "TOP kept its size weight");
+
+        let Node::Split { orient: inner, children: kids } = &children[1].node else {
+            panic!("right child is not a split")
+        };
+        assert_eq!(*inner, Orientation::TopBottom, "inner split flipped to stacked");
+        assert!(matches!(kids[0].node, Node::Leaf(id) if id == br), "bottom-right rotated to top-right");
+        assert!(matches!(kids[1].node, Node::Leaf(id) if id == bl), "bottom-left rotated to bottom-right");
+    }
+
+    /// A rotation has order four: four quarter-turns are the identity. This
+    /// guards against accidentally reversing the wrong axis or dropping weights.
+    #[test]
+    fn rotate_four_times_is_identity() {
+        let (a, b, c, d) = (PaneId(1), PaneId(2), PaneId(3), PaneId(4));
+        let root = split(
+            Orientation::LeftRight,
+            vec![
+                (3.0, Node::Leaf(a)),
+                (
+                    1.0,
+                    split(
+                        Orientation::TopBottom,
+                        vec![
+                            (1.0, Node::Leaf(b)),
+                            (2.0, split(Orientation::LeftRight, vec![(1.0, Node::Leaf(c)), (1.0, Node::Leaf(d))])),
+                        ],
+                    ),
+                ),
+            ],
+        );
+        let mut tree = Tree { root, next_id: 5 };
+        let before = format!("{:?}", tree.root);
+        for _ in 0..4 {
+            assert!(tree.rotate(a)); // `a` stays a direct child of the rotating root
+        }
+        assert_eq!(format!("{:?}", tree.root), before, "four quarter-turns must equal the identity");
     }
 }
