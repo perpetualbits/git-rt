@@ -1263,7 +1263,8 @@ dependencies = [
 [[package]]
 name = "mullion"
 version = "0.3.0"
-source = "git+https://github.com/perpetualbits/mullion.git?rev=f5bc146aeb48046e3d6654d7c8e488eea38825da#f5bc146aeb48046e3d6654d7c8e488eea38825da"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22eb16423d5d14e8a78bba0fc3745d5bcbc02a4e54d08ed67a88e791bbfd4ff7"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm",
