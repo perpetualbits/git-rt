@@ -193,6 +193,17 @@ launch_alacritty() {
   LPID=$!
 }
 
+launch_foot() {
+  # foot is Wayland-native like rt; pin the same font, grid, and zero padding so
+  # the glyph/line load matches. `-e` is accepted (ignored) for xterm compat.
+  setsid foot \
+    --font="$FONT:size=$FONT_PT" \
+    --window-size-chars="${COLS}x${ROWS}" \
+    --override=pad=0x0 \
+    -e bash $(BENCH_ARGS foot) >/dev/null 2>&1 &
+  LPID=$!
+}
+
 launch_gnome-terminal() {
   # gnome-terminal daemonizes; --wait keeps the client alive until the window
   # closes, and the default profile closes the window when the command exits.
