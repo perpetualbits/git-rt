@@ -2787,38 +2787,56 @@ impl App {
             return false; // throttle to ~2 Hz
         }
         active.heat_last = now;
-        // Sum cumulative CPU ticks per session in one /proc scan.
-        let mut by_session: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-        if let Ok(rd) = std::fs::read_dir("/proc") {
-            for ent in rd.flatten() {
-                let name = ent.file_name();
-                let Some(s) = name.to_str() else { continue };
-                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-                    continue; // only numeric pid dirs
-                }
-                let Ok(content) = std::fs::read_to_string(ent.path().join("stat")) else { continue };
-                // comm (field 2) is parenthesised; parse fixed fields after the last ')'.
-                let Some(rp) = content.rfind(')') else { continue };
-                let toks: Vec<&str> = content[rp + 1..].split_whitespace().collect();
-                if toks.len() < 13 {
-                    continue; // [3]=session(6) [11]=utime(14) [12]=stime(15)
-                }
-                let session: u32 = toks[3].parse().unwrap_or(0);
-                let utime: u64 = toks[11].parse().unwrap_or(0);
-                let stime: u64 = toks[12].parse().unwrap_or(0);
-                *by_session.entry(session).or_default() += utime + stime;
-            }
-        }
         const HZ: f32 = 100.0; // _SC_CLK_TCK on Linux
         for id in active.session.tree().all_panes() {
             let Some(pid) = active.session.pane(id).and_then(|p| p.pid()) else { continue };
-            let ticks = by_session.get(&pid).copied().unwrap_or(0);
+            // Read only this pane's process subtree, not one stat per system
+            // process — an idle shell is ~2 file reads instead of dozens/hundreds.
+            let ticks = Self::subtree_cpu_ticks(pid);
             let prev = active.heat_ticks.insert(id, ticks).unwrap_or(ticks);
             let load = ticks.saturating_sub(prev) as f32 / (dt * HZ); // fraction of one core
             let e = active.heat.entry(id).or_insert(0.0);
             *e = *e * 0.5 + load * 0.5; // smooth
         }
         true
+    }
+
+    /// Sum CPU ticks (utime+stime) over `root` and its descendants, reading only
+    /// their `/proc` entries via the kernel's per-task `children` list — O(the
+    /// pane's own processes), not O(all system processes). This keeps the heat
+    /// instrument from dominating idle CPU on slow machines: an idle shell has no
+    /// children, so it costs a single `stat` + an empty `children` read per
+    /// sample. Still catches a silent CPU hog (it lives in this subtree).
+    fn subtree_cpu_ticks(root: u32) -> u64 {
+        let mut total: u64 = 0;
+        let mut stack = vec![root];
+        let mut visited = 0u32;
+        while let Some(pid) = stack.pop() {
+            visited += 1;
+            if visited > 4096 {
+                break; // safety cap against pathological/looping process trees
+            }
+            if let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                // Fields after the parenthesised comm: [11]=utime(14), [12]=stime(15).
+                if let Some(rp) = content.rfind(')') {
+                    let toks: Vec<&str> = content[rp + 1..].split_whitespace().collect();
+                    if toks.len() >= 13 {
+                        total += toks[11].parse::<u64>().unwrap_or(0) + toks[12].parse::<u64>().unwrap_or(0);
+                    }
+                }
+            }
+            // Direct children of this process's main thread. Needs CONFIG_PROC_CHILDREN
+            // (on by default in Debian/Ubuntu); if absent we simply miss grandchildren,
+            // never crash.
+            if let Ok(kids) = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
+                for k in kids.split_whitespace() {
+                    if let Ok(cpid) = k.parse::<u32>() {
+                        stack.push(cpid);
+                    }
+                }
+            }
+        }
+        total
     }
 
     /// Run the built-in manual overlay for this frame and paint it.
