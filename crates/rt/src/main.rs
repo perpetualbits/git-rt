@@ -255,6 +255,8 @@ struct Active {
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
     active_until: Instant,                // poll fast (animate) until here; set on input/output, else idle-throttle
     last_input: Instant,                  // last keystroke; the cursor soft-blinks for a bounded window after it
+    last_anim: Instant,                   // last animation-driven repaint; throttled hard on a software renderer
+    low_power: bool,                      // software GL → cap animated-chrome repaints so bling can't peg a weak CPU
     poll_ms: u64,                         // the wake interval set last tick, so latency is judged against it
     scrollback: Rc<std::cell::Cell<usize>>, // live scrollback size for newly spawned panes
     jacks: SharedJacks,                   // per-pane patch-bay pipe jacks (shared with the spawn closure)
@@ -851,6 +853,7 @@ impl ApplicationHandler for App {
             .expect("failed to create egui painter");
 
         // Store the fully-initialised state and paint once.
+        let low_power = renderer.is_software(); // read before `renderer` is moved in
         self.active = Some(Active {
             window,
             surface,
@@ -883,6 +886,8 @@ impl ApplicationHandler for App {
             last_wake: Instant::now(),
             active_until: Instant::now(),
             last_input: Instant::now(),
+            last_anim: Instant::now(),
+            low_power,
             poll_ms: 16,
             scrollback,
             jacks,
@@ -1539,37 +1544,44 @@ impl ApplicationHandler for App {
                 active.wiring_from = None;
             }
         }
-        // Move bytes across the patch-bay wires; repaint if anything flowed or is
-        // still flowing (so the wire packets animate).
+        // Animated chrome: wire packets, the CPU-heat / output-flow border
+        // instruments, and the latency flare. Keep calling the samplers (they
+        // update state every tick), but collect whether anything WANTS to animate
+        // into `anim` rather than forcing a repaint — on a software renderer each
+        // repaint is real CPU, so animation-only repaints are throttled below.
+        let mut anim = false;
         if Self::pump_wires(active) || active.wires.iter().any(|w| w.rate > 1.0) {
-            dirty = true;
+            anim = true; // wire packets still moving
         }
-        // Refresh the CPU-heat readings (~2 Hz); repaint if a fresh sample lands
-        // and any pane is warm, so the temperature border stays live even for a
-        // CPU-busy-but-silent pane.
         if Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02) {
-            dirty = true;
+            anim = true; // a warm pane's heat border stays live
         }
-        // Keep repainting while any border flow is still moving, so it eases to a
-        // stop (and decays) instead of freezing mid-orbit when output pauses.
         if active.meters.values().any(|m| m.rate > 0.5) {
-            dirty = true;
+            anim = true; // output-flow easing to a stop
         }
-        // And while a latency flare is fading, so the spike animates out.
         if active.stall > 0.02 {
+            anim = true; // latency flare fading out
+        }
+        // The focused cursor soft-blinks for a bounded window after typing — but a
+        // smooth pulse needs ~20fps, so skip it entirely on a software renderer
+        // (steady cursor) rather than paint a choppy, expensive blink.
+        let blinking = !active.low_power
+            && active.last_input.elapsed() < Duration::from_secs_f32(CURSOR_BLINK_PERIOD * CURSOR_BLINK_CYCLES);
+        if blinking {
+            anim = true;
+        }
+        // Let animation drive a repaint, but throttle it to ~2 fps on a software
+        // renderer (llvmpipe — a weak or remote box) so the bling can't peg the
+        // CPU; content changes (output/title/bell, above) still repaint promptly.
+        let anim_min = if active.low_power { Duration::from_millis(500) } else { Duration::ZERO };
+        if anim && now.duration_since(active.last_anim) >= anim_min {
+            active.last_anim = now;
             dirty = true;
         }
         // While the search bar is open, keep its results current as new output
-        // streams into the searched pane (so a running command's fresh lines are
-        // matched live). Re-run only on a change, and only when the query is set.
+        // streams into the searched pane. Re-run only on a change, query set.
         if dirty && active.search_open && !active.search_query.is_empty() {
             Self::run_search(active, false); // live refresh; keep position + view
-        }
-        // The focused cursor soft-blinks for a bounded window after the last
-        // keystroke; keep repainting (cheaply) so the fade animates, then stop.
-        let blinking = active.last_input.elapsed() < Duration::from_secs_f32(CURSOR_BLINK_PERIOD * CURSOR_BLINK_CYCLES);
-        if blinking {
-            dirty = true;
         }
         if dirty {
             active.window.request_redraw(); // schedule a paint
@@ -2290,7 +2302,12 @@ impl App {
                             // Soft-blink: fade the focused cursor's alpha so the glyph
                             // beneath shows through, pulsing for a bounded window after
                             // the last keystroke, then holding steady.
-                            let blink = cursor_blink_alpha(active.last_input.elapsed().as_secs_f32());
+                            // Software renderer: steady cursor (blink is disabled to save repaints).
+                            let blink = if active.low_power {
+                                1.0
+                            } else {
+                                cursor_blink_alpha(active.last_input.elapsed().as_secs_f32())
+                            };
                             let cur_col = ccol.with_alpha(blink);
                             match cur.shape {
                                 CursorShape::Block => {
