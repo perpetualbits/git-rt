@@ -145,6 +145,16 @@ pub struct Renderer {
     shelf_h: i32,                      // height of the current shelf
     verts: Vec<f32>,                   // per-frame vertex scratch (cleared each frame)
     screen: (f32, f32),                // current viewport size in pixels
+    software: bool,                    // GL renderer is software (llvmpipe/swrast) → repaints are CPU-expensive
+}
+
+impl Renderer {
+    /// Whether the GL renderer is a software rasteriser (llvmpipe/softpipe/
+    /// swrast). On such a backend every repaint costs real CPU, so the caller
+    /// throttles animated chrome. Detected once from `GL_RENDERER`.
+    pub fn is_software(&self) -> bool {
+        self.software
+    }
 }
 
 impl Renderer {
@@ -236,8 +246,17 @@ impl Renderer {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
 
+            // Is this a software rasteriser? On llvmpipe/swrast every repaint is
+            // pure CPU, so the app throttles animated chrome (see main's loop).
+            let renderer = gl.get_parameter_string(glow::RENDERER).to_lowercase();
+            let software = ["llvmpipe", "softpipe", "swrast", "software", "llvm"]
+                .iter()
+                .any(|s| renderer.contains(s));
+            log::info!("GL renderer: {renderer} (software={software})");
+
             Ok(Renderer {
                 gl,
+                software,
                 program,
                 vao,
                 vbo,
