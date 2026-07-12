@@ -7,6 +7,7 @@
 //! encoding of ordinary typed keys into the bytes a PTY expects. Both live here
 //! as pure functions with unit tests.
 
+pub mod damage; // pure pixel-rect damage accumulator
 pub mod input; // winit key/modifiers -> Chord, and typed-key -> PTY bytes
 
 pub use input::{chord_from_winit, encode_key};
