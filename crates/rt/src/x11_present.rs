@@ -43,8 +43,11 @@ impl X11Present {
             RawWindowHandle::Xcb(h) => h.window.get(),
             _ => return None, // Wayland: no X present path
         };
-        let (conn, screen_num) = x11rb::connect(None).ok()?; // honours $DISPLAY
-        let depth = conn.setup().roots[screen_num].root_depth;
+        let (conn, _screen_num) = x11rb::connect(None).ok()?; // honours $DISPLAY
+        // The WINDOW's own visual depth (not the root's): a translucent rt window
+        // uses an ARGB32 (depth-32) visual even on a depth-24 root, and XPutImage
+        // must match the drawable's depth or it fails with BadMatch.
+        let depth = conn.get_geometry(win).ok()?.reply().ok()?.depth;
         if depth != 24 && depth != 32 {
             log::info!("x11_present: depth {depth} unsupported; using swap_buffers");
             return None; // unfamiliar visual → fall back
