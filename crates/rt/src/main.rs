@@ -237,6 +237,8 @@ struct Active {
     window: Window,                       // the OS window
     surface: Surface<WindowSurface>,      // the GL drawing surface
     context: glutin::context::PossiblyCurrentContext, // the current GL context
+    #[cfg(feature = "x11")]
+    x11_present: Option<x11_present::X11Present>, // Route 1: X11 damage-rect present (None on Wayland)
     renderer: Renderer,                   // our glyph-atlas renderer
     session: AppSession,                  // layout + panes + focus + broadcast
     keymap: Keymap,                       // Terminator-style bindings
@@ -868,6 +870,8 @@ impl ApplicationHandler for App {
         // Store the fully-initialised state and paint once.
         let low_power = renderer.is_software(); // read before `renderer` is moved in
         self.active = Some(Active {
+            #[cfg(feature = "x11")]
+            x11_present: x11_present::X11Present::try_new(&window),
             window,
             surface,
             context,
@@ -2260,7 +2264,7 @@ impl App {
             || overlay_open
             || !active.renderer.is_software()
             || !active.wires.is_empty()
-            || !matches!(active.surface, Surface::Egl(_))
+            || !Self::partial_present_available(active)
         {
             // hardware GL / overlays / re-armed → full frame; also, wires are
             // animated chrome spanning arbitrary inter-pane regions outside
@@ -2706,12 +2710,38 @@ impl App {
         }
     }
 
+    /// Whether a partial (non-full-swap) present is available this build/surface:
+    /// an EGL surface (mechanism A) or an X11 present handle (Route 1). Otherwise
+    /// the frame must take the full path.
+    fn partial_present_available(active: &Active) -> bool {
+        if matches!(active.surface, Surface::Egl(_)) {
+            return true; // mechanism A (buffer_age partial swap)
+        }
+        #[cfg(feature = "x11")]
+        if active.x11_present.is_some() {
+            return true; // Route 1 (readback + XPutImage)
+        }
+        false
+    }
+
     /// Combine this frame's damage with recent frames' damage per the EGL buffer
     /// age and decide Full vs Partial. Records this frame into the history ring
     /// (newest front, capped at `HISTORY_DEPTH`) for future frames.
     fn plan_frame(active: &mut Active, this: crate::damage::FrameDamage) -> FramePlan {
         use crate::damage::{DamageAccumulator, FrameDamage, PxRect};
-        let age = Self::buffer_age(active);
+        // Route 1 (X11 present) preserves the window server-side, so only this
+        // frame's damage must be redrawn — treat it as age 1 regardless of the
+        // GLX buffer_age (which is unusable on softpipe). EGL keeps real age.
+        let age = {
+            #[cfg(feature = "x11")]
+            {
+                if active.x11_present.is_some() { 1 } else { Self::buffer_age(active) }
+            }
+            #[cfg(not(feature = "x11"))]
+            {
+                Self::buffer_age(active)
+            }
+        };
         let full_now = matches!(this, FrameDamage::Full);
         // Record this frame's damage for future frames (the back buffer we draw
         // into next may be several swaps old).
