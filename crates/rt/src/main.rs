@@ -1235,6 +1235,7 @@ impl ApplicationHandler for App {
                 } else if active.wiring_from.is_some() {
                     // Rubber-band the in-progress wire to the cursor.
                     active.drag_cursor = Some(active.mouse);
+                    active.force_full = true; // rubber-band spans arbitrary pixels: repaint fully
                     active.window.request_redraw();
                 } else if let Some(handle) = active.dragging_divider.clone() {
                     // Resize the split: turn the mouse position along the split's
@@ -2240,8 +2241,12 @@ impl App {
         // engine damage state — runs exactly once per pane per frame.
         active.damage.begin_frame();
         let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
-        if active.force_full || overlay_open || !active.renderer.is_software() {
-            active.damage.mark_full(); // hardware GL / overlays / re-armed → full frame
+        if active.force_full || overlay_open || !active.renderer.is_software() || !active.wires.is_empty() {
+            // hardware GL / overlays / re-armed → full frame; also, wires are
+            // animated chrome spanning arbitrary inter-pane regions outside
+            // `border_bands`, so the partial path can't bound their damage —
+            // fall back to Full whenever any wire exists.
+            active.damage.mark_full();
         }
         for (id, rect) in active.session.visible_rects(bounds) {
             let content = active.session.content_rect(rect);
