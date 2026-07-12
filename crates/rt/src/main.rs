@@ -61,6 +61,12 @@ type AppSession = Session<TermPane, Box<dyn FnMut(rt_core::PaneId, usize, usize)
 /// and renders them); winit is single-threaded so this never contends.
 type SharedJacks = Rc<RefCell<std::collections::HashMap<rt_core::PaneId, Jacks>>>;
 
+/// A visible pane's layout rect paired with its (once-per-frame) render
+/// snapshot. Built in `redraw`'s planning loop and handed to `draw_panes`, so
+/// `render_snapshot()` — which mutates the engine's damage state — runs exactly
+/// once per pane per frame.
+type PxRectSnap = (Rect, Option<rt_engine::Snapshot>);
+
 /// Which of a pane's output streams a wire draws from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stream {
@@ -281,6 +287,9 @@ struct Active {
     font_db: std::sync::Arc<fontdb::Database>, // for reloading fonts on a family change
     font_blobs: render::FontBlobs,        // the current font chains (kept so a size change can reload)
     mono_families: Vec<String>,           // monospace family names for the preferences picker
+    damage: crate::damage::DamageAccumulator, // this frame's accumulated pixel damage
+    damage_history: std::collections::VecDeque<crate::damage::FrameDamage>, // recent frames' damage, for buffer-age
+    force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -912,6 +921,9 @@ impl ApplicationHandler for App {
             font_db: self.font_db.clone(),
             font_blobs,
             mono_families: self.mono_families.clone(),
+            damage: crate::damage::DamageAccumulator::new(),
+            damage_history: std::collections::VecDeque::new(),
+            force_full: true, // first frame is always a full redraw
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so its egui rendering can be screenshotted.
@@ -1155,6 +1167,7 @@ impl ApplicationHandler for App {
                 // Recompute pane sizes from the new window bounds.
                 let bounds = content_bounds(size);
                 active.session.relayout(bounds); // push new sizes to PTYs
+                active.force_full = true; // whole surface changed: next frame is full
                 active.window.request_redraw(); // repaint at the new size
             }
 
@@ -1201,6 +1214,7 @@ impl ApplicationHandler for App {
                     if let Some(pane) = active.session.pane(focus) {
                         pane.scroll(lines); // &self method: locks the Term internally
                     }
+                    active.force_full = true; // scrollback offset changed: cell→px mapping shifts
                     active.window.request_redraw(); // repaint at the new offset
                 }
             }
@@ -1228,6 +1242,7 @@ impl ApplicationHandler for App {
                     let axis = if handle.horizontal { active.mouse.0 } else { active.mouse.1 };
                     let ratio = ((axis - handle.start) / handle.len).clamp(0.05, 0.95);
                     active.session.set_split_ratio(&handle, ratio);
+                    active.force_full = true; // layout changed: repaint the whole window
                     active.window.request_redraw();
                 } else if active.selecting {
                     // Extend the selection to the cell under the pointer.
@@ -1235,6 +1250,7 @@ impl ApplicationHandler for App {
                         if let Some(sel) = active.selection.as_mut() {
                             if sel.pane == pane {
                                 sel.head = (col, row); // move the drag end
+                                active.force_full = true; // selection highlight isn't engine-tracked damage
                                 active.window.request_redraw();
                             }
                         }
@@ -1391,6 +1407,7 @@ impl ApplicationHandler for App {
                                         active.selecting = true;
                                     }
                                 }
+                                active.force_full = true; // selection highlight changed
                             }
                             active.window.request_redraw();
                         }
@@ -1424,6 +1441,7 @@ impl ApplicationHandler for App {
                                 cb.store_primary(text); // PRIMARY for middle-click paste
                             }
                         }
+                        active.force_full = true; // selection cleared/finalised: repaint highlight
                         active.window.request_redraw();
                     }
                 }
@@ -1604,6 +1622,31 @@ impl ApplicationHandler for App {
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + interval));
     }
 }
+
+/// The chrome bands around a pane rect that egui repaints each frame (focus
+/// outline + border instruments). Kept thin so forcing them into damage stays
+/// cheap. `BORDER_PX` matches the renderer's focus-outline / instrument band.
+const BORDER_PX: i32 = 6;
+fn border_bands(rect: Rect) -> [crate::damage::PxRect; 4] {
+    use crate::damage::PxRect;
+    let (x, y, w, h) = (rect.x as i32, rect.y as i32, rect.w as i32, rect.h as i32);
+    [
+        PxRect { x, y, w, h: BORDER_PX },                    // top
+        PxRect { x, y: y + h - BORDER_PX, w, h: BORDER_PX }, // bottom
+        PxRect { x, y, w: BORDER_PX, h },                    // left
+        PxRect { x: x + w - BORDER_PX, y, w: BORDER_PX, h }, // right
+    ]
+}
+
+/// The outcome of the per-frame damage decision: repaint everything, or scissor
+/// to a bounding box and hint the compositor with per-rect damage.
+enum FramePlan {
+    Full,
+    Partial(crate::damage::PxRect, Vec<crate::damage::PxRect>), // (scissor bbox, compositor hints)
+}
+
+/// How many past frames' damage we retain to satisfy an EGL buffer age > 1.
+const HISTORY_DEPTH: u32 = 2;
 
 impl App {
     /// Run a semantic [`Action`](rt_config::Action) against the live state. This
@@ -1990,6 +2033,7 @@ impl App {
         let delta = target - offset as isize;
         if delta != 0 {
             pane.scroll(delta); // move the view; the next frame redraws the thumb
+            active.force_full = true; // scrollback offset changed
             active.window.request_redraw();
         }
     }
@@ -2092,6 +2136,7 @@ impl App {
     /// pane to the new (cols, rows). Shared by the preferences dialog and the
     /// zoom actions.
     fn refresh_fonts(active: &mut Active, family_changed: bool) {
+        active.force_full = true; // cell metrics change: every cell→px mapping is stale
         if family_changed {
             active.font_blobs = font_blobs(&active.font_db, &active.settings.font_family);
         }
@@ -2159,6 +2204,11 @@ impl App {
             // Typing returns you to the live prompt: if the focused pane was
             // scrolled up in history, snap it back to the bottom.
             if let Some(pane) = active.session.pane(active.session.focus()) {
+                if pane.scroll_info().0 > 0 {
+                    // Was scrolled up in history; snapping back shifts the whole
+                    // viewport, so force a full repaint next frame.
+                    active.force_full = true;
+                }
                 pane.scroll_to_bottom();
             }
         }
@@ -2174,21 +2224,89 @@ impl App {
         // through, compositor permitting). Glyphs and chrome stay fully opaque.
         let cfg_bg = active.settings.background; // configured background RGB
         let bg = Color::rgb(cfg_bg[0], cfg_bg[1], cfg_bg[2]).with_alpha(active.settings.background_opacity);
-        let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline (opaque)
-
         let size = active.window.inner_size(); // physical pixels
         let bounds = content_bounds(size);
-        // Clear to the (possibly translucent) background. This IS the pane
-        // background — we no longer draw an opaque per-pane fill, which under
-        // translucency would double-blend and darken the see-through areas.
-        active.renderer.begin_frame(bg); // translucent clear
+
+        // Decide this frame's damage. The partial (scissored) path is taken ONLY
+        // on software GL with an EGL surface whose buffer we can trust to be
+        // preserved; everything else falls to the full redraw (today's path),
+        // which is always correct.
+        let overlay_open = active.prefs_open || active.menu.is_some() || active.manual_open || active.search_open;
+        let (cell_w, cell_h) = active.renderer.cell_size(); // px per cell
+        let (cw, ch) = (cell_w as i32, cell_h as i32);
+
+        // Build this frame's damage from the panes. This loop also fetches the
+        // snapshots the draw pass reuses, so `render_snapshot()` — which mutates
+        // engine damage state — runs exactly once per pane per frame.
+        active.damage.begin_frame();
+        let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
+        if active.force_full || overlay_open || !active.renderer.is_software() {
+            active.damage.mark_full(); // hardware GL / overlays / re-armed → full frame
+        }
+        for (id, rect) in active.session.visible_rects(bounds) {
+            let content = active.session.content_rect(rect);
+            let snap = active.session.pane(id).map(|p| p.render_snapshot()); // ONCE per pane
+            if let Some(snap) = &snap {
+                if active.session.columns_of(id) > 1 {
+                    active.damage.mark_full(); // newspaper columns: cell→px mapping ambiguous
+                } else {
+                    active.damage.add_cells(&snap.damage, content.x as i32, content.y as i32, cw, ch);
+                }
+            }
+            snapshots.push((id, (rect, snap)));
+        }
+        // Chrome egui blends every frame (focus outline, border instruments)
+        // lives on the pane borders; force those bands into the damage set so the
+        // scissored clear+redraw always precedes egui's blend (no double-blend).
+        if !active.damage.is_full() {
+            for (_id, (rect, _)) in &snapshots {
+                for band in border_bands(*rect) {
+                    active.damage.add_rect(band);
+                }
+            }
+        }
+
+        let frame_damage = active.damage.finish();
+        // Fold in recent frames' damage per the back-buffer age, and decide.
+        let plan = Self::plan_frame(active, frame_damage);
+
+        let force_next = match plan {
+            FramePlan::Full => {
+                self.redraw_full(bg, bounds, snapshots); // today's exact path
+                false
+            }
+            FramePlan::Partial(bbox, hint_rects) => {
+                self.redraw_scissored(bg, bounds, snapshots, bbox, &hint_rects)
+            }
+        };
+        // Clear the per-frame force flag. An overlay visible this frame (its
+        // pixels must be cleared when it closes) or a failed partial swap arms a
+        // full redraw next frame; specific handlers also re-arm it.
+        if let Some(active) = self.active.as_mut() {
+            active.force_full = overlay_open || force_next;
+        }
+    }
+
+    /// Draw every visible pane (grid, cursor, scrollbar, titlebar, focus border)
+    /// plus the split dividers, tab strips, broadcast indicator and visible-bell
+    /// stripes. Consumes the pre-fetched `snapshots` (never re-calls
+    /// `render_snapshot()`) so engine damage state advances exactly once per pane
+    /// per frame. The caller brackets this with `begin_frame`/`end_frame` and
+    /// decides full vs scissored.
+    fn draw_panes(active: &mut Active, bounds: Rect, snapshots: &[(rt_core::PaneId, PxRectSnap)]) {
+        let focus_border = Color::rgb(0x4a, 0x90, 0xd9); // blue focus outline (opaque)
+        let cfg_bg = active.settings.background; // configured background RGB (for the non-default cell-bg test)
 
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, cell_h) = active.renderer.cell_size(); // px per cell
         let sep = Color::rgb(0x2a, 0x2a, 0x33); // subtle inter-column separator colour
         // Draw every visible pane. (No per-pane background fill: the translucent
-        // clear above already is the background.)
-        for (id, rect) in active.session.visible_rects(bounds) {
+        // clear above already is the background.) Iterates the pre-fetched
+        // snapshots so the engine's damage state is not advanced again here.
+        for (id, snap_rect) in snapshots {
+            let id = *id; // PaneId is Copy
+            let (rect, snap_pre) = snap_rect; // &Rect + &Option<Snapshot> fetched in the planning loop
+            let rect = *rect;
             let n = active.session.columns_of(id); // newspaper column count (1 = normal)
             // Reserve the titlebar strip at the top: `content` is where the grid
             // draws; `full` keeps the whole pane rectangle for the strip, border
@@ -2200,7 +2318,10 @@ impl App {
             let bar_h = active.session.titlebar_h(); // header height (0 when disabled)
             // Copy the pane's current grid (glyphs + resolved colours + cursor).
             if let Some(pane) = active.session.pane(id) {
-                let snap = pane.snapshot(); // in column mode this is a count*rows-tall screen
+                // Pre-fetched once/frame in the planning loop (Some here because
+                // pane(id) was Some there too). In column mode this is a
+                // count*rows-tall screen.
+                let snap = snap_pre.as_ref().expect("pane present ⇒ snapshot fetched in planning loop");
                 let geom = active.session.column_layout(id, rect); // count/col_cells/rows/gap
                 // The selection, if it belongs to this (single-column) pane.
                 let pane_sel: Option<Selection> = active.selection.filter(|s| n <= 1 && s.pane == id);
@@ -2538,10 +2659,13 @@ impl App {
             }
         }
 
-        active.renderer.end_frame(); // upload + draw call
+    }
 
-        // One egui pass per frame: the preferences dialog, the context menu, the
-        // manual, the search bar, or (when none is up) the border instruments.
+    /// The single egui pass per frame: the preferences dialog, the context menu,
+    /// the manual, the search bar, or (when none is up) the border instruments.
+    /// Runs after the pane draw + `end_frame`, blending over the current
+    /// framebuffer (inside the cleared scissor bbox on the partial path).
+    fn paint_overlays_or_instruments(active: &mut Active) {
         if active.prefs_open {
             Self::paint_egui(active);
         } else if active.menu.is_some() {
@@ -2553,11 +2677,103 @@ impl App {
         } else {
             Self::paint_instruments(active);
         }
+    }
 
-        // Present the frame.
+    /// Combine this frame's damage with recent frames' damage per the EGL buffer
+    /// age and decide Full vs Partial. Records this frame into the history ring
+    /// (newest front, capped at `HISTORY_DEPTH`) for future frames.
+    fn plan_frame(active: &mut Active, this: crate::damage::FrameDamage) -> FramePlan {
+        use crate::damage::{DamageAccumulator, FrameDamage, PxRect};
+        let age = Self::buffer_age(active);
+        let full_now = matches!(this, FrameDamage::Full);
+        // Record this frame's damage for future frames (the back buffer we draw
+        // into next may be several swaps old).
+        let recorded = match &this {
+            FrameDamage::Full => FrameDamage::Full,
+            FrameDamage::Rects(rs) => FrameDamage::Rects(rs.clone()),
+        };
+        active.damage_history.push_front(recorded);
+        while active.damage_history.len() > HISTORY_DEPTH as usize {
+            active.damage_history.pop_back();
+        }
+
+        if full_now || age == 0 || age > HISTORY_DEPTH {
+            return FramePlan::Full; // unknown/older-than-history buffer → repaint all
+        }
+        // Union this frame + the previous (age-1) frames' damage: the back buffer
+        // still holds content from `age` swaps ago, so anything damaged since must
+        // be redrawn.
+        let mut acc = DamageAccumulator::new();
+        acc.begin_frame();
+        for fd in active.damage_history.iter().take(age as usize) {
+            match fd {
+                FrameDamage::Full => return FramePlan::Full, // any full in the window → full
+                FrameDamage::Rects(rs) => {
+                    for r in rs {
+                        acc.add_rect(*r);
+                    }
+                }
+            }
+        }
+        match acc.finish() {
+            FrameDamage::Full => FramePlan::Full,
+            FrameDamage::Rects(rs) => {
+                if rs.is_empty() {
+                    // Nothing changed and the buffer is fresh enough: a zero-rect
+                    // partial swap is a safe no-op hint.
+                    FramePlan::Partial(PxRect { x: 0, y: 0, w: 0, h: 0 }, Vec::new())
+                } else {
+                    let bbox = FrameDamage::Rects(rs.clone()).bbox().unwrap();
+                    FramePlan::Partial(bbox, rs)
+                }
+            }
+        }
+    }
+
+    /// Today's exact full-window path: clear everything, draw all panes + chrome,
+    /// egui, full swap. Byte-for-byte the pre-damage behaviour.
+    fn redraw_full(&mut self, bg: Color, bounds: Rect, snapshots: Vec<(rt_core::PaneId, PxRectSnap)>) {
+        let Some(active) = self.active.as_mut() else { return };
+        active.renderer.begin_frame(bg); // translucent clear
+        Self::draw_panes(active, bounds, &snapshots);
+        active.renderer.end_frame(); // upload + draw call
+        Self::paint_overlays_or_instruments(active);
         if let Err(e) = active.surface.swap_buffers(&active.context) {
             log::error!("swap_buffers failed: {e}"); // non-fatal; log and continue
         }
+    }
+
+    /// Partial path (software GL, EGL surface only): preserve the buffer,
+    /// clear + redraw only `bbox`, hint the compositor with `hint_rects`. Returns
+    /// `true` if a full redraw must be forced next frame (the EGL partial swap was
+    /// unavailable this frame, so we fell back to a full redraw + full swap here).
+    fn redraw_scissored(
+        &mut self,
+        bg: Color,
+        bounds: Rect,
+        snapshots: Vec<(rt_core::PaneId, PxRectSnap)>,
+        bbox: crate::damage::PxRect,
+        hint_rects: &[crate::damage::PxRect],
+    ) -> bool {
+        let Some(active) = self.active.as_mut() else { return false };
+        active.renderer.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
+        Self::draw_panes(active, bounds, &snapshots);
+        active.renderer.end_frame();
+        Self::paint_overlays_or_instruments(active); // instruments blend inside the cleared bbox
+        active.renderer.clear_scissor(); // next frame starts with a clean scissor
+        if !Self::present_with_damage(active, hint_rects) {
+            // EGL partial swap unavailable/failed → guarantee correctness with a
+            // full redraw + full swap this frame, and force a full frame next time.
+            active.renderer.begin_frame(bg);
+            Self::draw_panes(active, bounds, &snapshots);
+            active.renderer.end_frame();
+            Self::paint_overlays_or_instruments(active);
+            if let Err(e) = active.surface.swap_buffers(&active.context) {
+                log::error!("swap_buffers failed: {e}");
+            }
+            return true;
+        }
+        false
     }
 
     /// The age of the back buffer: how many swaps ago its contents were last drawn.
