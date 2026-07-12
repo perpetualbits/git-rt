@@ -1279,11 +1279,13 @@ impl ApplicationHandler for App {
                     // jack under the cursor (before falling through to the menu).
                     if active.wiring_from.take().is_some() {
                         active.drag_cursor = None;
+                        active.force_full = true; // clear the cancelled rubber-band ghost (off the partial path)
                         active.window.request_redraw();
                         return;
                     }
                     if let Some((id, stream)) = Self::jack_at(active, active.mouse.0, active.mouse.1) {
                         active.wires.retain(|w| !(w.src == id && w.stream == stream));
+                        active.force_full = true; // clear the removed wire's ghost (spans arbitrary inter-pane pixels)
                         active.window.request_redraw();
                         return;
                     }
@@ -1561,6 +1563,7 @@ impl ApplicationHandler for App {
             active.heat_ticks.remove(&id);
             active.jacks.borrow_mut().remove(&id); // Drop -> remove its fifos
             active.wires.retain(|w| w.src != id && w.dst != id); // unplug its wires
+            active.force_full = true; // clear removed-wire ghosts (relayout usually rescues, but be explicit)
             if matches!(active.wiring_from, Some((s, _)) if s == id) {
                 active.wiring_from = None;
             }
@@ -1627,12 +1630,17 @@ impl ApplicationHandler for App {
 /// The chrome bands around a pane rect that egui repaints each frame (focus
 /// outline + border instruments). Kept thin so forcing them into damage stays
 /// cheap. `BORDER_PX` matches the renderer's focus-outline / instrument band.
+/// The visual-bell / hollow-cursor outline thickness (`t = cell_h/16`, ~1px,
+/// render.rs:585) must stay within `BORDER_PX` so the bell outline is covered
+/// on the partial path. `top_h` widens the top band to cover the titlebar strip
+/// (focus tint + title text) when the titlebar is shown; 0 leaves it at `BORDER_PX`.
 const BORDER_PX: i32 = 6;
-fn border_bands(rect: Rect) -> [crate::damage::PxRect; 4] {
+fn border_bands(rect: Rect, top_h: i32) -> [crate::damage::PxRect; 4] {
     use crate::damage::PxRect;
     let (x, y, w, h) = (rect.x as i32, rect.y as i32, rect.w as i32, rect.h as i32);
+    let top = BORDER_PX.max(top_h); // cover the full titlebar strip when shown
     [
-        PxRect { x, y, w, h: BORDER_PX },                    // top
+        PxRect { x, y, w, h: top },                          // top
         PxRect { x, y: y + h - BORDER_PX, w, h: BORDER_PX }, // bottom
         PxRect { x, y, w: BORDER_PX, h },                    // left
         PxRect { x: x + w - BORDER_PX, y, w: BORDER_PX, h }, // right
@@ -1773,6 +1781,7 @@ impl App {
             Action::Unwire => {
                 let f = active.session.focus();
                 active.wires.retain(|w| w.src != f && w.dst != f);
+                active.force_full = true; // clear the removed wires' ghosts (off the partial path)
                 active.window.request_redraw();
             }
             Action::Manual => {
@@ -2241,11 +2250,18 @@ impl App {
         // engine damage state — runs exactly once per pane per frame.
         active.damage.begin_frame();
         let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
-        if active.force_full || overlay_open || !active.renderer.is_software() || !active.wires.is_empty() {
+        if active.force_full
+            || overlay_open
+            || !active.renderer.is_software()
+            || !active.wires.is_empty()
+            || !matches!(active.surface, Surface::Egl(_))
+        {
             // hardware GL / overlays / re-armed → full frame; also, wires are
             // animated chrome spanning arbitrary inter-pane regions outside
             // `border_bands`, so the partial path can't bound their damage —
-            // fall back to Full whenever any wire exists.
+            // fall back to Full whenever any wire exists. Partial present is
+            // EGL-only (buffer-age-preserved swap); a non-EGL surface (GLX/…)
+            // would draw scissored AND full every other frame, so → full path.
             active.damage.mark_full();
         }
         for (id, rect) in active.session.visible_rects(bounds) {
@@ -2265,7 +2281,7 @@ impl App {
         // scissored clear+redraw always precedes egui's blend (no double-blend).
         if !active.damage.is_full() {
             for (_id, (rect, _)) in &snapshots {
-                for band in border_bands(*rect) {
+                for band in border_bands(*rect, active.session.titlebar_h() as i32) {
                     active.damage.add_rect(band);
                 }
             }

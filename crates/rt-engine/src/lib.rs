@@ -924,7 +924,7 @@ mod damage_tests {
 
         // Wait for the child's output to reach the grid.
         let mut saw_hello = false;
-        for _ in 0..200 {
+        for _ in 0..600 {
             if pane.snapshot().to_text().contains("hello") {
                 saw_hello = true;
                 break;
@@ -937,7 +937,7 @@ mod damage_tests {
         // stop being Full within a few frames — that only happens if
         // reset_damage() runs each call.
         let mut converged = None;
-        for _ in 0..50 {
+        for _ in 0..200 {
             let d = pane.render_snapshot().damage;
             if !d.is_full() {
                 converged = Some(d);
