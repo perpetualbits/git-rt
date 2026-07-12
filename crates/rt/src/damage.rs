@@ -156,6 +156,7 @@ impl DamageAccumulator {
                 if merged[i].intersects(&cur) {
                     cur = merged[i].union(&cur);
                     merged.swap_remove(i); // re-test cur against the rest
+                    i = 0; // reset to re-test grown cur against all remaining elements
                 } else {
                     i += 1;
                 }
@@ -264,5 +265,24 @@ mod tests {
         let b = fd.bbox().unwrap();
         assert_eq!(b, PxRect { x: 10, y: 10, w: 110, h: 60 }); // (10,10)..(120,70)
         assert!(FrameDamage::Full.bbox().is_none());
+    }
+
+    #[test]
+    fn transitive_chain_coalesces_to_one() {
+        // X and C are disjoint from each other, but both intersect Y. Inserting
+        // in the order X, Y, C used to leave X un-merged (scan index not reset
+        // after a merge). All three must collapse into their common bbox.
+        let mut acc = DamageAccumulator::new();
+        acc.begin_frame();
+        acc.add_rect(PxRect { x: 0, y: 0, w: 10, h: 10 });   // X: x[0,10] y[0,10]
+        acc.add_rect(PxRect { x: 5, y: 14, w: 10, h: 11 });  // Y: x[5,15] y[14,25]
+        acc.add_rect(PxRect { x: 11, y: 5, w: 10, h: 10 });  // C: x[11,21] y[5,15]
+        match acc.finish() {
+            FrameDamage::Rects(rs) => {
+                assert_eq!(rs.len(), 1, "transitive chain must merge to one rect, got {}", rs.len());
+                assert_eq!(rs[0], PxRect { x: 0, y: 0, w: 21, h: 25 });
+            }
+            FrameDamage::Full => panic!("expected Rects"),
+        }
     }
 }
