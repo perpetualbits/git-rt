@@ -110,6 +110,48 @@ pub struct CursorPos {
     pub shape: CursorShape,  // the shape the app requested for the cursor
 }
 
+/// Which cells changed since the previous rendered frame, in the pane's
+/// viewport cell coordinates. `Full` means "repaint everything" — the honest,
+/// always-correct answer for the first frame, a scroll, a resize, newspaper
+/// columns, or anything the engine can't describe precisely. `Lines` is a
+/// per-row inclusive changed-column span (`left..=right`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Damage {
+    Full,
+    Lines(Vec<CellDamage>),
+}
+
+impl Default for Damage {
+    fn default() -> Self {
+        Damage::Full // a fresh snapshot makes no promises: repaint all
+    }
+}
+
+impl Damage {
+    /// Does this damage cover viewport row `line`? `Full` covers every row.
+    pub fn contains_line(&self, line: usize) -> bool {
+        match self {
+            Damage::Full => true,
+            Damage::Lines(v) => v.iter().any(|d| d.line == line),
+        }
+    }
+
+    /// Is this the "repaint everything" variant?
+    pub fn is_full(&self) -> bool {
+        matches!(self, Damage::Full)
+    }
+}
+
+/// One damaged span on a single viewport row: columns `left..=right` (inclusive)
+/// of row `line` changed. Mirrors `alacritty_terminal`'s `LineDamageBounds` in
+/// the pane's own cell space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellDamage {
+    pub line: usize,
+    pub left: usize,
+    pub right: usize,
+}
+
 /// An immutable snapshot of a pane's visible grid, produced for rendering or
 /// for headless assertions in tests. Row-major: `rows[y]` is one screen line.
 #[derive(Clone, Debug, Default)]
@@ -117,6 +159,7 @@ pub struct Snapshot {
     pub cols: usize,              // number of columns captured
     pub rows: Vec<Vec<SnapCell>>, // one inner Vec per visible screen line
     pub cursor: Option<CursorPos>, // cursor location, if visible
+    pub damage: Damage,           // cells changed since the previous rendered frame
 }
 
 impl Snapshot {
@@ -446,8 +489,16 @@ impl TermPane {
     /// testing. Locks the `Term` briefly, copies out the visible cells, and
     /// releases — it never hands out a reference into shared state.
     pub fn snapshot(&self) -> Snapshot {
-        use alacritty_terminal::term::TermMode; // for the cursor-visibility flag
         let term = self.term.lock(); // read access to the grid
+        self.capture_locked(&term)
+    }
+
+    /// Build a [`Snapshot`] from an already-locked `Term`. Split out so
+    /// `render_snapshot()` can capture the grid and the damage under one lock.
+    /// The `damage` field is left at its `Full` default here; only
+    /// `render_snapshot()` fills it.
+    fn capture_locked(&self, term: &Term<Proxy>) -> Snapshot {
+        use alacritty_terminal::term::TermMode; // for the cursor-visibility flag
         let cols = term.columns(); // current column count
         let rows = term.screen_lines(); // current visible row count
         // How many lines the view is scrolled up into history. `display_iter`
@@ -496,7 +547,38 @@ impl TermPane {
         } else {
             None // hidden or scrolled back
         };
-        Snapshot { cols, rows: grid, cursor }
+        Snapshot { cols, rows: grid, cursor, damage: Damage::default() }
+    }
+
+    /// Like [`snapshot`](Self::snapshot) but also captures the terminal's damage
+    /// (which cells changed since the last call) and resets it, so the next call
+    /// reports damage relative to this frame. Call this **once per pane per
+    /// frame** from the render path only — `Term::damage()` mutates damage state.
+    ///
+    /// Precise `Damage::Lines` is produced only for the ordinary case: a single
+    /// column of grid, scrolled to the bottom (`display_offset == 0`), where a
+    /// damaged viewport row maps 1:1 onto snapshot row `line`. Any other case
+    /// (scrolled into history, mid-resize) already comes back as `Full` from the
+    /// engine, which the renderer honours by repainting everything.
+    pub fn render_snapshot(&self) -> Snapshot {
+        use alacritty_terminal::term::TermDamage;
+        let mut term = self.term.lock(); // exclusive: damage() is &mut
+        let mut snap = self.capture_locked(&term); // grid + cursor (immutable borrow ends here)
+        let damage = match term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(iter) => {
+                // Collect before reset_damage(): the iterator borrows the damage
+                // buffer, and reset_damage() needs to borrow it mutably.
+                let lines: Vec<CellDamage> = iter
+                    .filter(|b| b.is_damaged())
+                    .map(|b| CellDamage { line: b.line, left: b.left, right: b.right })
+                    .collect();
+                Damage::Lines(lines)
+            }
+        };
+        term.reset_damage(); // next frame's damage is relative to this one
+        snap.damage = damage;
+        snap
     }
 
     /// Extract the drawing attributes (underline/italic/strikeout) from a cell's
@@ -714,7 +796,7 @@ impl TermPane {
             }
             out.push(line); // append this (possibly blank) line
         }
-        Snapshot { cols, rows: out, cursor: None }
+        Snapshot { cols, rows: out, cursor: None, damage: Damage::default() }
     }
 
     /// Search the whole grid (scrollback history + visible screen) for `needle`,
@@ -801,5 +883,74 @@ impl Drop for TermPane {
         if let Some(handle) = self.io_thread.take() {
             let _ = handle.join(); // wait for it to actually exit
         }
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+
+    #[test]
+    fn damage_default_is_full() {
+        assert_eq!(Damage::default(), Damage::Full);
+        assert!(Snapshot::default().damage.is_full());
+    }
+
+    #[test]
+    fn contains_line_semantics() {
+        assert!(Damage::Full.contains_line(7)); // Full covers everything
+        let d = Damage::Lines(vec![
+            CellDamage { line: 2, left: 0, right: 3 },
+            CellDamage { line: 5, left: 1, right: 1 },
+        ]);
+        assert!(d.contains_line(2));
+        assert!(d.contains_line(5));
+        assert!(!d.contains_line(3));
+        assert!(!d.is_full());
+    }
+
+    // Real PTY, so poll with a bounded budget. Proves: render_snapshot()
+    // clears the engine's initial Full and converges to precise Lines on an
+    // idle pane (i.e. reset_damage() actually runs).
+    #[test]
+    fn render_snapshot_resets_and_converges_to_lines() {
+        let pane = TermPane::spawn(
+            Some(("sh".into(), vec!["-c".into(), "printf 'hello\\n'; sleep 30".into()])),
+            None,
+            20,
+            5,
+        )
+        .expect("spawn test pane");
+
+        // Wait for the child's output to reach the grid.
+        let mut saw_hello = false;
+        for _ in 0..600 {
+            if pane.snapshot().to_text().contains("hello") {
+                saw_hello = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_hello, "child output never reached the grid");
+
+        // Drain the initial Full frame(s). On an idle pane the damage must
+        // stop being Full within a few frames — that only happens if
+        // reset_damage() runs each call.
+        let mut converged = None;
+        for _ in 0..200 {
+            let d = pane.render_snapshot().damage;
+            if !d.is_full() {
+                converged = Some(d);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let d = converged.expect("idle pane never converged off Full");
+        assert!(matches!(d, Damage::Lines(_)), "idle damage should be Lines, got {d:?}");
+
+        // A line we never wrote to (row 4, below "hello") must not be damaged
+        // on a now-idle pane — precise damage, not blanket.
+        let d2 = pane.render_snapshot().damage;
+        assert!(!d2.contains_line(4), "unwritten line 4 should be undamaged: {d2:?}");
     }
 }

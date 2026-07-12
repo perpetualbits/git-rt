@@ -85,3 +85,18 @@ arboard = { version = "3", default-features = false, optional = true }
 x11rb = { version = "0.13", optional = true }
 # For the patch-bay pipe jacks: mkfifo + non-blocking open (O_NONBLOCK).
 libc = "0.2"
+
+[dev-dependencies]
+# The offscreen pixel-identity gate (tests/damage_pixel_identity.rs) drives the
+# real GL renderer into a headless framebuffer. Integration tests link the lib
+# only, so the crates the test itself names must be dev-dependencies even though
+# glow is already a normal dependency of the bin path.
+#   * glow pinned to the SAME 0.17 as [dependencies] so `Arc<glow::Context>`
+#     unifies to one type across the lib and the test.
+#   * khronos-egl gives a raw EGL entry point to build a surfaceless OpenGL
+#     context (EGL_MESA_platform_surfaceless) with no window — llvmpipe/Mesa is
+#     exactly the software-GL path damage rendering optimises. `static` links
+#     libEGL via pkg-config; default features include the 1.5 API we need for
+#     eglGetPlatformDisplay.
+glow = "0.17"
+khronos-egl = { version = "6", features = ["static"] }
