@@ -2796,6 +2796,15 @@ impl App {
         Self::draw_panes(active, bounds, &snapshots);
         active.renderer.end_frame(); // upload + draw call
         Self::paint_overlays_or_instruments(active);
+        #[cfg(feature = "x11")]
+        if let Some(p) = active.x11_present.as_ref() {
+            let sz = active.window.inner_size();
+            let (w, h) = (sz.width as i32, sz.height as i32);
+            if p.present_rect(active.renderer.gl_ctx(), 0, 0, w, h, h) {
+                return; // presented the full window via XPutImage; no swap
+            }
+            // present failed → fall through to swap_buffers
+        }
         if let Err(e) = active.surface.swap_buffers(&active.context) {
             log::error!("swap_buffers failed: {e}"); // non-fatal; log and continue
         }
@@ -2819,6 +2828,14 @@ impl App {
         active.renderer.end_frame();
         Self::paint_overlays_or_instruments(active); // instruments blend inside the cleared bbox
         active.renderer.clear_scissor(); // next frame starts with a clean scissor
+        #[cfg(feature = "x11")]
+        if let Some(p) = active.x11_present.as_ref() {
+            let sh = active.window.inner_size().height as i32;
+            if p.present_rect(active.renderer.gl_ctx(), bbox.x, bbox.y, bbox.w, bbox.h, sh) {
+                return false; // presented the damage rect via XPutImage; no swap, no re-arm
+            }
+            // present failed → fall through to the full-redraw fallback below
+        }
         if !Self::present_with_damage(active, hint_rects) {
             // EGL partial swap unavailable/failed → guarantee correctness with a
             // full redraw + full swap this frame, and force a full frame next time.

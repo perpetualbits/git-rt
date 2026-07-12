@@ -163,6 +163,12 @@ impl Renderer {
     pub fn is_software(&self) -> bool {
         self.software
     }
+
+    /// Borrow the GL context (for the X11 readback present path).
+    #[cfg(feature = "x11")]
+    pub fn gl_ctx(&self) -> &glow::Context {
+        &self.gl
+    }
 }
 
 impl Renderer {
