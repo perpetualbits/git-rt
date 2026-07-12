@@ -1428,6 +1428,10 @@ impl ApplicationHandler for App {
                             Self::connect_wire(active, src, stream, dst);
                         }
                         active.drag_cursor = None;
+                        // The rubber-band was drawn last frame across arbitrary pixels; whether
+                        // this release connected a wire or aborted (no pane / rejected self-loop),
+                        // its old pixels must be cleared, so force a full frame off the partial path.
+                        active.force_full = true;
                         active.window.request_redraw();
                         return;
                     }
