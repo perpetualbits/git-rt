@@ -122,6 +122,14 @@ pub fn cell_size_for(blobs: &FontBlobs, font_px: f32) -> (f32, f32) {
     }
 }
 
+/// Convert a top-left-origin pixel rectangle to a GL scissor box, which is
+/// **bottom-left origin**. `screen_h` is the window height in physical pixels.
+/// Returns `(x, y, width, height)` ready for `glScissor`.
+pub fn scissor_box(r: crate::damage::PxRect, screen_h: i32) -> (i32, i32, i32, i32) {
+    let gl_y = screen_h - (r.y + r.h); // flip Y: top-left px → bottom-left GL
+    (r.x, gl_y, r.w, r.h)
+}
+
 /// The renderer owns the GL objects, the font, the atlas, and the per-frame
 /// vertex scratch buffer.
 pub struct Renderer {
@@ -408,6 +416,37 @@ impl Renderer {
         }
     }
 
+    /// Begin a frame that only repaints the damaged bounding box `bbox`. Unlike
+    /// [`begin_frame`], this does **not** clear the whole window — it enables
+    /// the scissor test, clips to `bbox`, and clears only that region to the
+    /// premultiplied background. Everything outside `bbox` keeps the previous
+    /// frame's pixels (the present layer guarantees the back buffer is
+    /// preserved). The following `end_frame()` draw is clipped to `bbox` too.
+    pub fn begin_frame_scissored(&mut self, bg: Color, bbox: crate::damage::PxRect) {
+        self.verts.clear(); // drop last frame's geometry
+        let a = bg.3; // premultiplied clear, matching begin_frame
+        let (sx, sy, sw, sh) = scissor_box(bbox, self.screen.1 as i32);
+        unsafe {
+            self.gl.viewport(0, 0, self.screen.0 as i32, self.screen.1 as i32);
+            self.gl.enable(glow::SCISSOR_TEST); // clip clears AND draws to bbox
+            self.gl.scissor(sx, sy, sw, sh);
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+            self.gl.clear_color(bg.0 * a, bg.1 * a, bg.2 * a, a);
+            self.gl.clear(glow::COLOR_BUFFER_BIT); // scissor confines this to bbox
+        }
+    }
+
+    /// Reset scissor state to the full window. Call after presenting a scissored
+    /// frame so egui and the next `begin_frame`/`begin_frame_scissored` start
+    /// from a known-clean state.
+    pub fn clear_scissor(&mut self) {
+        unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
+            self.gl.scissor(0, 0, self.screen.0 as i32, self.screen.1 as i32);
+        }
+    }
+
     /// Rasterise (if needed) and cache a glyph, returning its atlas placement.
     /// Returns `None` for glyphs that don't fit the atlas or have no bitmap
     /// (e.g. space), so callers simply skip drawing them.
@@ -669,5 +708,33 @@ impl Renderer {
             // One draw call for the whole frame's quads.
             self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
         }
+    }
+}
+
+#[cfg(test)]
+mod scissor_tests {
+    use super::scissor_box;
+    use crate::damage::PxRect;
+
+    #[test]
+    fn flips_y_to_bottom_left_origin() {
+        // 800x600 window. A 24x16 rect at top-left-origin (34, 52).
+        // GL origin is bottom-left, so gl_y = screen_h - (y + h) = 600 - 68 = 532.
+        let (x, y, w, h) = scissor_box(PxRect { x: 34, y: 52, w: 24, h: 16 }, 600);
+        assert_eq!((x, y, w, h), (34, 532, 24, 16));
+    }
+
+    #[test]
+    fn top_row_maps_to_top_of_gl_buffer() {
+        // A rect flush against the top (y=0, h=16) sits at gl_y = 600 - 16 = 584.
+        let (_, y, _, _) = scissor_box(PxRect { x: 0, y: 0, w: 8, h: 16 }, 600);
+        assert_eq!(y, 584);
+    }
+
+    #[test]
+    fn bottom_row_maps_to_gl_zero() {
+        // A rect flush against the bottom (y = 584, h = 16) maps to gl_y = 0.
+        let (_, y, _, _) = scissor_box(PxRect { x: 0, y: 584, w: 8, h: 16 }, 600);
+        assert_eq!(y, 0);
     }
 }
