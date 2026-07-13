@@ -10,6 +10,7 @@ const BAR_COLS: usize = 32; // query field width in cells
 /// Bar rect pinned to the top-right corner (with an 8px standoff).
 pub fn layout(win_w: f32, cell_w: f32, cell_h: f32) -> Recti {
     let w = BAR_COLS as f32 * cell_w + PAD * 2.0 + 8.0 * cell_w; // query + " 12/34 "
+    let w = w.min(win_w); // never wider than the window itself
     let h = cell_h + PAD * 2.0;
     Recti { x: (win_w - w - 8.0).max(0.0), y: 8.0, w, h }
 }
@@ -51,5 +52,13 @@ mod tests {
         assert!(bar.x + bar.w <= 800.0 + 0.01, "within the window");
         assert!(bar.x > 400.0, "anchored to the right half");
         assert!(bar.y >= 0.0 && bar.h > 0.0);
+    }
+
+    #[test]
+    fn bar_fits_narrow_window() {
+        // Window narrower than the bar's natural width: it must not overflow.
+        let bar = layout(200.0, 8.0, 18.0);
+        assert!(bar.x >= 0.0 && bar.x + bar.w <= 200.0 + 0.01, "bar overflows a narrow window");
+        assert!(bar.h > 0.0);
     }
 }
