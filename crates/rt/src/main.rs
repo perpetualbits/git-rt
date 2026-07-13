@@ -13,6 +13,7 @@
 mod backend; // rendering backend abstraction (GL today, XRender in mechanism C)
 mod blur; // best-effort KDE/KWin background-blur request (no-op elsewhere)
 mod bg_effect; // cross-compositor blur via ext-background-effect-v1 (no-op elsewhere)
+mod chrome; // native (XRender) chrome: menu/search/manual/instruments draw + hit-test
 mod gl_backend; // the default GL backend: wraps render.rs's Renderer + present resources
 mod x11_blur; // X11 background blur via _KDE_NET_WM_BLUR_BEHIND_REGION (no-op elsewhere)
 #[cfg(feature = "x11")]
