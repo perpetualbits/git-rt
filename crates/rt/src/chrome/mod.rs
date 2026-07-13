@@ -7,6 +7,7 @@
 use crate::render::Color;
 
 pub mod menu;
+pub mod search;
 
 /// An axis-aligned layout rectangle in window pixels.
 #[derive(Clone, Copy, Debug)]
