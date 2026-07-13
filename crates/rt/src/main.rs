@@ -1037,6 +1037,32 @@ impl ApplicationHandler for App {
             active.active_until = Instant::now() + ACTIVE_TAIL;
         }
 
+        // Chrome degradation (Slice 1): the egui overlays cannot render without a
+        // GL context, so on the XRender backend we never let one open — otherwise
+        // an invisible dialog would swallow all terminal input (a soft hang). Any
+        // open request (shortcut, right-click, toggle, startup hook) is force-closed
+        // here before the diversion blocks below, so input keeps flowing to the PTY.
+        if !active.backend.supports_egui()
+            && (active.prefs_open
+                || active.manual_open
+                || active.menu.is_some()
+                || active.search_open)
+        {
+            active.prefs_open = false;
+            active.manual_open = false;
+            active.menu = None;
+            if active.search_open {
+                Self::close_search(active);
+            }
+            static CHROME_HINT: std::sync::Once = std::sync::Once::new();
+            CHROME_HINT.call_once(|| {
+                eprintln!(
+                    "rt: menu/preferences/manual/search overlays are unavailable on the \
+                     remote (XRender) backend yet — the terminal itself is fully usable."
+                );
+            });
+        }
+
         // While the preferences dialog is open, egui gets first look at events
         // and terminal input is suspended (window lifecycle still flows through).
         if active.prefs_open {
@@ -2745,6 +2771,11 @@ impl App {
     /// Runs after the pane draw + `end_frame`, blending over the current
     /// framebuffer (inside the cleared scissor bbox on the partial path).
     fn paint_overlays_or_instruments(active: &mut Active) {
+        // XRender backend has no GL context: egui_glow would render invisibly to
+        // an unpresented buffer. Skip it entirely (Slice 1 chrome degradation).
+        if !active.backend.supports_egui() {
+            return;
+        }
         if active.prefs_open {
             Self::paint_egui(active);
         } else if active.menu.is_some() {

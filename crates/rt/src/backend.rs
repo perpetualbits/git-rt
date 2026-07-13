@@ -68,6 +68,13 @@ pub trait Backend {
     fn partial_present_available(&self) -> bool;
     /// Whether the X11 Route-1 damage-rect present path is active.
     fn x11_present_active(&self) -> bool;
+    /// Whether this backend can render the `egui_glow` chrome (menu, preferences,
+    /// manual, search, border instruments). The GL backend can; the XRender
+    /// backend has no GL context, so it returns `false` and the overlays are
+    /// skipped (Slice 1 chrome degradation — see the mechanism-C spec).
+    fn supports_egui(&self) -> bool {
+        true
+    }
 }
 
 /// Which [`Backend`] implementation to use. `Gl` is the existing local-rendering

@@ -29,6 +29,7 @@ fn to_render_color(c: Color) -> render::Color {
 
 pub struct XRenderBackend {
     conn: RustConnection,
+    #[allow(dead_code)] // X window id — reserved for Slice 2 (back-pixmap CopyArea)
     window: u32,
     win_pic: render::Picture,   // the on-screen window, as an XRender Picture
     a8_format: Pictformat,      // the A8 glyph mask format
@@ -231,8 +232,14 @@ impl Backend for XRenderBackend {
         self.cell_h = ch;
         self.ascent = asc;
         self.glyph_px = font_px;
-        // stale glyph ids: recreate the glyph set (Task 7 does this properly)
+        // Old glyph ids are stale (different rasterisation): drop the cache and
+        // rebuild the server-side GlyphSet from scratch so no glyphs are orphaned.
         self.glyphs.clear();
+        let new_set = self.conn.generate_id().map_err(|e| e.to_string())?;
+        render::create_glyph_set(&self.conn, new_set, self.a8_format).map_err(|e| e.to_string())?;
+        let _ = render::free_glyph_set(&self.conn, self.glyphset);
+        self.glyphset = new_set;
+        self.next_glyph_id = 1;
         Ok(())
     }
 
@@ -344,6 +351,9 @@ impl Backend for XRenderBackend {
         // inflation (a GL-buffer artifact), so a keystroke's damage stays the
         // changed cells — exactly what the clip filter in fill/draw_char honours.
         true
+    }
+    fn supports_egui(&self) -> bool {
+        false // no GL context → egui_glow chrome cannot render (Slice 1 degrade)
     }
 }
 
