@@ -21,6 +21,69 @@ use crate::backend::Backend;
 use crate::damage::PxRect;
 use crate::render::{Color, FontBlobs};
 
+/// A triangle in f32 window pixels (converted to XRender 16.16 fixed point at draw).
+type TriF = [(f32, f32); 3];
+
+/// Rim subdivisions for a disc/ring of radius `r`: enough that the polygon reads
+/// as a circle at terminal sizes, capped so a big ring stays cheap.
+fn seg_count(r: f32) -> u32 {
+    ((r * 3.0) as u32).clamp(8, 64)
+}
+
+/// Filled disc as a triangle fan (apex = centre, rim = `seg_count(r)` points).
+fn disc_tris(cx: f32, cy: f32, r: f32) -> Vec<TriF> {
+    use std::f32::consts::TAU;
+    let n = seg_count(r);
+    let pt = |k: u32| {
+        let a = TAU * k as f32 / n as f32;
+        (cx + r * a.cos(), cy + r * a.sin())
+    };
+    (0..n).map(|k| [(cx, cy), pt(k), pt((k + 1) % n)]).collect()
+}
+
+/// Annulus (outer `r`, inner `r-width`) as a triangle strip of quads → 2 tris each.
+fn ring_tris(cx: f32, cy: f32, r: f32, width: f32) -> Vec<TriF> {
+    use std::f32::consts::TAU;
+    let ri = (r - width).max(0.0);
+    let n = seg_count(r);
+    let outer = |k: u32| { let a = TAU * k as f32 / n as f32; (cx + r * a.cos(), cy + r * a.sin()) };
+    let inner = |k: u32| { let a = TAU * k as f32 / n as f32; (cx + ri * a.cos(), cy + ri * a.sin()) };
+    let mut out = Vec::with_capacity(n as usize * 2);
+    for k in 0..n {
+        let (o0, o1) = (outer(k), outer((k + 1) % n));
+        let (i0, i1) = (inner(k), inner((k + 1) % n));
+        out.push([o0, o1, i1]);
+        out.push([o0, i1, i0]);
+    }
+    out
+}
+
+/// Thick segment as a quad (2 triangles), butt caps, `width` centred on the line.
+fn line_tris(x0: f32, y0: f32, x1: f32, y1: f32, width: f32) -> Vec<TriF> {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+    // Unit normal, scaled to the half-width.
+    let (nx, ny) = (-dy / len * width * 0.5, dx / len * width * 0.5);
+    let a = (x0 + nx, y0 + ny);
+    let b = (x1 + nx, y1 + ny);
+    let c = (x1 - nx, y1 - ny);
+    let d = (x0 - nx, y0 - ny);
+    vec![[a, b, c], [a, c, d]]
+}
+
+/// Axis-aligned bounds `(x, y, w, h)` of a triangle list (for clip rejection).
+fn tris_bbox(tris: &[TriF]) -> (f32, f32, f32, f32) {
+    let mut lo = (f32::MAX, f32::MAX);
+    let mut hi = (f32::MIN, f32::MIN);
+    for t in tris {
+        for &(x, y) in t {
+            lo = (lo.0.min(x), lo.1.min(y));
+            hi = (hi.0.max(x), hi.1.max(y));
+        }
+    }
+    (lo.0, lo.1, hi.0 - lo.0, hi.1 - lo.1)
+}
+
 /// Convert rt's 0..1 float colour to XRender's 16-bit-per-channel colour.
 fn to_render_color(c: Color) -> render::Color {
     let s = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
@@ -431,5 +494,50 @@ impl Drop for XRenderBackend {
         let _ = xproto::free_pixmap(&self.conn, self.src_pixmap);
         let _ = xproto::free_gc(&self.conn, self.gc);
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod geom_tests {
+    use super::*;
+
+    #[test]
+    fn disc_is_a_fan_on_radius() {
+        let n = seg_count(9.0);
+        let tris = disc_tris(50.0, 40.0, 9.0);
+        assert_eq!(tris.len() as u32, n, "one triangle per rim segment");
+        // Every rim vertex is ~9px from the centre.
+        for t in &tris {
+            for &(x, y) in &[t[1], t[2]] {
+                let d = ((x - 50.0).powi(2) + (y - 40.0).powi(2)).sqrt();
+                assert!((d - 9.0).abs() < 0.01, "rim vertex off-circle: {d}");
+            }
+            assert_eq!(t[0], (50.0, 40.0), "fan apex is the centre");
+        }
+    }
+
+    #[test]
+    fn ring_has_inner_and_outer_radius() {
+        let tris = ring_tris(30.0, 30.0, 4.0, 1.4);
+        assert!(!tris.is_empty());
+        let mut saw_outer = false;
+        let mut saw_inner = false;
+        for t in &tris {
+            for &(x, y) in t {
+                let d = ((x - 30.0).powi(2) + (y - 30.0).powi(2)).sqrt();
+                if (d - 4.0).abs() < 0.02 { saw_outer = true; }
+                if (d - 2.6).abs() < 0.02 { saw_inner = true; } // 4.0 - 1.4
+            }
+        }
+        assert!(saw_outer && saw_inner, "ring must touch both radii");
+    }
+
+    #[test]
+    fn line_is_two_triangles_of_correct_width() {
+        // A horizontal segment, width 2 → a 10x2 quad centred on y=20.
+        let tris = line_tris(10.0, 20.0, 20.0, 20.0, 2.0);
+        assert_eq!(tris.len(), 2, "a quad is two triangles");
+        let (_, y, _, h) = tris_bbox(&tris);
+        assert!((y - 19.0).abs() < 0.01 && (h - 2.0).abs() < 0.01, "half-width each side");
     }
 }
