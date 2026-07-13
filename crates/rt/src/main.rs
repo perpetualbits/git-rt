@@ -282,6 +282,7 @@ struct Active {
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
     prefs_open: bool,                     // whether the preferences dialog is showing
     manual_open: bool,                    // whether the built-in manual overlay is showing
+    manual_scroll: usize,                 // scroll offset (cell rows) into the native manual panel
     search_open: bool,                    // whether the scrollback-search bar is showing
     search_query: String,                 // the current search text
     search_matches: Vec<rt_engine::SearchMatch>, // hits for search_query in search_pane
@@ -958,6 +959,7 @@ impl ApplicationHandler for App {
             egui_painter,
             prefs_open: false,
             manual_open: false,
+            manual_scroll: 0,
             search_open: false,
             search_query: String::new(),
             search_matches: Vec::new(),

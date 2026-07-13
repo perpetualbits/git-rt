@@ -6,6 +6,7 @@
 
 use crate::render::Color;
 
+pub mod manual;
 pub mod menu;
 pub mod search;
 
