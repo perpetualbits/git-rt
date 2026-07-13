@@ -118,6 +118,39 @@ impl XRenderBackend {
         })
     }
 
+    /// Glyph id for `ch`, rasterising + uploading it to the glyph set on first use.
+    /// `None` if the glyph has no bitmap or can't be rasterised.
+    fn glyph_id(&mut self, ch: char) -> Option<u32> {
+        if let Some(&g) = self.glyphs.get(&ch) {
+            return Some(g);
+        }
+        let (m, bitmap) = self.fonts[0].rasterize(ch, self.glyph_px);
+        if m.width == 0 || m.height == 0 {
+            // No pixels (e.g. control char): cache a "blank" so we don't retry, but
+            // don't upload — return None so draw_char skips it.
+            return None;
+        }
+        // XRender wants each A8 scanline padded to a 4-byte boundary.
+        let stride = (m.width + 3) & !3;
+        let mut data = vec![0u8; stride * m.height];
+        for r in 0..m.height {
+            data[r * stride..r * stride + m.width].copy_from_slice(&bitmap[r * m.width..(r + 1) * m.width]);
+        }
+        let info = render::Glyphinfo {
+            width: m.width as u16,
+            height: m.height as u16,
+            x: (-m.xmin) as i16,                       // origin ← bitmap left
+            y: (m.ymin + m.height as i32) as i16,      // origin ← bitmap top (ascent)
+            x_off: m.advance_width.round() as i16,
+            y_off: 0,
+        };
+        let gid = self.next_glyph_id;
+        render::add_glyphs(&self.conn, self.glyphset, &[gid], &[info], &data).ok()?;
+        self.next_glyph_id += 1;
+        self.glyphs.insert(ch, gid);
+        Some(gid)
+    }
+
     fn fill(&self, x: f32, y: f32, w: f32, h: f32, c: Color) {
         // Respect the damage clip: skip fills that don't touch it.
         if let Some(b) = self.clip {
@@ -222,8 +255,37 @@ impl Backend for XRenderBackend {
     fn fill_cell(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
         self.fill(ox + col as f32 * self.cell_w, oy + row as f32 * self.cell_h, self.cell_w, self.cell_h, color);
     }
-    fn draw_char(&mut self, _ox: f32, _oy: f32, _col: usize, _row: usize, _ch: char, _fg: Color, _bold: bool, _italic: bool) {
-        // Glyphs: Task 5.
+    fn draw_char(&mut self, ox: f32, oy: f32, col: usize, row: usize, ch: char, fg: Color, _bold: bool, _italic: bool) {
+        if ch == ' ' {
+            return; // space: no glyph
+        }
+        let x = ox + col as f32 * self.cell_w;
+        let y = oy + row as f32 * self.cell_h;
+        if let Some(b) = self.clip {
+            if !rect_intersects(x, y, self.cell_w, self.cell_h, b) {
+                return;
+            }
+        }
+        let gid = match self.glyph_id(ch) {
+            Some(g) => g,
+            None => return, // unrasterisable → skip
+        };
+        // Set the 1x1 solid source to the fg colour.
+        let one = xproto::Rectangle { x: 0, y: 0, width: 1, height: 1 };
+        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.src_pic, to_render_color(fg), &[one]);
+        // Composite the glyph at the cell's pen baseline.
+        let dx = x.round() as i16;
+        let dy = (y + self.ascent).round() as i16;
+        let mut cmd = Vec::with_capacity(12);
+        cmd.push(1u8); // one glyph in this element
+        cmd.extend_from_slice(&[0u8, 0, 0]); // pad
+        cmd.extend_from_slice(&dx.to_ne_bytes());
+        cmd.extend_from_slice(&dy.to_ne_bytes());
+        cmd.extend_from_slice(&gid.to_ne_bytes()); // u32 glyph id
+        let _ = render::composite_glyphs32(
+            &self.conn, render::PictOp::OVER, self.src_pic, self.win_pic,
+            self.a8_format, self.glyphset, 0, 0, &cmd,
+        );
     }
     fn draw_underline(&mut self, ox: f32, oy: f32, col: usize, row: usize, color: Color) {
         let t = (self.cell_h / 16.0).max(1.0);
