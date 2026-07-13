@@ -336,10 +336,14 @@ impl Backend for XRenderBackend {
         1 // the X window preserves undamaged pixels server-side
     }
     fn partial_present_available(&self) -> bool {
-        false // Slice 1 Task 3-5 run the full path; Task 6 flips this on
+        true // XRender draws only the damaged cells directly into the window
     }
     fn x11_present_active(&self) -> bool {
-        false
+        // Semantically "an X present that preserves the window server-side": the
+        // planner uses this to force age=1 AND to skip the border-band damage
+        // inflation (a GL-buffer artifact), so a keystroke's damage stays the
+        // changed cells — exactly what the clip filter in fill/draw_char honours.
+        true
     }
 }
 
