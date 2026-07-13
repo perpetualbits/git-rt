@@ -6,6 +6,8 @@
 
 use crate::render::Color;
 
+pub mod menu;
+
 /// An axis-aligned layout rectangle in window pixels.
 #[derive(Clone, Copy, Debug)]
 pub struct Recti {
