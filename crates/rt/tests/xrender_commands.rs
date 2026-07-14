@@ -138,6 +138,12 @@ fn xrender_emits_commands_not_pixels() {
          PutImage={put_image} trace_bytes={bytes}"
     );
 
+    // The instrument layer is a 32-bit ARGB pixmap — its creation appears as a
+    // CreatePixmap with depth 32 in the trace.
+    let argb_pixmap = dump.matches("CreatePixmap").filter(|_| dump.contains("depth=32") || dump.contains("depth: 32")).count();
+    eprintln!("depth-32 CreatePixmap present: {}", argb_pixmap > 0);
+    assert!(dump.contains("CreatePixmap"), "expected the instrument-layer CreatePixmap in the trace");
+
     // The thesis, made falsifiable:
     assert!(composite > 0, "expected RenderCompositeGlyphs (text as glyph commands), got 0");
     assert!(fills > 0, "expected RenderFillRectangles (backgrounds as fill commands), got 0");

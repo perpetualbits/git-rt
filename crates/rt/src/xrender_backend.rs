@@ -118,6 +118,11 @@ pub struct XRenderBackend {
     depth: u8,                  // window/pixmap depth (for back-buffer recreation)
     win_format: Pictformat,     // the window's Pictformat (for back-buffer recreation)
     a8_format: Pictformat,      // the A8 glyph mask format
+    argb_format: Pictformat,        // 32-bit premultiplied ARGB format (instrument layer)
+    // Offscreen instrument/patch-bay layer: 32-bit ARGB, full-window, transparent
+    // except where instruments are drawn. Composited OVER the content at present.
+    instr_pixmap: xproto::Pixmap,
+    instr_pic: render::Picture,
     glyphset: render::Glyphset, // one shared glyph set (all styles)
     src_pixmap: xproto::Pixmap, // 1x1 repeating solid-colour source
     src_pic: render::Picture,   // the source Picture over `src_pixmap`
@@ -207,6 +212,19 @@ impl XRenderBackend {
         let gc = conn.generate_id().ok()?;
         conn.create_gc(gc, win, &xproto::CreateGCAux::new()).ok()?;
 
+        // The instrument layer: a full-window 32-bit ARGB pixmap + Picture,
+        // composited OVER the content at present time.
+        let instr_pixmap = conn.generate_id().ok()?;
+        conn.create_pixmap(32, instr_pixmap, win, win_w, win_h).ok()?;
+        let instr_pic = conn.generate_id().ok()?;
+        render::create_picture(&conn, instr_pic, instr_pixmap, argb_format, &render::CreatePictureAux::new()).ok()?;
+        // Freshly-created pixmap contents are undefined — start fully transparent.
+        let _ = render::fill_rectangles(
+            &conn, render::PictOp::SRC, instr_pic,
+            render::Color { red: 0, green: 0, blue: 0, alpha: 0 },
+            &[xproto::Rectangle { x: 0, y: 0, width: win_w, height: win_h }],
+        );
+
         let fonts = parse_fonts(blobs)?;
         let (cell_w, cell_h, ascent) = measure_cell(&fonts[0], font_px);
 
@@ -225,6 +243,9 @@ impl XRenderBackend {
             depth,
             win_format,
             a8_format,
+            argb_format,
+            instr_pixmap,
+            instr_pic,
             glyphset,
             src_pixmap,
             src_pic,
@@ -286,6 +307,16 @@ impl XRenderBackend {
         self.next_glyph_id += 1;
         self.glyphs.insert(ch, gid);
         Some(gid)
+    }
+
+    /// Reset the instrument layer to fully transparent (whole window). Called
+    /// at creation and at the start of every instrument tick.
+    fn clear_instr_layer(&self) {
+        let _ = render::fill_rectangles(
+            &self.conn, render::PictOp::SRC, self.instr_pic,
+            render::Color { red: 0, green: 0, blue: 0, alpha: 0 },
+            &[xproto::Rectangle { x: 0, y: 0, width: self.win_w, height: self.win_h }],
+        );
     }
 
     fn fill(&self, x: f32, y: f32, w: f32, h: f32, c: Color) {
@@ -389,6 +420,19 @@ impl XRenderBackend {
                 }
             }
         }
+        // Recreate the instrument layer at the new size, transparent.
+        let _ = render::free_picture(&self.conn, self.instr_pic);
+        let _ = self.conn.free_pixmap(self.instr_pixmap);
+        if let Ok(pm) = self.conn.generate_id() {
+            if self.conn.create_pixmap(32, pm, self.window, w, h).is_ok() {
+                self.instr_pixmap = pm;
+                if let Ok(pic) = self.conn.generate_id() {
+                    let _ = render::create_picture(&self.conn, pic, pm, self.argb_format, &render::CreatePictureAux::new());
+                    self.instr_pic = pic;
+                }
+            }
+        }
+        self.clear_instr_layer();
     }
 }
 
