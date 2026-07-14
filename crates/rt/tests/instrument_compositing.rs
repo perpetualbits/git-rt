@@ -270,8 +270,8 @@ fn instrument_layer_composites_without_pixel_upload() {
     assert_eq!(put_image_on, 0, "instruments-ON: XRender path must ship ZERO PutImage pixel blits");
     assert_eq!(put_image_off, 0, "instruments-OFF: XRender path must ship ZERO PutImage pixel blits");
 
-    std::fs::remove_dir_all(xdg_on.parent().unwrap_or(&xdg_on)).ok();
-    std::fs::remove_dir_all(xdg_off.parent().unwrap_or(&xdg_off)).ok();
+    std::fs::remove_dir_all(&xdg_on).ok();
+    std::fs::remove_dir_all(&xdg_off).ok();
 }
 
 /// The REAL end-to-end assertion for the instrument layer — instrument-green
@@ -304,8 +304,8 @@ fn instrument_green_appears_when_visible() {
     let mean_off = green_mean(&png_off, "#40c054", 18).unwrap_or(0.0);
     eprintln!("green mean: on={mean_on} off={mean_off}");
 
-    std::fs::remove_dir_all(xdg_on.parent().unwrap_or(&xdg_on)).ok();
-    std::fs::remove_dir_all(xdg_off.parent().unwrap_or(&xdg_off)).ok();
+    std::fs::remove_dir_all(&xdg_on).ok();
+    std::fs::remove_dir_all(&xdg_off).ok();
 
     assert!(mean_on > 0.0, "green mean: expected instrument-green pixels with inst_remote=true, found none (mean={mean_on})");
     assert_eq!(mean_off, 0.0, "green mean: expected NO instrument-green pixels with inst_remote=false, found some (mean={mean_off})");
@@ -443,8 +443,8 @@ fn instrument_ticks_decoupled_from_output() {
 
     std::fs::remove_file(&silent_shell).ok();
     std::fs::remove_file(&flood_shell).ok();
-    std::fs::remove_dir_all(xdg_silent.parent().unwrap_or(&xdg_silent)).ok();
-    std::fs::remove_dir_all(xdg_flood.parent().unwrap_or(&xdg_flood)).ok();
+    std::fs::remove_dir_all(&xdg_silent).ok();
+    std::fs::remove_dir_all(&xdg_flood).ok();
 
     let silent_triangles = dump_silent.matches("Triangles").count();
     let flood_triangles = dump_flood.matches("Triangles").count();
