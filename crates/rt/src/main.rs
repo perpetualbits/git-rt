@@ -296,6 +296,7 @@ struct Active {
     damage: crate::damage::DamageAccumulator, // this frame's accumulated pixel damage
     damage_history: std::collections::VecDeque<crate::damage::FrameDamage>, // recent frames' damage, for buffer-age
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
+    last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -915,6 +916,7 @@ impl ApplicationHandler for App {
             let xr: Option<Box<dyn backend::Backend>> = None;
             xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window)))
         };
+        let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
         self.active = Some(Active {
             window,
             backend,
@@ -974,6 +976,7 @@ impl ApplicationHandler for App {
             damage: crate::damage::DamageAccumulator::new(),
             damage_history: std::collections::VecDeque::new(),
             force_full: true, // first frame is always a full redraw
+            last_focus: init_focus,
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so its egui rendering can be screenshotted.
@@ -1531,7 +1534,13 @@ impl ApplicationHandler for App {
                     let before = active.session.focus();
                     active.session.focus_at(active.mouse.0, active.mouse.1);
                     if active.session.focus() != before {
-                        active.window.request_redraw(); // repaint the focus border
+                        // Focus-follows-mouse produces no engine cell-damage, so
+                        // nothing else would schedule a frame — ask for one. The
+                        // frame builder's central `focus != last_focus` check forces
+                        // it full (so the blue border clears off the old pane and
+                        // fully draws on the new); no per-site force_full needed, and
+                        // omitting it keeps the *following* keystroke frame scissored.
+                        active.window.request_redraw();
                     }
                 }
             }
@@ -1618,6 +1627,13 @@ impl ApplicationHandler for App {
                             .map(|t| t.first_pane);
                         if let Some(first_pane) = clicked_tab {
                             active.session.focus_tab(first_pane);
+                            // The visible pane set changes but the newly-shown
+                            // panes have no engine damage (their content didn't
+                            // change), so force a full redraw — otherwise the
+                            // XRender back buffer keeps the previous tab's pixels
+                            // (stale content, and re-switching to an already-drawn
+                            // tab shows nothing new). Matches the keyboard path.
+                            active.force_full = true;
                             active.window.request_redraw();
                         } else {
                             active.session.focus_at(mx, my); // click-to-focus
@@ -1702,7 +1718,12 @@ impl ApplicationHandler for App {
                         return;
                     }
                     active.dragging_divider = None; // end any divider resize
-                    active.scroll_drag = None; // end any scrollbar drag
+                    if active.scroll_drag.take().is_some() {
+                        // The scrollbar drag skipped the instrument layer (kept the
+                        // drag cheap); repaint it now the drag has ended.
+                        active.force_full = true;
+                        active.window.request_redraw();
+                    }
                     active.selecting = false; // drag finished
                     // A zero-length selection was just a click: discard it, and
                     // (copy-on-select) copy a real selection to PRIMARY.
@@ -1844,17 +1865,29 @@ impl ApplicationHandler for App {
         // into `anim` rather than forcing a repaint — on a software renderer each
         // repaint is real CPU, so animation-only repaints are throttled below.
         let mut anim = false;
-        if Self::pump_wires(active) || active.wires.iter().any(|w| w.rate > 1.0) {
-            anim = true; // wire packets still moving
-        }
-        if Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02) {
-            anim = true; // a warm pane's heat border stays live
-        }
-        if active.meters.values().any(|m| m.rate > 0.5) {
-            anim = true; // output-flow easing to a stop
-        }
-        if active.stall > 0.02 {
-            anim = true; // latency flare fading out
+        // Always pump the patch-bay (moves bytes) and sample heat (/proc) — these
+        // are side effects that must run every tick. Whether they DRIVE an
+        // animation repaint is gated: on the remote XRender backend the animated
+        // chrome lives on the pane borders, so a repaint re-sends the whole screen
+        // (slow over ssh -X on a weak box). So instrument animation there is off
+        // unless `inst_animate` opts in; the local GL backend always animates.
+        let pumped = Self::pump_wires(active);
+        let heat_live = Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02);
+        let animate_instruments = active.backend.supports_egui()
+            || (active.settings.inst_remote && active.settings.inst_animate);
+        if animate_instruments {
+            if pumped || active.wires.iter().any(|w| w.rate > 1.0) {
+                anim = true; // wire packets still moving
+            }
+            if heat_live {
+                anim = true; // a warm pane's heat border stays live
+            }
+            if active.meters.values().any(|m| m.rate > 0.5) {
+                anim = true; // output-flow easing to a stop
+            }
+            if active.stall > 0.02 {
+                anim = true; // latency flare fading out
+            }
         }
         // The focused cursor soft-blinks for a bounded window after typing — but a
         // smooth pulse needs ~20fps, so skip it entirely on a software renderer
@@ -1871,6 +1904,15 @@ impl ApplicationHandler for App {
         if anim && now.duration_since(active.last_anim) >= anim_min {
             active.last_anim = now;
             dirty = true;
+            // Native (XRender): the perimeter chrome (instruments + wires) is
+            // drawn only on full frames — a partial frame can't redraw the
+            // perimeter without eroding the static border or trailing the moving
+            // packets. An animation repaint IS that full frame, throttled to
+            // ~2fps by `anim_min`, so keystrokes and output stay on the minimal
+            // scissored path between ticks (no whole-screen re-send under load).
+            if !active.backend.supports_egui() {
+                active.force_full = true;
+            }
         }
         // While the search bar is open, keep its results current as new output
         // streams into the searched pane. Re-run only on a change, query set.
@@ -2082,7 +2124,17 @@ impl App {
                 Some(SessionEvent::CloseWindow) => exit_clean(), // last pane closed; clean up first
                 Some(SessionEvent::Copy) => Self::do_copy(active),   // selection → clipboard
                 Some(SessionEvent::Paste) => Self::do_paste(active), // clipboard → focused PTY
-                Some(SessionEvent::Redraw) => active.window.request_redraw(),
+                Some(SessionEvent::Redraw) => {
+                    // A session action that changed what's on screen — a tab
+                    // switch, split, zoom, rotate, columns, etc. These change the
+                    // whole visible layout, but the newly-shown panes have no
+                    // per-cell engine damage (their content didn't change, they
+                    // were just hidden), so a partial frame would redraw nothing
+                    // and the XRender back buffer would keep the OLD tab's pixels.
+                    // Force a full redraw so the new layout actually paints.
+                    active.force_full = true;
+                    active.window.request_redraw();
+                }
                 None => {}
             },
         }
@@ -2520,19 +2572,31 @@ impl App {
         // engine damage state — runs exactly once per pane per frame.
         active.damage.begin_frame();
         let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
+        // Native (XRender) chrome: the border instruments + patch-bay are drawn
+        // over a persistent back buffer and span the pane perimeters, so any
+        // frame that shows them must be FULL. A partial frame would (a) erode the
+        // static border/jacks — a scissored clear erases the pixels under its
+        // bbox and the instruments outside it are never redrawn — and (b) trail
+        // the moving packets (their previous position isn't cleared). XRender
+        // full frames are commands-only (~KB), so this stays cheap; a keystroke
+        // A partial (scissored) frame is correct only when it can bound ALL of
+        // this frame's damage. On the native (XRender) path the animated chrome —
+        // border instruments AND patch-bay wires — is drawn only on full
+        // ANIMATION frames (see `about_to_wait`, throttled to ~2fps), so partial
+        // content frames stay MINIMAL: a keystroke or a line of output re-sends
+        // only the changed cells, never the whole screen. That is the whole point
+        // of mechanism C, and forcing full frames here for instruments/wires
+        // (an earlier bug) saturated the ssh link under load. On the GL path the
+        // wires are egui chrome blended every frame across arbitrary inter-pane
+        // regions the partial path can't bound, so any wire still forces full there.
         if active.force_full
             || overlay_open
+            || active.session.focus() != active.last_focus // focus moved: the blue border shifts panes with no cell-damage → full
+            || !active.bell_flash.is_empty() // bell stripes span the pane top+bottom, not the output's cell-damage → full (and the expired entry, still present here until draw_panes retains it, gives one full frame to clear the stripe)
             || !active.backend.is_software()
-            || !active.wires.is_empty()
+            || (active.backend.supports_egui() && !active.wires.is_empty())
             || !active.backend.partial_present_available()
         {
-            // hardware GL / overlays / re-armed → full frame; also, wires are
-            // animated chrome spanning arbitrary inter-pane regions outside
-            // `border_bands`, so the partial path can't bound their damage —
-            // fall back to Full whenever any wire exists. A partial present
-            // needs either an EGL surface (mechanism A, buffer-age swap) or an
-            // X11 present handle (Route 1, readback+XPutImage) — see
-            // `partial_present_available`; otherwise → full path.
             active.damage.mark_full();
         }
         for (id, rect) in active.session.visible_rects(bounds) {
@@ -2584,6 +2648,7 @@ impl App {
         // full redraw next frame; specific handlers also re-arm it.
         if let Some(active) = self.active.as_mut() {
             active.force_full = overlay_open || force_next;
+            active.last_focus = active.session.focus(); // record the focus this frame painted, so the next focus move is detected
         }
     }
 
@@ -2985,34 +3050,46 @@ impl App {
         // it is never open here. Draw the instruments first (background layer),
         // then whichever overlay is up on top of them — otherwise the overlay's
         // text would be composited underneath the animated meters/wires.
-        // First advance the instrument flow by real wall-clock time.
+        //
+        // This dispatch runs on FULL frames only (redraw_scissored skips it on
+        // the native path; animation ticks force a full frame — see
+        // `about_to_wait`). So the scissor is clear and the instrument layer is
+        // redrawn whole over a freshly-cleared buffer: no eroded border, no
+        // packet trail. First advance the instrument flow by real wall-clock time.
         let now = Instant::now();
         let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
         active.last_meter_tick = now;
-        advance_instrument_state(&mut active.meters, &mut active.wires, dt);
         let size = active.window.inner_size();
         let (cw, ch) = active.backend.cell_size();
-        // Instruments always draw under any open overlay. Build the borrowing
-        // context from DISJOINT fields so `&mut active.backend` coexists with the
-        // `&active.*` reads (a whole-struct `&active` alongside would not).
-        let bounds = content_bounds(size);
-        let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
-        let ctx = chrome::instruments::InstrCtx {
-            rects: &rects,
-            meters: &active.meters,
-            wires: &active.wires,
-            heat: &active.heat,
-            inst_output: active.settings.inst_output,
-            inst_heat: active.settings.inst_heat,
-            inst_latency: active.settings.inst_latency,
-            show_jacks: active.settings.show_jacks,
-            wiring_from: active.wiring_from,
-            drag_cursor: active.drag_cursor,
-            lat_phase: active.lat_phase,
-            stall: active.stall,
-            size,
-        };
-        chrome::instruments::draw(&mut *active.backend, &ctx);
+        // Over the remote (XRender) backend the instruments are OFF by default
+        // (`inst_remote`): the layer is redrawn on every full frame, and over a
+        // slow ssh -X link that makes tab/menu/scroll lag — so remotely rt is a
+        // plain, fast terminal unless the user opts in. Also skip the layer while
+        // dragging the scrollbar (each drag frame is forced-full; grid-only keeps
+        // it cheap — the instruments repaint on drag-release via force_full).
+        if active.settings.inst_remote && active.scroll_drag.is_none() {
+            advance_instrument_state(&mut active.meters, &mut active.wires, dt);
+            // Build the borrowing context from DISJOINT fields so `&mut
+            // active.backend` coexists with the `&active.*` reads.
+            let bounds = content_bounds(size);
+            let rects = active.session.visible_rects(bounds); // owned Vec — no lingering session borrow
+            let ctx = chrome::instruments::InstrCtx {
+                rects: &rects,
+                meters: &active.meters,
+                wires: &active.wires,
+                heat: &active.heat,
+                inst_output: active.settings.inst_output,
+                inst_heat: active.settings.inst_heat,
+                inst_latency: active.settings.inst_latency,
+                show_jacks: active.settings.show_jacks,
+                wiring_from: active.wiring_from,
+                drag_cursor: active.drag_cursor,
+                lat_phase: active.lat_phase,
+                stall: active.stall,
+                size,
+            };
+            chrome::instruments::draw(&mut *active.backend, &ctx);
+        }
         // Overlay draws: each reads a few `active.*` fields to build its inputs as
         // locals FIRST, then takes `&mut *active.backend` (disjoint field borrows).
         if let Some(pos) = active.menu {
@@ -3126,7 +3203,15 @@ impl App {
         active.backend.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame();
-        Self::paint_overlays_or_instruments(active); // instruments blend inside the cleared bbox
+        // GL blends its egui instruments into the scissored region every frame.
+        // The native (XRender) path draws its perimeter chrome (instruments,
+        // wires) only on full ANIMATION frames (2fps), so a scissored native
+        // frame stays minimal — changed cells only — and leaves the persistent
+        // instrument layer untouched in the window (server-side). It is refreshed
+        // on the next animation tick.
+        if active.backend.supports_egui() {
+            Self::paint_overlays_or_instruments(active);
+        }
         active.backend.clear_scissor(); // next frame starts with a clean scissor
         // Present just the damage (X11 Route-1 bbox present, else EGL partial swap).
         if active.backend.present(&active.window, Some((bbox, hint_rects))) {
@@ -3566,11 +3651,11 @@ impl App {
                 let has_out = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
                 let has_err = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
                 let jack = |p: egui::Pos2, filled: bool, col: egui::Color32| {
-                    painter.circle_filled(p, 4.5, egui::Color32::from_black_alpha(180)); // dark backing
+                    painter.circle_filled(p, 6.0, egui::Color32::from_black_alpha(180)); // dark backing
                     if filled {
-                        painter.circle_filled(p, 3.5, col);
+                        painter.circle_filled(p, 4.6, col);
                     } else {
-                        painter.circle_stroke(p, 3.2, egui::Stroke::new(1.4, col));
+                        painter.circle_stroke(p, 4.3, egui::Stroke::new(1.6, col));
                     }
                 };
                 jack(jack_pos(r, 0), has_in, egui::Color32::from_rgb(0x88, 0x88, 0x98));

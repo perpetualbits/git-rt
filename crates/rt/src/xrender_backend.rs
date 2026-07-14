@@ -22,40 +22,51 @@ use crate::damage::PxRect;
 use crate::render::{Color, FontBlobs};
 
 /// A triangle in f32 window pixels (converted to XRender 16.16 fixed point at draw).
+/// Used for the thin instrument LINES (wires/latency): a line is 2 triangles, so
+/// this stays cheap AND anti-aliased. The round shapes (packets, jacks), by
+/// contrast, are drawn as cached A8 masks (see `rasterise_*` + `shape_glyph`) —
+/// re-tessellating a disc into ~30 inline triangles every frame was far too
+/// expensive over ssh -X on a slow board (CPU + wire volume). A mask uploads
+/// once and is stamped by a ~20-byte reference, like a font glyph.
 type TriF = [(f32, f32); 3];
 
-/// Rim subdivisions for a disc/ring of radius `r`: enough that the polygon reads
-/// as a circle at terminal sizes, capped so a big ring stays cheap.
-fn seg_count(r: f32) -> u32 {
-    ((r * 3.0) as u32).clamp(8, 64)
-}
-
-/// Filled disc as a triangle fan (apex = centre, rim = `seg_count(r)` points).
-fn disc_tris(cx: f32, cy: f32, r: f32) -> Vec<TriF> {
-    use std::f32::consts::TAU;
-    let n = seg_count(r);
-    let pt = |k: u32| {
-        let a = TAU * k as f32 / n as f32;
-        (cx + r * a.cos(), cy + r * a.sin())
-    };
-    (0..n).map(|k| [(cx, cy), pt(k), pt((k + 1) % n)]).collect()
-}
-
-/// Annulus (outer `r`, inner `r-width`) as a triangle strip of quads → 2 tris each.
-fn ring_tris(cx: f32, cy: f32, r: f32, width: f32) -> Vec<TriF> {
-    use std::f32::consts::TAU;
-    let ri = (r - width).max(0.0);
-    let n = seg_count(r);
-    let outer = |k: u32| { let a = TAU * k as f32 / n as f32; (cx + r * a.cos(), cy + r * a.sin()) };
-    let inner = |k: u32| { let a = TAU * k as f32 / n as f32; (cx + ri * a.cos(), cy + ri * a.sin()) };
-    let mut out = Vec::with_capacity(n as usize * 2);
-    for k in 0..n {
-        let (o0, o1) = (outer(k), outer((k + 1) % n));
-        let (i0, i1) = (inner(k), inner((k + 1) % n));
-        out.push([o0, o1, i1]);
-        out.push([o0, i1, i0]);
+/// Rasterise a filled disc of radius `r` into an A8 coverage bitmap, centred in a
+/// `side`×`side` square (`side = 2*ceil(r)+1`). Edge coverage ramps over ~1px
+/// (analytic AA). Returns `(side, side, coverage)`. Rasterised ONCE, then cached.
+fn rasterize_disc(r: f32) -> (u16, u16, Vec<u8>) {
+    let rad = r.ceil().max(1.0) as i32;
+    let side = (rad * 2 + 1) as usize;
+    let mut data = vec![0u8; side * side];
+    for py in 0..side {
+        for px in 0..side {
+            let dx = px as f32 - rad as f32;
+            let dy = py as f32 - rad as f32;
+            let d = (dx * dx + dy * dy).sqrt();
+            let cov = (r + 0.5 - d).clamp(0.0, 1.0);
+            data[py * side + px] = (cov * 255.0) as u8;
+        }
     }
-    out
+    (side as u16, side as u16, data)
+}
+
+/// Rasterise a ring (outer radius `r`, stroke `width` inward) into an A8 mask:
+/// coverage = inside the outer edge AND outside the inner edge, both AA.
+fn rasterize_ring(r: f32, width: f32) -> (u16, u16, Vec<u8>) {
+    let rad = r.ceil().max(1.0) as i32;
+    let side = (rad * 2 + 1) as usize;
+    let ri = (r - width).max(0.0);
+    let mut data = vec![0u8; side * side];
+    for py in 0..side {
+        for px in 0..side {
+            let dx = px as f32 - rad as f32;
+            let dy = py as f32 - rad as f32;
+            let d = (dx * dx + dy * dy).sqrt();
+            let outer = (r + 0.5 - d).clamp(0.0, 1.0); // inside outer edge
+            let inner = (d - ri + 0.5).clamp(0.0, 1.0); // outside inner edge
+            data[py * side + px] = (outer.min(inner) * 255.0) as u8;
+        }
+    }
+    (side as u16, side as u16, data)
 }
 
 /// Thick segment as a quad (2 triangles), butt caps, `width` centred on the line.
@@ -106,9 +117,13 @@ pub struct XRenderBackend {
     glyphset: render::Glyphset, // one shared glyph set (all styles)
     src_pixmap: xproto::Pixmap, // 1x1 repeating solid-colour source
     src_pic: render::Picture,   // the source Picture over `src_pixmap`
-    argb_format: Pictformat,        // 32-bit ARGB format for the alpha source
     src_pixmap_argb: xproto::Pixmap,// 1x1 repeating alpha-capable source pixmap
     src_pic_argb: render::Picture,  // the ARGB source Picture (AA primitives)
+    // AA round shapes (packets/jacks) as cached A8 masks, keyed by (kind, r, w).
+    // Uploaded once, stamped by reference (composite_glyphs) — cheap over ssh -X.
+    shape_glyphset: render::Glyphset,
+    shapes: HashMap<(u8, u32, u32), u32>, // (0=disc/1=ring, r*4, width*4) -> glyph id
+    next_shape_id: u32,
     cell_w: f32,
     cell_h: f32,
     ascent: f32,
@@ -174,6 +189,9 @@ impl XRenderBackend {
 
         let glyphset = conn.generate_id().ok()?;
         render::create_glyph_set(&conn, glyphset, a8_format).ok()?;
+        // A second glyph set for the AA round-shape masks (discs/rings).
+        let shape_glyphset = conn.generate_id().ok()?;
+        render::create_glyph_set(&conn, shape_glyphset, a8_format).ok()?;
 
         // Server-side back buffer at the window's size + depth, and a GC for the
         // pixmap->window copy. Drawing goes here; `present` copies it to the window.
@@ -205,9 +223,11 @@ impl XRenderBackend {
             glyphset,
             src_pixmap,
             src_pic,
-            argb_format,
             src_pixmap_argb,
             src_pic_argb,
+            shape_glyphset,
+            shapes: HashMap::new(),
+            next_shape_id: 1,
             cell_w,
             cell_h,
             ascent,
@@ -274,10 +294,62 @@ impl XRenderBackend {
         let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, to_render_color(c), &[rect]);
     }
 
+    /// Set the 1x1 repeating ARGB source to `c` (straight alpha), premultiplied as
+    /// OVER expects, ready to be modulated by a shape mask or a triangle mesh.
+    fn set_argb_src(&self, c: Color) {
+        let s = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
+        let premult = render::Color { red: s(c.0 * c.3), green: s(c.1 * c.3), blue: s(c.2 * c.3), alpha: s(c.3) };
+        let one = xproto::Rectangle { x: 0, y: 0, width: 1, height: 1 };
+        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.src_pic_argb, premult, &[one]);
+    }
+
+    /// Glyph id for a disc (`kind` 0) or ring (`kind` 1) of the given radius/width,
+    /// rasterising + uploading its A8 mask on first use (then cached). The glyph
+    /// origin is the shape centre, so it stamps centred on the pen position.
+    fn shape_glyph(&mut self, kind: u8, r: f32, width: f32) -> Option<u32> {
+        // Quantise to 0.25px so a handful of masks cover every instrument shape.
+        let key = (kind, (r * 4.0).round() as u32, (width * 4.0).round() as u32);
+        if let Some(&g) = self.shapes.get(&key) {
+            return Some(g);
+        }
+        let (w, h, cov) = if kind == 1 { rasterize_ring(r, width) } else { rasterize_disc(r) };
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let rad = (r.ceil().max(1.0)) as i16; // origin offset from top-left = centre
+        // A8 scanlines padded to a 4-byte boundary (as add_glyphs requires).
+        let stride = (w as usize + 3) & !3;
+        let mut data = vec![0u8; stride * h as usize];
+        for row in 0..h as usize {
+            data[row * stride..row * stride + w as usize]
+                .copy_from_slice(&cov[row * w as usize..(row + 1) * w as usize]);
+        }
+        let info = render::Glyphinfo { width: w, height: h, x: rad, y: rad, x_off: 0, y_off: 0 };
+        let gid = self.next_shape_id;
+        render::add_glyphs(&self.conn, self.shape_glyphset, &[gid], &[info], &data).ok()?;
+        self.next_shape_id += 1;
+        self.shapes.insert(key, gid);
+        Some(gid)
+    }
+
+    /// Stamp shape glyph `gid` centred at `(dx, dy)` using the current ARGB source.
+    fn stamp_shape(&self, gid: u32, dx: i16, dy: i16) {
+        let mut cmd = Vec::with_capacity(12);
+        cmd.push(1u8); // one glyph
+        cmd.extend_from_slice(&[0u8, 0, 0]); // pad
+        cmd.extend_from_slice(&dx.to_ne_bytes());
+        cmd.extend_from_slice(&dy.to_ne_bytes());
+        cmd.extend_from_slice(&gid.to_ne_bytes());
+        let _ = render::composite_glyphs32(
+            &self.conn, render::PictOp::OVER, self.src_pic_argb, self.back_pic,
+            self.a8_format, self.shape_glyphset, 0, 0, &cmd,
+        );
+    }
+
     /// Composite a triangle mesh in colour `c` (straight alpha) onto the back
-    /// buffer with anti-aliasing: fill the 1x1 ARGB source with the *premultiplied*
-    /// colour, then `render::triangles` OVER through the A8 mask format so the
-    /// per-edge coverage is antialiased. Server-side geometry — zero wire pixels.
+    /// buffer with anti-aliasing — used for the thin instrument LINES (2 triangles
+    /// each). `render::triangles` OVER through the A8 mask format gives per-edge
+    /// coverage. Server-side geometry — zero wire pixels.
     fn draw_tris(&self, tris: &[TriF], c: Color) {
         if tris.is_empty() { return; }
         // Clip rejection: skip meshes wholly outside the damage clip.
@@ -285,11 +357,7 @@ impl XRenderBackend {
             let (x, y, w, h) = tris_bbox(tris);
             if !rect_intersects(x, y, w, h, b) { return; }
         }
-        // Premultiplied ARGB solid source (OVER expects premultiplied alpha).
-        let s = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
-        let premult = render::Color { red: s(c.0 * c.3), green: s(c.1 * c.3), blue: s(c.2 * c.3), alpha: s(c.3) };
-        let one = xproto::Rectangle { x: 0, y: 0, width: 1, height: 1 };
-        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.src_pic_argb, premult, &[one]);
+        self.set_argb_src(c);
         // f32 window px → 16.16 fixed point.
         let fx = |v: f32| (v * 65536.0).round() as i32;
         let mk = |(x, y): (f32, f32)| Pointfix { x: fx(x), y: fx(y) };
@@ -491,12 +559,25 @@ impl Backend for XRenderBackend {
         self.fill(x, y + h - t, w, t, c);
     }
     fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: Color) {
-        self.draw_tris(&disc_tris(cx, cy, r), c);
+        // Cached A8 mask stamped by reference — cheap over ssh -X (no per-frame
+        // tessellation, no inline geometry). AA + alpha preserved.
+        if r <= 0.0 {
+            return;
+        }
+        let Some(gid) = self.shape_glyph(0, r, 0.0) else { return };
+        self.set_argb_src(c);
+        self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
     }
     fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: Color) {
-        self.draw_tris(&ring_tris(cx, cy, r, width), c);
+        if r <= 0.0 || width <= 0.0 {
+            return;
+        }
+        let Some(gid) = self.shape_glyph(1, r, width) else { return };
+        self.set_argb_src(c);
+        self.stamp_shape(gid, cx.round() as i16, cy.round() as i16);
     }
     fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
+        // Thin lines: 2 anti-aliased triangles — cheap AND smooth (no staircase).
         self.draw_tris(&line_tris(x0, y0, x1, y1, width), c);
     }
     fn end_frame(&mut self) {}
@@ -506,17 +587,19 @@ impl Backend for XRenderBackend {
         self.win_h = h.get() as u16;
         self.recreate_back(); // back buffer must match the new window size
     }
-    fn present(&mut self, _window: &Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
-        // Copy the finished frame from the back buffer to the window in one
-        // server-side CopyArea (no wire pixels): the damage bbox if partial, else
-        // the whole window. This is what makes the update atomic — no flash.
-        let (sx, sy, w, h) = match damage {
-            Some((b, _)) => (b.x as i16, b.y as i16, b.w as u16, b.h as u16),
-            None => (0, 0, self.win_w, self.win_h),
-        };
-        if w > 0 && h > 0 {
-            let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, sx, sy, sx, sy, w, h);
-        }
+    fn present(&mut self, _window: &Window, _damage: Option<(PxRect, &[PxRect])>) -> bool {
+        // ALWAYS copy the whole back buffer to the window, ignoring the damage
+        // bbox. A CopyArea is server-side (zero wire pixels), so a full-window
+        // copy costs the same as a partial one — but it guarantees the complete,
+        // consistent back buffer is what's on screen. Presenting only the damage
+        // bbox was the source of the "half-drawn / grows-as-you-type" borders:
+        // `fill()` draws a whole rect (focus border, divider) into the back buffer
+        // whenever it merely intersects the bbox, but a bbox-only present showed
+        // just the sliver inside the bbox, revealing the rest only as later
+        // frames' bboxes swept over it. The DRAW stays minimal (scissored to the
+        // changed cells — that is what keeps the *wire* small); only the present
+        // is full. Still zero PutImage, so mechanism C's invariant holds.
+        let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
         let _ = self.conn.flush();
         false // never needs the GL fallback
     }
@@ -554,6 +637,7 @@ impl Drop for XRenderBackend {
         let _ = render::free_picture(&self.conn, self.src_pic_argb);
         let _ = xproto::free_pixmap(&self.conn, self.src_pixmap_argb);
         let _ = render::free_glyph_set(&self.conn, self.glyphset);
+        let _ = render::free_glyph_set(&self.conn, self.shape_glyphset);
         let _ = xproto::free_pixmap(&self.conn, self.back_pixmap);
         let _ = xproto::free_pixmap(&self.conn, self.src_pixmap);
         let _ = xproto::free_gc(&self.conn, self.gc);
@@ -566,34 +650,23 @@ mod geom_tests {
     use super::*;
 
     #[test]
-    fn disc_is_a_fan_on_radius() {
-        let n = seg_count(9.0);
-        let tris = disc_tris(50.0, 40.0, 9.0);
-        assert_eq!(tris.len() as u32, n, "one triangle per rim segment");
-        // Every rim vertex is ~9px from the centre.
-        for t in &tris {
-            for &(x, y) in &[t[1], t[2]] {
-                let d = ((x - 50.0).powi(2) + (y - 40.0).powi(2)).sqrt();
-                assert!((d - 9.0).abs() < 0.01, "rim vertex off-circle: {d}");
-            }
-            assert_eq!(t[0], (50.0, 40.0), "fan apex is the centre");
-        }
+    fn disc_mask_is_opaque_centre_clear_corner() {
+        let (w, h, d) = rasterize_disc(9.0);
+        let rad = 9usize; // ceil(9)
+        assert!(w as usize >= 2 * rad + 1 && h == w, "square mask around the disc");
+        let centre = d[rad * w as usize + rad];
+        assert!(centre > 250, "disc centre should be ~opaque, got {centre}");
+        assert_eq!(d[0], 0, "top-left corner is outside the disc");
+        assert!(d.iter().any(|&v| v > 0 && v < 255), "expected AA edge coverage");
     }
 
     #[test]
-    fn ring_has_inner_and_outer_radius() {
-        let tris = ring_tris(30.0, 30.0, 4.0, 1.4);
-        assert!(!tris.is_empty());
-        let mut saw_outer = false;
-        let mut saw_inner = false;
-        for t in &tris {
-            for &(x, y) in t {
-                let d = ((x - 30.0).powi(2) + (y - 30.0).powi(2)).sqrt();
-                if (d - 4.0).abs() < 0.02 { saw_outer = true; }
-                if (d - 2.6).abs() < 0.02 { saw_inner = true; } // 4.0 - 1.4
-            }
-        }
-        assert!(saw_outer && saw_inner, "ring must touch both radii");
+    fn ring_mask_is_hollow_and_filled_on_the_band() {
+        let (w, _h, d) = rasterize_ring(6.0, 1.4);
+        let rad = 6usize;
+        assert_eq!(d[rad * w as usize + rad], 0, "ring centre must be hollow");
+        let band = d[rad * w as usize + (rad + 6).min(w as usize - 1)];
+        assert!(band > 100, "ring band should be filled, got {band}");
     }
 
     #[test]

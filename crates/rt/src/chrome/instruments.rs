@@ -85,7 +85,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         let p2 = (p3.0 - ext, p3.1);
         let hue = if w.stream == Stream::Stdout { (0x40u8, 0xc0u8, 0x54u8) } else { (0xd0, 0x54, 0x30) };
         let act = (w.rate / WIRE_BUSY_BYTES).clamp(0.0, 1.0);
-        const N: u32 = 56;
+        const N: u32 = 32; // bezier segments per wire (trimmed from 56 to cut ssh -X wire volume; still smooth)
         let mut prev = p0;
         for i in 1..=N {
             let t = i as f32 / N as f32;
@@ -117,9 +117,9 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             let has_out = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
             let has_err = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
             let mut jack = |p: (f32, f32), filled: bool, c: crate::render::Color| {
-                be.fill_circle(p.0, p.1, 4.5, crate::render::Color(0.0, 0.0, 0.0, 0.70));
-                if filled { be.fill_circle(p.0, p.1, 3.5, c); }
-                else { be.stroke_circle(p.0, p.1, 3.2, 1.4, c); }
+                be.fill_circle(p.0, p.1, 6.0, crate::render::Color(0.0, 0.0, 0.0, 0.70));
+                if filled { be.fill_circle(p.0, p.1, 4.6, c); }
+                else { be.stroke_circle(p.0, p.1, 4.3, 1.6, c); }
             };
             jack(jack_pos(r, 0), has_in, crate::render::Color::rgb(0x88, 0x88, 0x98));
             jack(jack_pos(r, 1), has_out, crate::render::Color::rgb(0x40, 0xc0, 0x54));
@@ -165,7 +165,7 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             ((fx, fy + fh), 2.0 * fw + fh),
             ((fx, fy), per),
         ];
-        const SUB: u32 = 26;
+        const SUB: u32 = 14; // latency-frame segments per edge (trimmed from 26; a thin frame reads fine)
         for e in 0..4 {
             let (pa, da) = corners[e];
             let (pb, db) = corners[e + 1];
