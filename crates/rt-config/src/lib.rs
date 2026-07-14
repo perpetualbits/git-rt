@@ -133,6 +133,14 @@ pub struct Settings {
     pub inst_latency: bool,
     /// Show the patch-bay jack dots on each pane (existing wires draw regardless).
     pub show_jacks: bool,
+    /// Animate the border instruments on the REMOTE (XRender / `ssh -X`) backend.
+    /// The animated packets/latency live on the pane borders, so animating them
+    /// forces a full-window redraw each tick — cheap locally, but over `ssh -X`
+    /// on a weak box it re-sends the whole screen ~2×/second and makes typing
+    /// lag. Off by default: over XRender the instruments are drawn but STATIC
+    /// (they still update on resize/tab/focus). The LOCAL GL backend always
+    /// animates regardless of this flag. Turn on if your link is fast enough.
+    pub inst_animate: bool,
     /// Default text colour (RGB). Cells that don't set an explicit foreground
     /// use this.
     pub foreground: [u8; 3],
@@ -186,6 +194,7 @@ impl Default for Settings {
             inst_heat: true,
             inst_latency: true,
             show_jacks: true,              // patch-bay jacks visible by default
+            inst_animate: false,           // static instruments over ssh -X (fast); GL animates regardless
             foreground: [0xd0, 0xd0, 0xd8], // light grey text
             background: [0x10, 0x10, 0x14], // near-black background
             palette: DEFAULT_PALETTE,      // classic xterm 16-colour palette

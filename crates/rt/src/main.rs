@@ -1844,17 +1844,28 @@ impl ApplicationHandler for App {
         // into `anim` rather than forcing a repaint — on a software renderer each
         // repaint is real CPU, so animation-only repaints are throttled below.
         let mut anim = false;
-        if Self::pump_wires(active) || active.wires.iter().any(|w| w.rate > 1.0) {
-            anim = true; // wire packets still moving
-        }
-        if Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02) {
-            anim = true; // a warm pane's heat border stays live
-        }
-        if active.meters.values().any(|m| m.rate > 0.5) {
-            anim = true; // output-flow easing to a stop
-        }
-        if active.stall > 0.02 {
-            anim = true; // latency flare fading out
+        // Always pump the patch-bay (moves bytes) and sample heat (/proc) — these
+        // are side effects that must run every tick. Whether they DRIVE an
+        // animation repaint is gated: on the remote XRender backend the animated
+        // chrome lives on the pane borders, so a repaint re-sends the whole screen
+        // (slow over ssh -X on a weak box). So instrument animation there is off
+        // unless `inst_animate` opts in; the local GL backend always animates.
+        let pumped = Self::pump_wires(active);
+        let heat_live = Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02);
+        let animate_instruments = active.backend.supports_egui() || active.settings.inst_animate;
+        if animate_instruments {
+            if pumped || active.wires.iter().any(|w| w.rate > 1.0) {
+                anim = true; // wire packets still moving
+            }
+            if heat_live {
+                anim = true; // a warm pane's heat border stays live
+            }
+            if active.meters.values().any(|m| m.rate > 0.5) {
+                anim = true; // output-flow easing to a stop
+            }
+            if active.stall > 0.02 {
+                anim = true; // latency flare fading out
+            }
         }
         // The focused cursor soft-blinks for a bounded window after typing — but a
         // smooth pulse needs ~20fps, so skip it entirely on a software renderer
