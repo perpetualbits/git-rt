@@ -117,9 +117,9 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
             let has_out = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
             let has_err = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
             let mut jack = |p: (f32, f32), filled: bool, c: crate::render::Color| {
-                be.fill_circle(p.0, p.1, 4.5, crate::render::Color(0.0, 0.0, 0.0, 0.70));
-                if filled { be.fill_circle(p.0, p.1, 3.5, c); }
-                else { be.stroke_circle(p.0, p.1, 3.2, 1.4, c); }
+                be.fill_circle(p.0, p.1, 6.0, crate::render::Color(0.0, 0.0, 0.0, 0.70));
+                if filled { be.fill_circle(p.0, p.1, 4.6, c); }
+                else { be.stroke_circle(p.0, p.1, 4.3, 1.6, c); }
             };
             jack(jack_pos(r, 0), has_in, crate::render::Color::rgb(0x88, 0x88, 0x98));
             jack(jack_pos(r, 1), has_out, crate::render::Color::rgb(0x40, 0xc0, 0x54));

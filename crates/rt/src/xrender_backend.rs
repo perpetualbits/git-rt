@@ -106,7 +106,6 @@ pub struct XRenderBackend {
     glyphset: render::Glyphset, // one shared glyph set (all styles)
     src_pixmap: xproto::Pixmap, // 1x1 repeating solid-colour source
     src_pic: render::Picture,   // the source Picture over `src_pixmap`
-    argb_format: Pictformat,        // 32-bit ARGB format for the alpha source
     src_pixmap_argb: xproto::Pixmap,// 1x1 repeating alpha-capable source pixmap
     src_pic_argb: render::Picture,  // the ARGB source Picture (AA primitives)
     cell_w: f32,
@@ -205,7 +204,6 @@ impl XRenderBackend {
             glyphset,
             src_pixmap,
             src_pic,
-            argb_format,
             src_pixmap_argb,
             src_pic_argb,
             cell_w,

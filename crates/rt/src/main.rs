@@ -1871,6 +1871,15 @@ impl ApplicationHandler for App {
         if anim && now.duration_since(active.last_anim) >= anim_min {
             active.last_anim = now;
             dirty = true;
+            // Native (XRender): the perimeter chrome (instruments + wires) is
+            // drawn only on full frames — a partial frame can't redraw the
+            // perimeter without eroding the static border or trailing the moving
+            // packets. An animation repaint IS that full frame, throttled to
+            // ~2fps by `anim_min`, so keystrokes and output stay on the minimal
+            // scissored path between ticks (no whole-screen re-send under load).
+            if !active.backend.supports_egui() {
+                active.force_full = true;
+            }
         }
         // While the search bar is open, keep its results current as new output
         // streams into the searched pane. Re-run only on a change, query set.
@@ -2520,19 +2529,29 @@ impl App {
         // engine damage state — runs exactly once per pane per frame.
         active.damage.begin_frame();
         let mut snapshots: Vec<(rt_core::PaneId, PxRectSnap)> = Vec::new();
+        // Native (XRender) chrome: the border instruments + patch-bay are drawn
+        // over a persistent back buffer and span the pane perimeters, so any
+        // frame that shows them must be FULL. A partial frame would (a) erode the
+        // static border/jacks — a scissored clear erases the pixels under its
+        // bbox and the instruments outside it are never redrawn — and (b) trail
+        // the moving packets (their previous position isn't cleared). XRender
+        // full frames are commands-only (~KB), so this stays cheap; a keystroke
+        // A partial (scissored) frame is correct only when it can bound ALL of
+        // this frame's damage. On the native (XRender) path the animated chrome —
+        // border instruments AND patch-bay wires — is drawn only on full
+        // ANIMATION frames (see `about_to_wait`, throttled to ~2fps), so partial
+        // content frames stay MINIMAL: a keystroke or a line of output re-sends
+        // only the changed cells, never the whole screen. That is the whole point
+        // of mechanism C, and forcing full frames here for instruments/wires
+        // (an earlier bug) saturated the ssh link under load. On the GL path the
+        // wires are egui chrome blended every frame across arbitrary inter-pane
+        // regions the partial path can't bound, so any wire still forces full there.
         if active.force_full
             || overlay_open
             || !active.backend.is_software()
-            || !active.wires.is_empty()
+            || (active.backend.supports_egui() && !active.wires.is_empty())
             || !active.backend.partial_present_available()
         {
-            // hardware GL / overlays / re-armed → full frame; also, wires are
-            // animated chrome spanning arbitrary inter-pane regions outside
-            // `border_bands`, so the partial path can't bound their damage —
-            // fall back to Full whenever any wire exists. A partial present
-            // needs either an EGL surface (mechanism A, buffer-age swap) or an
-            // X11 present handle (Route 1, readback+XPutImage) — see
-            // `partial_present_available`; otherwise → full path.
             active.damage.mark_full();
         }
         for (id, rect) in active.session.visible_rects(bounds) {
@@ -2985,7 +3004,12 @@ impl App {
         // it is never open here. Draw the instruments first (background layer),
         // then whichever overlay is up on top of them — otherwise the overlay's
         // text would be composited underneath the animated meters/wires.
-        // First advance the instrument flow by real wall-clock time.
+        //
+        // This dispatch runs on FULL frames only (redraw_scissored skips it on
+        // the native path; animation ticks force a full frame — see
+        // `about_to_wait`). So the scissor is clear and the instrument layer is
+        // redrawn whole over a freshly-cleared buffer: no eroded border, no
+        // packet trail. First advance the instrument flow by real wall-clock time.
         let now = Instant::now();
         let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
         active.last_meter_tick = now;
@@ -3126,7 +3150,15 @@ impl App {
         active.backend.begin_frame_scissored(bg, bbox); // scissor clips clear + draws to bbox
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame();
-        Self::paint_overlays_or_instruments(active); // instruments blend inside the cleared bbox
+        // GL blends its egui instruments into the scissored region every frame.
+        // The native (XRender) path draws its perimeter chrome (instruments,
+        // wires) only on full ANIMATION frames (2fps), so a scissored native
+        // frame stays minimal — changed cells only — and leaves the persistent
+        // instrument layer untouched in the window (server-side). It is refreshed
+        // on the next animation tick.
+        if active.backend.supports_egui() {
+            Self::paint_overlays_or_instruments(active);
+        }
         active.backend.clear_scissor(); // next frame starts with a clean scissor
         // Present just the damage (X11 Route-1 bbox present, else EGL partial swap).
         if active.backend.present(&active.window, Some((bbox, hint_rects))) {
@@ -3566,11 +3598,11 @@ impl App {
                 let has_out = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
                 let has_err = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
                 let jack = |p: egui::Pos2, filled: bool, col: egui::Color32| {
-                    painter.circle_filled(p, 4.5, egui::Color32::from_black_alpha(180)); // dark backing
+                    painter.circle_filled(p, 6.0, egui::Color32::from_black_alpha(180)); // dark backing
                     if filled {
-                        painter.circle_filled(p, 3.5, col);
+                        painter.circle_filled(p, 4.6, col);
                     } else {
-                        painter.circle_stroke(p, 3.2, egui::Stroke::new(1.4, col));
+                        painter.circle_stroke(p, 4.3, egui::Stroke::new(1.6, col));
                     }
                 };
                 jack(jack_pos(r, 0), has_in, egui::Color32::from_rgb(0x88, 0x88, 0x98));
