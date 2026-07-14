@@ -296,6 +296,7 @@ struct Active {
     damage: crate::damage::DamageAccumulator, // this frame's accumulated pixel damage
     damage_history: std::collections::VecDeque<crate::damage::FrameDamage>, // recent frames' damage, for buffer-age
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
+    last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
 }
 
 /// A rectangular-by-lines text selection within one pane, in that pane's grid
@@ -915,6 +916,7 @@ impl ApplicationHandler for App {
             let xr: Option<Box<dyn backend::Backend>> = None;
             xr.unwrap_or_else(|| Box::new(gl_backend::GlBackend::new(renderer, surface, context, &window)))
         };
+        let init_focus = session.focus(); // seed last_focus before `session` is moved into Active
         self.active = Some(Active {
             window,
             backend,
@@ -974,6 +976,7 @@ impl ApplicationHandler for App {
             damage: crate::damage::DamageAccumulator::new(),
             damage_history: std::collections::VecDeque::new(),
             force_full: true, // first frame is always a full redraw
+            last_focus: init_focus,
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so its egui rendering can be screenshotted.
@@ -1531,7 +1534,13 @@ impl ApplicationHandler for App {
                     let before = active.session.focus();
                     active.session.focus_at(active.mouse.0, active.mouse.1);
                     if active.session.focus() != before {
-                        active.window.request_redraw(); // repaint the focus border
+                        // Focus-follows-mouse produces no engine cell-damage, so
+                        // nothing else would schedule a frame — ask for one. The
+                        // frame builder's central `focus != last_focus` check forces
+                        // it full (so the blue border clears off the old pane and
+                        // fully draws on the new); no per-site force_full needed, and
+                        // omitting it keeps the *following* keystroke frame scissored.
+                        active.window.request_redraw();
                     }
                 }
             }
@@ -2582,6 +2591,7 @@ impl App {
         // regions the partial path can't bound, so any wire still forces full there.
         if active.force_full
             || overlay_open
+            || active.session.focus() != active.last_focus // focus moved: the blue border shifts panes with no cell-damage → full
             || !active.backend.is_software()
             || (active.backend.supports_egui() && !active.wires.is_empty())
             || !active.backend.partial_present_available()
@@ -2637,6 +2647,7 @@ impl App {
         // full redraw next frame; specific handlers also re-arm it.
         if let Some(active) = self.active.as_mut() {
             active.force_full = overlay_open || force_next;
+            active.last_focus = active.session.focus(); // record the focus this frame painted, so the next focus move is detected
         }
     }
 
