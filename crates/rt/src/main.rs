@@ -1857,7 +1857,8 @@ impl ApplicationHandler for App {
         // unless `inst_animate` opts in; the local GL backend always animates.
         let pumped = Self::pump_wires(active);
         let heat_live = Self::sample_heat(active) && active.heat.values().any(|&h| h > 0.02);
-        let animate_instruments = active.backend.supports_egui() || active.settings.inst_animate;
+        let animate_instruments = active.backend.supports_egui()
+            || (active.settings.inst_remote && active.settings.inst_animate);
         if animate_instruments {
             if pumped || active.wires.iter().any(|w| w.rate > 1.0) {
                 anim = true; // wire packets still moving
@@ -3041,14 +3042,13 @@ impl App {
         active.last_meter_tick = now;
         let size = active.window.inner_size();
         let (cw, ch) = active.backend.cell_size();
-        // Skip the instrument layer while the user is dragging the scrollbar: the
-        // drag forces a full frame per motion event, and re-emitting the whole
-        // instrument layer on each would flood the ssh -X link and freeze the
-        // drag (each frame is grid + instruments over the wire). A grid-only drag
-        // frame is as cheap as running with instruments off; the instruments are
-        // repainted on drag-release (which arms a force_full). Same for other
-        // rapid full-frame gestures could be added here.
-        if active.scroll_drag.is_none() {
+        // Over the remote (XRender) backend the instruments are OFF by default
+        // (`inst_remote`): the layer is redrawn on every full frame, and over a
+        // slow ssh -X link that makes tab/menu/scroll lag — so remotely rt is a
+        // plain, fast terminal unless the user opts in. Also skip the layer while
+        // dragging the scrollbar (each drag frame is forced-full; grid-only keeps
+        // it cheap — the instruments repaint on drag-release via force_full).
+        if active.settings.inst_remote && active.scroll_drag.is_none() {
             advance_instrument_state(&mut active.meters, &mut active.wires, dt);
             // Build the borrowing context from DISJOINT fields so `&mut
             // active.backend` coexists with the `&active.*` reads.

@@ -148,11 +148,11 @@ fn xrender_emits_commands_not_pixels() {
 }
 
 /// Chrome regression: with the manual overlay open (via the test-only
-/// `RT_OPEN_MANUAL=1` startup hook), the native XRender path must still ship
-/// zero `PutImage` pixel blits, and the instruments drawing underneath the
-/// overlay must still emit RENDER `Triangles` (their AA primitives). This is
-/// the on-point guard that chrome + instruments stay commands-only even when
-/// an overlay is showing, not just on the bare "hello world" frame.
+/// `RT_OPEN_MANUAL=1` startup hook), the native XRender path must still render
+/// as glyph/fill COMMANDS and ship zero `PutImage` pixel blits — even when an
+/// overlay is showing, not just on the bare "hello world" frame. (Border
+/// instruments are off by default on the remote backend, so this frame has no
+/// RENDER Triangles; the commands-not-pixels invariant is `PutImage == 0`.)
 #[test]
 #[ignore = "needs Xvfb + xtrace; run with --ignored"]
 fn xrender_chrome_is_commands_not_pixels() {
@@ -245,10 +245,14 @@ fn xrender_chrome_is_commands_not_pixels() {
     assert!(!dump.is_empty(), "xtrace produced no output — did rt connect to :{disp}?");
 
     let put_image = dump.matches("PutImage").count();
-    let triangles = dump.matches("Triangles").count();
+    let composite = dump.matches("CompositeGlyphs").count();
     let bytes = dump.len();
-    eprintln!("chrome wire profile: Triangles={triangles} PutImage={put_image} bytes={bytes}");
+    eprintln!("chrome wire profile: CompositeGlyphs={composite} PutImage={put_image} bytes={bytes}");
 
-    assert!(triangles > 0, "native chrome must emit RENDER Triangles (AA primitives), got 0");
+    // The manual overlay + grid render as glyph/fill COMMANDS, never pixel blits.
+    // (Border instruments are off by default on the remote backend — inst_remote
+    // — so this frame legitimately has no RENDER Triangles; the invariant that
+    // matters is zero PutImage.)
+    assert!(composite > 0, "native chrome must emit CompositeGlyphs (text as commands), got 0");
     assert_eq!(put_image, 0, "native chrome must ship ZERO PutImage pixel blits");
 }
