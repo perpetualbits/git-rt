@@ -2592,6 +2592,7 @@ impl App {
         if active.force_full
             || overlay_open
             || active.session.focus() != active.last_focus // focus moved: the blue border shifts panes with no cell-damage → full
+            || !active.bell_flash.is_empty() // bell stripes span the pane top+bottom, not the output's cell-damage → full (and the expired entry, still present here until draw_panes retains it, gives one full frame to clear the stripe)
             || !active.backend.is_software()
             || (active.backend.supports_egui() && !active.wires.is_empty())
             || !active.backend.partial_present_available()
