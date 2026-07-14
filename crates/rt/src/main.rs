@@ -1442,6 +1442,7 @@ impl ApplicationHandler for App {
                 let bounds = content_bounds(size);
                 active.session.relayout(bounds); // push new sizes to PTYs
                 active.force_full = true; // whole surface changed: next frame is full
+                active.instr_layer_drawn = false; // layer pixmap was recreated+cleared on resize — redraw it next frame
                 active.window.request_redraw(); // repaint at the new size
             }
 
@@ -1906,22 +1907,28 @@ impl ApplicationHandler for App {
         // Let animation drive a repaint, but throttle it to ~2 fps on a software
         // renderer (llvmpipe — a weak or remote box) so the bling can't peg the
         // CPU; content changes (output/title/bell, above) still repaint promptly.
+        // GL path: a throttled full-frame repaint drives egui's inline instrument
+        // animation (target "A"). Software GL caps this at ~2fps so the bling can't
+        // peg the CPU; on a real GPU it repaints every frame.
         let anim_min = if active.low_power { Duration::from_millis(500) } else { Duration::ZERO };
-        if anim && now.duration_since(active.last_anim) >= anim_min {
+        if anim && active.backend.supports_egui() && now.duration_since(active.last_anim) >= anim_min {
             active.last_anim = now;
             dirty = true;
-            if active.backend.supports_egui() {
-                // GL: egui redraws instruments inline every frame (target "A").
-            } else if active.settings.inst_remote
-                && active.settings.inst_animate
-                && now.duration_since(active.last_instr_tick) >= INSTRUMENT_TICK
-            {
-                // Native: redraw ONLY the instrument layer at 6fps; the content
-                // buffer stays on the scissored path. No content full frame.
-                active.instr_tick = true;
-                active.last_instr_tick = now;
-                dirty = true;
-            }
+        }
+        // Native (XRender) path: the instrument LAYER redraws on its own fixed
+        // cadence (INSTRUMENT_TICK = 6fps), paced independently of `anim_min` — a
+        // tick redraws only the ARGB layer (composited server-side), never a
+        // content frame, so it stays cheap over ssh -X regardless of the ~2fps
+        // software-GL repaint throttle. `anim` gates it so a static (no-flow)
+        // patch-bay costs nothing.
+        let instruments_animating = anim
+            && !active.backend.supports_egui()
+            && active.settings.inst_remote
+            && active.settings.inst_animate;
+        if instruments_animating && now.duration_since(active.last_instr_tick) >= INSTRUMENT_TICK {
+            active.instr_tick = true;
+            active.last_instr_tick = now;
+            dirty = true;
         }
         // While the search bar is open, keep its results current as new output
         // streams into the searched pane. Re-run only on a change, query set.
@@ -1940,6 +1947,8 @@ impl ApplicationHandler for App {
             ACTIVE_POLL
         } else if blinking {
             BLINK_POLL
+        } else if instruments_animating {
+            INSTRUMENT_TICK // wake at ~6fps to redraw the animating instrument layer
         } else {
             IDLE_POLL
         };

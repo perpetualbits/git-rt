@@ -421,6 +421,43 @@ fn run_traced(tag: &str, disp: u32, xdg_config_home: &Path, shell: &Path, run_se
 /// Before Task 5, the native path redrew instruments on every content-forced
 /// full frame — so heavier output (more frequent `dirty`/full-frame activity)
 /// would have re-shipped instrument geometry more often, not at a fixed rate.
+///
+/// Why the bound below is `3*silent + 50`, not a tighter `1x`-ish bound: the
+/// two runs legitimately animate instruments at DIFFERENT wall-clock rates,
+/// not the same one. "flood" drives instruments via the output meter path
+/// (`Meter`/`advance_instrument_state`), which samples every event-loop wake
+/// and reaches the real `INSTRUMENT_TICK` cadence (~6fps, restored by this
+/// change — see `main.rs`'s `instruments_animating`). "silent" only has the
+/// CPU-heat path to lean on, and `sample_heat` self-throttles its `/proc`
+/// resampling to `dt >= 0.4s` (~2.5Hz) — so silent ticks at ~2.5fps while
+/// flood ticks at ~6fps, a ~2.4x rate ratio that is CORRECT behavior, not a
+/// leak of content-frame volume onto the instrument layer. Measured
+/// (post-fix, 3 repeated runs, RUN_SECS=4): silent_triangles=336 and
+/// flood_triangles=840 every single run (840/336 = 2.500, deterministic given
+/// the fixed tick cadences and RUN_SECS) — comfortably inside `3*336+50 =
+/// 1058` with margin against jitter, while still rejecting the historical
+/// regression this guard exists for: forcing the pre-decoupling bug
+/// (instrument layer redrawn on every content-dirty frame instead of throttled
+/// to `INSTRUMENT_TICK`) reproduces flood_triangles=4424 in this environment
+/// (silent_triangles=56 in that same forced build) — matching the ~4088
+/// figure measured when Task 5 was first built — and `3*56+50 = 218` rejects
+/// it by roughly 20x.
+///
+/// A low-rate output TRICKLE shell (instead of CPU-spin) was tried first for
+/// "silent", so both runs would animate via the SAME meter path and isolate
+/// glyph volume as the only variable. It was rejected: measured
+/// deterministically stuck at silent_triangles=56 regardless of trickle
+/// rate/duration tuning — far BELOW even the ~2.5fps heat baseline (336) —
+/// because of a bootstrap catch-22 in `about_to_wait`. The instrument layer's
+/// very first draw runs unconditionally on first-show (before `anim` gating
+/// applies), consuming whatever `Meter::wakeups` have accumulated so far into
+/// `m.rate` via `advance_instrument_state`; every LATER draw requires
+/// `instr_tick`, which itself requires `anim` (`m.rate > 0.5`) to already be
+/// true. If that bootstrap draw fires before enough trickle output has
+/// accumulated (typical at cold start), `m.rate` never crosses the threshold
+/// and no further meter-driven tick ever fires — nothing else (no wires, no
+/// real CPU heat, no keystrokes) supplies a second `anim` trigger. Hence the
+/// CPU-spin shell + corrected bound above.
 #[test]
 #[ignore = "needs Xvfb + xtrace; run with --ignored"]
 fn instrument_ticks_decoupled_from_output() {
@@ -455,9 +492,14 @@ fn instrument_ticks_decoupled_from_output() {
          silent_glyphs={silent_glyphs} flood_glyphs={flood_glyphs}"
     );
 
-    // silent_triangles ≈ flood_triangles (both ~ the same throttled tick rate
-    // over the same wall-clock duration), but flood_glyphs >> silent_glyphs.
-    assert!(flood_triangles as f64 <= 2.0 * silent_triangles as f64 + 50.0,
+    // flood_triangles stays within a ~3x multiple of silent_triangles — the
+    // legitimate ~2.4x rate asymmetry between flood's real 6fps meter-driven
+    // tick and silent's ~2.5fps heat-only tick (see the big comment above for
+    // the measured numbers and margin), NOT 1x. It must NOT approach the
+    // ~10-20x+ this bound rejects, which is what re-appears if instruments
+    // ever ride on content frames again (measured ~4424-4088 flood vs. a
+    // ~56-336 silent baseline under that regression — see above).
+    assert!(flood_triangles as f64 <= 3.0 * silent_triangles as f64 + 50.0,
         "instrument geometry rode on output: silent={silent_triangles} flood={flood_triangles}");
     assert!(flood_glyphs > silent_glyphs * 3,
         "expected far more text glyphs under output flood: silent={silent_glyphs} flood={flood_glyphs}");

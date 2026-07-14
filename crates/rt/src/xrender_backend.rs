@@ -734,6 +734,8 @@ impl Drop for XRenderBackend {
         let _ = xproto::free_pixmap(&self.conn, self.back_pixmap);
         let _ = xproto::free_pixmap(&self.conn, self.src_pixmap);
         let _ = xproto::free_gc(&self.conn, self.gc);
+        let _ = render::free_picture(&self.conn, self.instr_pic);
+        let _ = xproto::free_pixmap(&self.conn, self.instr_pixmap);
         let _ = self.conn.flush();
     }
 }
