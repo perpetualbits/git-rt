@@ -146,3 +146,93 @@ fn xrender_emits_commands_not_pixels() {
         "XRender path must ship ZERO PutImage pixel blits (rt's old cost was 38 = 2.5 MB)"
     );
 }
+
+/// Chrome regression: with the manual overlay open (via the test-only
+/// `RT_OPEN_MANUAL=1` startup hook), the native XRender path must still ship
+/// zero `PutImage` pixel blits, and the instruments drawing underneath the
+/// overlay must still emit RENDER `Triangles` (their AA primitives). This is
+/// the on-point guard that chrome + instruments stay commands-only even when
+/// an overlay is showing, not just on the bare "hello world" frame.
+#[test]
+#[ignore = "needs Xvfb + xtrace; run with --ignored"]
+fn xrender_chrome_is_commands_not_pixels() {
+    if !have("Xvfb") || !have("xtrace") {
+        eprintln!("SKIP xrender_chrome_is_commands_not_pixels: needs both `Xvfb` and `xtrace` on PATH");
+        return;
+    }
+
+    // A different display number than the other test, so the two can run
+    // concurrently (or back-to-back with a lingering socket) without colliding.
+    let disp: u32 = 111 + (std::process::id() % 20);
+    let Some(mut xvfb) = start_xvfb(disp) else {
+        eprintln!("SKIP xrender_chrome_is_commands_not_pixels: Xvfb :{disp} did not come up");
+        return;
+    };
+
+    // Give rt a shell that prints known text then idles, matching the sibling
+    // test's timing budget (cold-start + first-render is ~1.5 s).
+    let mut shell = std::env::temp_dir();
+    shell.push(format!("rt_xrender_chrome_shell_{}.sh", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&shell).expect("create temp shell");
+        f.write_all(b"#!/bin/sh\nprintf 'hello world\\n'; printf 'second line\\n'; sleep 5\n")
+            .unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let trace =
+        std::env::temp_dir().join(format!("rt_xrender_chrome_trace_{}.txt", std::process::id()));
+    let rt_bin = env!("CARGO_BIN_EXE_rt");
+
+    // With the manual open, the instruments animate continuously underneath it,
+    // so this trace is far busier than the sibling test's idle-terminal one
+    // (tens of MB vs hundreds of KB). `-b` makes xtrace batch its writes
+    // instead of flushing every line, so it can keep up in real time. As a
+    // belt-and-braces bound (in case xtrace still lags flushing a big trace
+    // after its child exits), the *entire* xtrace invocation is itself wrapped
+    // in an outer `timeout`, so this test can never hang past a fixed wall
+    // clock budget even if the inner `timeout 3` isn't enough to end it.
+    let fake = disp + 50;
+    let status = Command::new("timeout")
+        .arg("30") // outer bound on the whole xtrace run, incl. its own flush time
+        .arg("xtrace")
+        .arg("-n")
+        .arg("-b")
+        .args(["-d", &format!(":{disp}")])
+        .args(["-D", &format!(":{fake}")])
+        .args(["-o", trace.to_str().unwrap(), "--"])
+        .arg("timeout")
+        .arg("3") // > rt's cold-start + first-render, < the shell's 5 s idle
+        .arg(rt_bin)
+        .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
+        .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
+        .env("RT_OPEN_MANUAL", "1") // test-only hook: open the manual overlay at startup
+        .env("SHELL", &shell)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    // Tear down the Xvfb we own, and the temp shell, regardless of outcome.
+    let _ = xvfb.kill();
+    let _ = xvfb.wait();
+    let _ = std::fs::remove_file(&shell);
+
+    let status = status.expect("run xtrace");
+    eprintln!("xtrace/rt (chrome) exited: {status:?}");
+
+    let dump = std::fs::read_to_string(&trace).unwrap_or_default();
+    let _ = std::fs::remove_file(&trace);
+    assert!(!dump.is_empty(), "xtrace produced no output — did rt connect to :{disp}?");
+
+    let put_image = dump.matches("PutImage").count();
+    let triangles = dump.matches("Triangles").count();
+    let bytes = dump.len();
+    eprintln!("chrome wire profile: Triangles={triangles} PutImage={put_image} bytes={bytes}");
+
+    assert!(triangles > 0, "native chrome must emit RENDER Triangles (AA primitives), got 0");
+    assert_eq!(put_image, 0, "native chrome must ship ZERO PutImage pixel blits");
+}

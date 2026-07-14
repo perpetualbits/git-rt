@@ -1005,6 +1005,14 @@ impl ApplicationHandler for App {
                 Self::run_search(active, true); // populate matches + highlight
             }
         }
+        // Test-only hook (undocumented): RT_OPEN_MANUAL opens the manual overlay
+        // at startup so the xtrace commands-only regression can drive a native
+        // overlay without synthetic input. Fires once, at construction.
+        if std::env::var_os("RT_OPEN_MANUAL").is_some() {
+            if let Some(active) = self.active.as_mut() {
+                active.manual_open = true;
+            }
+        }
         // Debug/verification hook: RT_WIRE_DEMO builds a live patch-bay scene —
         // split, wire pane1.stdout → pane2.stdin, and run a producer + reader — so
         // the wiring can be verified/screenshotted without synthetic input.
