@@ -1,7 +1,7 @@
 //! Native context menu: laid out from `menu::rows`, drawn as fills + glyphs.
 use crate::backend::Backend;
 use crate::chrome::{hit, Recti};
-use crate::menu::{self, Row};
+use crate::menu::Row;
 use crate::render::Color;
 
 /// Menu geometry in window px: the panel box and each row's rect (row rects
@@ -96,12 +96,12 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], hover: Option<usize>, 
             }
         }
     }
-    let _ = cell_w;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::menu;
     use rt_config::Keymap;
 
     fn sample() -> Vec<Row> {

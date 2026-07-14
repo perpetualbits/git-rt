@@ -2982,8 +2982,9 @@ impl App {
             return;
         }
         // Native (XRender) path: preferences is egui-only (force-closed above), so
-        // it is never open here. Draw whichever overlay is up, then always draw the
-        // instruments underneath (they sit in the background layer like the GL path).
+        // it is never open here. Draw the instruments first (background layer),
+        // then whichever overlay is up on top of them — otherwise the overlay's
+        // text would be composited underneath the animated meters/wires.
         // First advance the instrument flow by real wall-clock time.
         let now = Instant::now();
         let dt = now.duration_since(active.last_meter_tick).as_secs_f32().min(0.1);
@@ -2991,26 +2992,6 @@ impl App {
         advance_instrument_state(&mut active.meters, &mut active.wires, dt);
         let size = active.window.inner_size();
         let (cw, ch) = active.backend.cell_size();
-        // Overlay draws: each reads a few `active.*` fields to build its inputs as
-        // locals FIRST, then takes `&mut *active.backend` (disjoint field borrows).
-        if let Some(pos) = active.menu {
-            let url = Self::cell_at(active, pos.0, pos.1)
-                .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
-            let has_sel = Self::selected_text(active).is_some();
-            let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
-            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
-            let hover = active.menu_hover;
-            chrome::menu::draw(&mut *active.backend, &g, &rows, hover, cw, ch);
-        } else if active.manual_open {
-            let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch);
-            let scroll = active.manual_scroll;
-            chrome::manual::draw(&mut *active.backend, &g, scroll, cw, ch);
-        } else if active.search_open {
-            let bar = chrome::search::layout(size.width as f32, cw, ch);
-            let count = active.search_matches.len();
-            let pos = if count == 0 { 0 } else { active.search_index + 1 };
-            chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, cw, ch);
-        }
         // Instruments always draw under any open overlay. Build the borrowing
         // context from DISJOINT fields so `&mut active.backend` coexists with the
         // `&active.*` reads (a whole-struct `&active` alongside would not).
@@ -3032,6 +3013,26 @@ impl App {
             size,
         };
         chrome::instruments::draw(&mut *active.backend, &ctx);
+        // Overlay draws: each reads a few `active.*` fields to build its inputs as
+        // locals FIRST, then takes `&mut *active.backend` (disjoint field borrows).
+        if let Some(pos) = active.menu {
+            let url = Self::cell_at(active, pos.0, pos.1)
+                .and_then(|(pane, col, row)| Self::url_at(active, pane, col, row));
+            let has_sel = Self::selected_text(active).is_some();
+            let rows = menu::rows(&active.keymap, has_sel, url.as_deref());
+            let g = chrome::menu::layout(&rows, pos, cw, ch, size.width as f32, size.height as f32);
+            let hover = active.menu_hover;
+            chrome::menu::draw(&mut *active.backend, &g, &rows, hover, cw, ch);
+        } else if active.manual_open {
+            let g = chrome::manual::layout(size.width as f32, size.height as f32, cw, ch);
+            let scroll = active.manual_scroll;
+            chrome::manual::draw(&mut *active.backend, &g, scroll, cw, ch);
+        } else if active.search_open {
+            let bar = chrome::search::layout(size.width as f32, cw, ch);
+            let count = active.search_matches.len();
+            let pos = if count == 0 { 0 } else { active.search_index + 1 };
+            chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, cw, ch);
+        }
     }
 
     /// Combine this frame's damage with recent frames' damage per the EGL buffer
