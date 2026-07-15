@@ -33,7 +33,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 mod common;
-use common::{free_display_name, have, start_xvfb_scan, wait_for_trace, x_test_lock};
+use common::{free_display_name, have, start_xvfb_scan, release_display_name, stop_xvfb, wait_for_trace, x_test_lock};
 
 /// Write a private `$XDG_CONFIG_HOME/rt/config.toml` forcing the instrument
 /// visuals on (`inst_remote`/`inst_animate`) or off, so the run is deterministic
@@ -74,7 +74,7 @@ fn write_shell(tag: &str) -> PathBuf {
 /// with `xwd` into a PNG, and return `(trace_dump, png_path)`. `disp` must be
 /// free; `tag` disambiguates temp file names across the two runs.
 fn run_and_capture(tag: &str, disp_base: u32, xdg_config_home: &Path) -> (String, PathBuf) {
-    let Some((disp, mut xvfb)) = start_xvfb_scan(disp_base) else {
+    let Some((disp, xvfb)) = start_xvfb_scan(disp_base) else {
         panic!("no Xvfb came up at or after :{disp_base} for run '{tag}'");
     };
 
@@ -122,8 +122,8 @@ fn run_and_capture(tag: &str, disp_base: u32, xdg_config_home: &Path) -> (String
     if wait_for_trace(&trace, "CompositeGlyphs", Duration::from_secs(30)).is_none() {
         let _ = child.kill();
         let _ = child.wait();
-        let _ = xvfb.kill();
-        let _ = xvfb.wait();
+        release_display_name(fake);
+        stop_xvfb(xvfb, disp);
         panic!("[{tag}] rt never rendered any text within 30s — screenshot would be blank");
     }
     // Then allow a few INSTRUMENT_TICKs (166ms each) so the layer is drawn too.
@@ -148,10 +148,10 @@ fn run_and_capture(tag: &str, disp_base: u32, xdg_config_home: &Path) -> (String
     // Stop exactly the process we spawned (never by name/pattern), then reap it.
     let _ = child.kill();
     let status = child.wait();
+    release_display_name(fake); // xtrace does not unbind its proxy socket when killed
 
     // Tear down the Xvfb we own, and the temp shell, regardless of outcome.
-    let _ = xvfb.kill();
-    let _ = xvfb.wait();
+    stop_xvfb(xvfb, disp);
     let _ = std::fs::remove_file(&shell);
 
     let status = status.expect("run xtrace");
@@ -333,7 +333,7 @@ fn write_flood_shell(tag: &str) -> PathBuf {
 /// instruments forced on, returning the raw trace dump. No screenshot here —
 /// this guard only counts wire requests, so it skips `xwd`/`convert` entirely.
 fn run_traced(tag: &str, disp_base: u32, xdg_config_home: &Path, shell: &Path, run_secs: u64) -> String {
-    let Some((disp, mut xvfb)) = start_xvfb_scan(disp_base) else {
+    let Some((disp, xvfb)) = start_xvfb_scan(disp_base) else {
         panic!("no Xvfb came up at or after :{disp_base} for run '{tag}'");
     };
 
@@ -370,8 +370,8 @@ fn run_traced(tag: &str, disp_base: u32, xdg_config_home: &Path, shell: &Path, r
     }
     let _ = child.kill();
     let _ = child.wait();
-    let _ = xvfb.kill();
-    let _ = xvfb.wait();
+    release_display_name(fake); // xtrace does not unbind its proxy socket when killed
+    stop_xvfb(xvfb, disp);
 
     let dump = std::fs::read_to_string(&trace).unwrap_or_default();
     let _ = std::fs::remove_file(&trace);

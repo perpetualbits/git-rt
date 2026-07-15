@@ -89,6 +89,33 @@ pub fn start_xvfb_scan(base: u32) -> Option<(u32, Child)> {
         .find_map(|d| start_xvfb(d).map(|c| (d, c)))
 }
 
+/// Stop an Xvfb we started, and remove the socket + lock it leaves behind.
+///
+/// ALWAYS use this instead of a bare `kill()`. `Child::kill` sends SIGKILL, so
+/// Xvfb never runs its own cleanup: `/tmp/.X11-unix/X<n>` and `/tmp/.X<n>-lock`
+/// outlive it and permanently claim that display number, because `start_xvfb`
+/// (correctly) refuses a name something else appears to hold. Every run leaked
+/// two more names; 361 accumulated locally and starved the scan until tests
+/// failed with "no Xvfb came up".
+///
+/// Only ever removes the display THIS process created — never a name it merely
+/// found lying around, which might belong to a live server.
+pub fn stop_xvfb(mut child: Child, disp: u32) {
+    let _ = child.kill();
+    let _ = child.wait(); // reap before unlinking: the pid is ours
+    release_display_name(disp);
+}
+
+/// Give back a display NAME this process claimed, once whatever held it is dead.
+///
+/// Also needed for xtrace's PROXY display (`-D :fake`): xtrace binds that socket
+/// itself and, killed, leaves it behind — so every traced run leaked one more
+/// name even after Xvfb's own cleanup was fixed. Only for names we created.
+pub fn release_display_name(disp: u32) {
+    let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{disp}"));
+    let _ = std::fs::remove_file(format!("/tmp/.X{disp}-lock"));
+}
+
 /// Block until `path` contains `needle`, or `timeout` elapses. Returns the
 /// trace length at the moment it appeared (so a caller can measure only what
 /// came AFTER), or `None` on timeout.

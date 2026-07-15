@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 mod common;
-use common::{free_display_name, have, start_xvfb_scan, wait_for_trace, x_test_lock};
+use common::{free_display_name, have, start_xvfb_scan, release_display_name, stop_xvfb, wait_for_trace, x_test_lock};
 
 /// Write a private `$XDG_CONFIG_HOME/rt/config.toml` pinning `inst_remote =
 /// false`, so this guard measures CONTENT geometry only (CompositeGlyphs/
@@ -51,7 +51,7 @@ fn xrender_emits_commands_not_pixels() {
 
     // Scan for a display Xvfb will actually serve: fixed guesses collide with
     // the socket/lock litter that killed runs leave behind.
-    let Some((disp, mut xvfb)) = start_xvfb_scan(71) else {
+    let Some((disp, xvfb)) = start_xvfb_scan(71) else {
         panic!("no Xvfb came up at or after :71");
     };
 
@@ -113,10 +113,10 @@ fn xrender_emits_commands_not_pixels() {
     }
     let _ = child.kill();
     let _ = child.wait();
+    release_display_name(fake); // xtrace does not unbind its proxy socket when killed
 
     // Tear down the Xvfb we own, and the temp shell, regardless of outcome.
-    let _ = xvfb.kill();
-    let _ = xvfb.wait();
+    stop_xvfb(xvfb, disp);
     let _ = std::fs::remove_file(&shell);
     let _ = std::fs::remove_dir_all(&cfg_home);
 
@@ -172,7 +172,7 @@ fn xrender_chrome_is_commands_not_pixels() {
 
     // A different base than the other test; the scan then finds a display that
     // is genuinely free and answering.
-    let Some((disp, mut xvfb)) = start_xvfb_scan(111) else {
+    let Some((disp, xvfb)) = start_xvfb_scan(111) else {
         panic!("no Xvfb came up at or after :111");
     };
 
@@ -251,10 +251,10 @@ fn xrender_chrome_is_commands_not_pixels() {
     }
     let _ = child.kill();
     let _ = child.wait();
+    release_display_name(fake); // xtrace does not unbind its proxy socket when killed
 
     // Tear down the Xvfb we own, and the temp shell, regardless of outcome.
-    let _ = xvfb.kill();
-    let _ = xvfb.wait();
+    stop_xvfb(xvfb, disp);
     let _ = std::fs::remove_file(&shell);
     let _ = std::fs::remove_dir_all(&cfg_home);
 
