@@ -4137,6 +4137,11 @@ fn build_event_loop() -> EventLoop<()> {
 
 fn main() {
     env_logger::init(); // honour RUST_LOG for diagnostics
+    // Parse the CLI FIRST. `--version`/`--help` exit from here, and must work on
+    // a machine with no display and no fonts — scripts and CI ask a binary what
+    // it is without wanting a terminal window. Parsing after `build_event_loop`
+    // made `rt --version` abort with XOpenDisplayFailed over a plain (non-X) ssh.
+    let cli = parse_cli();
     // Scan system fonts up front (for the family picker + lookup). A monospace
     // font is mandatory; fail early with guidance if none is installed.
     let font_db = std::sync::Arc::new(build_font_db());
@@ -4152,7 +4157,7 @@ fn main() {
     sweep_stale_jacks();
     // Build the winit event loop and hand it our application.
     let event_loop = build_event_loop();
-    let mut app = App { font_db, mono_families, cli: parse_cli(), active: None };
+    let mut app = App { font_db, mono_families, cli, active: None };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
