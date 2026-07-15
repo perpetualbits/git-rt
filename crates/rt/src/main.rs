@@ -299,6 +299,7 @@ struct Active {
     last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
     resize_events: u64,                   // how many Resized events this session has paid for (diagnostics)
     cursor_icon: Option<CursorIcon>,      // shape currently set (None = default); avoids a round trip per motion
+    surface_pending: Option<winit::dpi::PhysicalSize<u32>>, // window resized; surface owed and PAINTING SUSPENDED until the settle
     resize_pending: bool,                 // a Resized arrived; the reflow waits for the drag to settle
     last_resize_at: Instant,              // when the most recent Resized arrived (drives the settle)
     deferred_resizes: u64,                // Resized events coalesced into the pending reflow (diagnostics)
@@ -987,6 +988,7 @@ impl ApplicationHandler for App {
             last_focus: init_focus,
             resize_events: 0,
             cursor_icon: None,
+            surface_pending: None,
             resize_pending: false,
             last_resize_at: Instant::now(),
             deferred_resizes: 0,
@@ -1437,47 +1439,38 @@ impl ApplicationHandler for App {
                 Ime::Disabled => active.ime_preedit = false, // IME off; clear any preedit gate
             },
 
-            // Window resized: resize the GL surface, viewport, and relayout PTYs.
+            // Window resized: defer EVERYTHING to the settle (see RESIZE_SETTLE).
             WindowEvent::Resized(size) => {
-                // Do the CHEAP work now (surface, viewport, blur region: ~0.1ms
-                // measured) and DEFER the reflow. `relayout` runs `Term::resize`
-                // per pane, which reflows the grid AND the entire scrollback (10k
-                // lines by default) synchronously on this thread — measured at a
-                // 676ms MEDIAN per event on a milkv with full history. A drag
-                // delivers ~20 configures, so reflowing on each one blocked the
-                // event loop for ~10.6s: the window froze solid, then repainted at
-                // once when the backlog drained. Every intermediate size is
-                // discarded within ~50ms anyway, so ~19 of those 20 reflows were
-                // pure waste. Reflow once, when the size stops changing (see
-                // RESIZE_SETTLE in `about_to_wait`), which is also what keeps the
-                // PTYs from taking 20 SIGWINCHes mid-drag.
+                // Do nothing now -- not even repaint. Two costs hide in a drag, and
+                // both are paid per configure event, ~20 times, for sizes that are
+                // superseded within ~50ms and never looked at:
                 //
-                // Cost of the trade: until it settles, panes draw their OLD grid at
-                // the NEW window size, so text can lag the frame during a drag. That
-                // is the normal look of a resizing terminal, and it resolves on the
-                // settle frame.
-                let t_evt = Instant::now();
-                // glutin needs non-zero dimensions to resize the surface.
-                if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
-                    active.backend.resize_surface(w, h); // resize GL surface
-                }
-                active.backend.resize(size.width as f32, size.height as f32); // viewport
-                let t_surface = t_evt.elapsed();
-                // Keep the blur region covering the whole surface at its new size.
-                if let Some(fx) = &mut active.bg_effect {
-                    fx.on_resize(size.width, size.height);
-                }
-                active.resize_pending = true; // reflow owed; `about_to_wait` pays it once quiet
+                //   relayout: Term::resize per pane = grid AND full scrollback,
+                //             676ms MEDIAN on a milkv with 10k lines of history.
+                //   repaint:  force_full = the ENTIRE window re-shipped as glyph
+                //             commands; on a weak/remote link that is the slow
+                //             operation this whole backend exists to avoid.
+                //
+                // Deferring only the reflow still left the window repainting per
+                // event: ~3s of settling showing 5-12 discarded intermediate
+                // frames. Terminator has always done the obvious thing here --
+                // repaint at the RESTING size -- so do that: record the size,
+                // suspend painting, and pay surface+reflow+one full frame once the
+                // size holds still. While suspended the X window keeps its old
+                // content (newly exposed area shows the background), which is
+                // exactly how Terminator looks mid-drag.
+                //
+                // The surface resize is deferred too: with painting suspended
+                // nothing needs the back buffer to match, and recreating both
+                // pixmaps + clearing a full-window ARGB layer per configure was
+                // itself area-proportional server work, ~20 times a drag.
+                active.surface_pending = Some(size); // painting is suspended while Some
+                active.resize_pending = true; // surface + reflow owed at the settle
                 active.last_resize_at = Instant::now();
                 active.deferred_resizes += 1;
-                active.force_full = true; // whole surface changed: next frame is full
-                active.instr_layer_drawn = false; // layer pixmap was recreated+cleared on resize — redraw it next frame
-                active.window.request_redraw(); // repaint at the new size
                 active.resize_events += 1;
-                log::debug!(
-                    "resize #{} to {}x{}: surface={:.1}ms (reflow deferred)",
-                    active.resize_events, size.width, size.height, t_surface.as_secs_f32() * 1e3,
-                );
+                log::debug!("resize #{} to {}x{}: deferred (painting suspended)",
+                    active.resize_events, size.width, size.height);
             }
 
             // A key was pressed or released.
@@ -1542,12 +1535,21 @@ impl ApplicationHandler for App {
                     && !active.selecting
                 {
                     let bounds = content_bounds(active.window.inner_size());
-                    let want = active
-                        .session
-                        .divider_at(active.mouse.0, active.mouse.1, bounds)
-                        // `horizontal` = the split's axis runs left/right, so the
-                        // divider is vertical and drags along x.
-                        .map(|h| if h.horizontal { CursorIcon::ColResize } else { CursorIcon::RowResize });
+                    // Jacks sit ON the divider, and a press checks `jack_at` FIRST
+                    // (a jack wins over the divider there). The cursor has to agree:
+                    // showing "resize" over a jack advertises the wrong action on a
+                    // small target, which makes the jack hard to trust even though
+                    // the click works. Grab = "you can pull a wire out of this".
+                    let want = if Self::jack_at(active, active.mouse.0, active.mouse.1).is_some() {
+                        Some(CursorIcon::Grab)
+                    } else {
+                        active
+                            .session
+                            .divider_at(active.mouse.0, active.mouse.1, bounds)
+                            // `horizontal` = the split's axis runs left/right, so the
+                            // divider is vertical and drags along x.
+                            .map(|h| if h.horizontal { CursorIcon::ColResize } else { CursorIcon::RowResize })
+                    };
                     if want != active.cursor_icon {
                         active.window.set_cursor(want.unwrap_or(CursorIcon::Default));
                         active.cursor_icon = want;
@@ -1937,7 +1939,19 @@ impl ApplicationHandler for App {
         // drag, ~10.6s of frozen window). Uses the CURRENT size, so every
         // intermediate size collapses into this single reflow.
         if active.resize_pending && now.duration_since(active.last_resize_at) >= RESIZE_SETTLE {
+            // A window resize also owes the surface work, skipped per-event above.
+            // Use the CURRENT size: every intermediate one collapses into this.
             let size = active.window.inner_size();
+            if active.surface_pending.take().is_some() {
+                if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                    active.backend.resize_surface(w, h); // back buffer + instrument layer
+                }
+                active.backend.resize(size.width as f32, size.height as f32); // viewport
+                if let Some(fx) = &mut active.bg_effect {
+                    fx.on_resize(size.width, size.height); // blur region follows the surface
+                }
+                active.instr_layer_drawn = false; // layer pixmap was recreated + cleared
+            }
             let bounds = content_bounds(size);
             let t0 = Instant::now();
             active.session.relayout(bounds); // reflow + push the settled size to the PTYs
@@ -2657,6 +2671,13 @@ impl App {
     /// grid, then outline the focused pane. Finally swap buffers.
     fn redraw(&mut self) {
         let Some(active) = self.active.as_mut() else { return };
+        // A window resize is in flight: the backend surface is still the old size
+        // and every frame drawn now is discarded by the settle frame. Painting
+        // here is what produced the 5-12 visible intermediate steps; skip it and
+        // let the settle repaint once, at the resting size (see Resized).
+        if active.surface_pending.is_some() {
+            return;
+        }
         // Terminal colours (a dark theme): near-black bg, light-grey fg.
         // The background carries the user's opacity in its alpha channel, so a
         // value < 1.0 makes empty areas translucent (the window(s) behind show
