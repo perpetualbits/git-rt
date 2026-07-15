@@ -1,6 +1,7 @@
 # Server-Side Instrument Compositing (Slice 2, item 2) — Design
 
-**Status:** approved design, pre-plan.
+**Status:** built, then CORRECTED in flight — see "Correction: the full-window
+composite premise was wrong" below before trusting any cost claim in this doc.
 
 **Goal:** Bring the animated instruments / patch-bay back on the remote (XRender,
 `ssh -X`) backend and make them cheap enough to be **on by default** — by drawing
@@ -60,6 +61,11 @@ pixels**:
 A full-window composite costs the same as a partial one over the wire (it is
 server-side), so `present()` stays "always full-window" — the invariant that
 fixed the half-drawn-border class of bugs.
+
+> **WRONG — see the correction section at the end of this doc.** True over the
+> wire, but silently generalised to "costs the same". A composite is X-server
+> CPU proportional to the area it covers, paid on every frame including every
+> keystroke. This shipped a typing regression.
 
 No ARGB *window* visual is required; `instr_pix` is an offscreen pixmap whose
 depth/format we choose. Compositing a 32-bit ARGB source `OVER` a 24-bit
@@ -184,3 +190,41 @@ layer is drawn once (first enable / topology change) and held static — no tick
 - **Higher frame rate (10–12 fps) or re-tessellating instruments server-side
   (target "A" remotely).** Re-fights the byte-volume battle Slice 2 just won; 6 fps
   is the honest rate for `ssh -X`.
+
+## Correction: the full-window composite premise was wrong
+
+Shipped with `inst_remote`/`inst_animate` defaulting on, this design made typing
+lag badly on the milkv (riscv64, `ssh -X`) — worse than any prior build. Root
+cause, confirmed by bisect (`inst_remote = false` restored fast typing) and then
+measured directly:
+
+**The claim "a full-window composite costs the same as a partial one" is false.**
+It is true *over the wire* — a `Composite` is a fixed-size request either way,
+and `PutImage` stays 0. It is not true of **X-server CPU**, which is
+proportional to the area composited. `present()` runs on every frame, so an
+unclipped full-window composite is an area-proportional cost **per keystroke**.
+
+Why every gate in this design missed it: the cost is not rt's. rt's CPU is
+identical with the layer on or off, so client-side profiling, the xtrace byte
+counts, and the `PutImage == 0` invariant all look clean. Measured on the X
+server instead (1180×780 window, ~30 keystrokes): **110ms** of server CPU with
+instruments on vs **50ms** off, scaling with window area — so a large real
+window is considerably worse.
+
+The 6fps tick was never the problem; it is bounded and correct.
+
+**Fix** (`fb3e6d6`): the full-window `CopyArea` already restores content
+everywhere, so the composite only needs to re-apply instruments where they
+actually are. `XRenderBackend` records each instrument primitive's extent as the
+layer is drawn and installs the union as `win_pic`'s clip region; the per-tick
+clear is bounded the same way. Re-measured: instrument overhead above the
+instruments-off baseline fell from **+120%** to **0–30%** (within noise).
+
+**Defaults stay OFF** pending a feel-test on the real link. The mechanism is
+opt-in via `inst_remote = true`.
+
+**Gate this design should have had:** every correctness/perf gate here measures
+rt or the wire. For a backend whose whole job is to make the *server* draw, at
+least one gate must measure the **server's** CPU. Sampling `/proc/<Xorg>/stat`
+across a scripted keystroke burst is enough, and would have caught this before
+it ever reached a feel-test.
