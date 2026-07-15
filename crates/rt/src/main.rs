@@ -300,6 +300,8 @@ struct Active {
     resize_events: u64,                   // how many Resized events this session has paid for (diagnostics)
     cursor_icon: Option<CursorIcon>,      // shape currently set (None = default); avoids a round trip per motion
     surface_pending: Option<winit::dpi::PhysicalSize<u32>>, // window resized; surface owed and PAINTING SUSPENDED until the settle
+    bcast_phase: f32,                     // broadcast swatch pulse phase (0..1), advanced while broadcasting
+    last_bcast_tick: Instant,             // when the pulse last advanced
     resize_pending: bool,                 // a Resized arrived; the reflow waits for the drag to settle
     last_resize_at: Instant,              // when the most recent Resized arrived (drives the settle)
     deferred_resizes: u64,                // Resized events coalesced into the pending reflow (diagnostics)
@@ -989,6 +991,8 @@ impl ApplicationHandler for App {
             resize_events: 0,
             cursor_icon: None,
             surface_pending: None,
+            bcast_phase: 0.0,
+            last_bcast_tick: Instant::now(),
             resize_pending: false,
             last_resize_at: Instant::now(),
             deferred_resizes: 0,
@@ -1959,6 +1963,20 @@ impl ApplicationHandler for App {
             active.force_full = true; // grid changed under us: repaint the lot
             dirty = true;
         }
+        // Broadcast pulse: while input is fanned out to more than the focused
+        // pane, the receiving panes' swatches throb so an armed broadcast is hard
+        // to miss. Bounded at BCAST_PULSE_TICK, and the frame builder damages ONLY
+        // the swatches (see swatch_rect), so this rides the scissored path — a few
+        // 13x13px redraws per tick, not a whole-window repaint.
+        let broadcasting = !matches!(active.session.broadcast(), Broadcast::Off);
+        if broadcasting {
+            let dt = now.duration_since(active.last_bcast_tick);
+            if dt >= BCAST_PULSE_TICK {
+                active.last_bcast_tick = now;
+                active.bcast_phase = (active.bcast_phase + dt.as_secs_f32() * BCAST_PULSE_HZ).fract();
+                dirty = true;
+            }
+        }
         // Animated chrome: wire packets, the CPU-heat / output-flow border
         // instruments, and the latency flare. Keep calling the samplers (they
         // update state every tick), but collect whether anything WANTS to animate
@@ -2038,6 +2056,8 @@ impl ApplicationHandler for App {
         // remembered so the next tick judges latency against it (see the budget).
         let interval = if Instant::now() < active.active_until {
             ACTIVE_POLL
+        } else if broadcasting {
+            BCAST_PULSE_TICK // keep the broadcast swatches throbbing
         } else if active.resize_pending {
             // A deferred reflow must not wait on IDLE_POLL: guarantee a wake-up
             // to settle it even if nothing else asks for one.
@@ -2765,6 +2785,31 @@ impl App {
                 }
             }
         }
+        // The broadcast swatch pulses (see BCAST_PULSE_TICK), and chrome carries
+        // no engine cell-damage — so without this the pulse would either not
+        // repaint at all or need mark_full(), i.e. the whole window several times
+        // a second. Damage exactly the swatches instead: a handful of ~13x13px
+        // rects, so the tick costs a scissored redraw of the swatches alone.
+        // `receives_broadcast` is `feed_input`'s own rule, and `swatch_rect` is
+        // the same geometry `draw_panes` paints — neither can drift from what
+        // actually appears.
+        if !active.damage.is_full() && !matches!(active.session.broadcast(), Broadcast::Off) {
+            let bar_h = active.session.titlebar_h();
+            if bar_h > 0.0 {
+                for (id, (rect, _)) in &snapshots {
+                    if !active.session.receives_broadcast(*id) {
+                        continue; // not armed: its swatch is static
+                    }
+                    let (sx, sy, s) = swatch_rect(*rect, bar_h, ch as f32);
+                    active.damage.add_rect(crate::damage::PxRect {
+                        x: sx.floor() as i32,
+                        y: sy.floor() as i32,
+                        w: s.ceil() as i32 + 1, // round outward: never clip the swatch
+                        h: s.ceil() as i32 + 1,
+                    });
+                }
+            }
+        }
 
         let frame_damage = active.damage.finish();
         // Fold in recent frames' damage per the back-buffer age, and decide.
@@ -3005,7 +3050,7 @@ impl App {
                 active.backend.fill_rect(full.x, full.y, full.w, bar_h, bar_bg);
                 active.backend.fill_rect(full.x, full.y + bar_h - 1.0, full.w, 1.0, sep);
                 let text_col = if focused { Color::rgb(fg[0], fg[1], fg[2]) } else { mix(fg, bg, 0.40) };
-                let pad = 6.0; // horizontal inset inside the strip
+                let pad = TITLEBAR_PAD; // horizontal inset inside the strip
                 let text_top = full.y + (bar_h - cell_h) * 0.5; // vertically centre the glyph line
                 let mut left_x = full.x + pad; // running left cursor (px)
                 // Group swatch, if this pane is in an input group.
@@ -3028,9 +3073,18 @@ impl App {
                     (None, false) => None,
                 };
                 if let Some(col) = swatch {
-                    let s = cell_h * 0.6; // swatch side length
-                    active.backend.fill_rect(left_x, full.y + (bar_h - s) * 0.5, s, s, col);
-                    left_x += s + 5.0; // leave a gap before the title
+                    let (sx, sy, s) = swatch_rect(full, bar_h, cell_h);
+                    // Pulse only while this pane is actually armed to receive: a
+                    // static group swatch must stay still, or every grouped pane
+                    // would throb whether broadcasting or not.
+                    let col = if receiving {
+                        let t = (active.bcast_phase * std::f32::consts::TAU).sin() * 0.5 + 0.5; // 0..1
+                        dim(col, 0.45 + 0.55 * t)
+                    } else {
+                        col
+                    };
+                    active.backend.fill_rect(sx, sy, s, s, col);
+                    left_x = sx + s + 5.0; // leave a gap before the title
                 }
                 // Size text ("COLSxROWS") pinned to the right edge.
                 let cols = (rect.w / cell_w).max(0.0) as usize; // content columns
@@ -4069,6 +4123,33 @@ fn blackbody(kelvin: f32) -> (f32, f32, f32) {
 /// the edge-living features — heat border, patch-bay jacks, latency frame, and
 /// the outermost text cells — have room and aren't clipped by the window edge.
 const WINDOW_MARGIN: f32 = 8.0;
+
+/// Horizontal inset of the titlebar strip's contents.
+const TITLEBAR_PAD: f32 = 6.0;
+
+/// How often the broadcast swatch re-paints while it pulses, and how fast it
+/// cycles. 5fps is plenty for a "this is armed" throb and bounds the cost.
+const BCAST_PULSE_TICK: Duration = Duration::from_millis(200);
+const BCAST_PULSE_HZ: f32 = 0.7; // cycles per second
+
+/// The group/broadcast swatch's rect in a pane's titlebar, in window pixels.
+///
+/// Shared on purpose. `draw_panes` paints it; the frame builder DAMAGES it while
+/// it pulses. Chrome carries no engine cell-damage, so the only other way to
+/// animate it is `mark_full()` — a whole-window repaint several times a second,
+/// which is the exact cost this backend exists to avoid (a full frame is ~250ms
+/// on a milkv over ssh -X). Damaging precisely what changes keeps the pulse on
+/// the scissored path: a ~13x13px redraw instead of the screen. The two callers
+/// must agree to the pixel, so they share this rather than copying it.
+fn swatch_rect(full: Rect, bar_h: f32, cell_h: f32) -> (f32, f32, f32) {
+    let s = cell_h * 0.6; // swatch side length
+    (full.x + TITLEBAR_PAD, full.y + (bar_h - s) * 0.5, s)
+}
+
+/// Scale a colour's brightness (alpha untouched) — the broadcast pulse.
+fn dim(c: Color, k: f32) -> Color {
+    Color(c.0 * k, c.1 * k, c.2 * k, c.3)
+}
 
 /// Fast wake interval while animating or interacting (~60fps).
 const ACTIVE_POLL: Duration = Duration::from_millis(16);
