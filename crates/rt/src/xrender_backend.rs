@@ -378,11 +378,35 @@ impl XRenderBackend {
     }
 
     fn fill(&self, x: f32, y: f32, w: f32, h: f32, c: Color) {
-        // Respect the damage clip: skip fills that don't touch it.
+        // TRIM to the damage clip — do not merely skip fills that miss it.
+        //
+        // Rejecting-but-not-trimming was a real bug: a fill that so much as
+        // touched the scissor was issued at FULL size, painting over pixels
+        // outside the damaged region. Nothing redraws those (that is the whole
+        // point of scissoring), so they were destroyed. It ate pane titles: a
+        // frame scissored to the right end of a titlebar (where the `buf` meter
+        // lives) repainted the WHOLE titlebar background, while the title's own
+        // character cells — outside the clip — were rejected by `draw_char` and
+        // never redrawn. Hence "the title disappears, sometimes one character at
+        // a time": `fill` clobbers by whole rects, `draw_char` restores by cells.
+        //
+        // Same family as the half-drawn borders that made `present()` full-window.
+        // That fix made the WINDOW show the whole back buffer; it could not help
+        // when the back buffer itself had been overwritten. This is the other half.
+        let (mut x, mut y, mut w, mut h) = (x, y, w, h);
         if let Some(b) = self.clip {
             if !rect_intersects(x, y, w, h, b) {
-                return;
+                return; // wholly outside: nothing to do
             }
+            let (x0, y0) = (x.max(b.x as f32), y.max(b.y as f32));
+            let (x1, y1) = ((x + w).min(b.right() as f32), (y + h).min(b.bottom() as f32));
+            if x1 <= x0 || y1 <= y0 {
+                return; // degenerate after trimming
+            }
+            x = x0;
+            y = y0;
+            w = x1 - x0;
+            h = y1 - y0;
         }
         let rect = xproto::Rectangle { x: x as i16, y: y as i16, width: w.max(0.0) as u16, height: h.max(0.0) as u16 };
         if self.drawing_instruments {
@@ -836,6 +860,56 @@ impl Drop for XRenderBackend {
         let _ = render::free_picture(&self.conn, self.instr_pic);
         let _ = xproto::free_pixmap(&self.conn, self.instr_pixmap);
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod fill_clip_tests {
+    use super::*;
+
+    /// `fill` trims to the clip; this is the pure geometry it trims with.
+    /// Kept honest against the real thing by mirroring its arithmetic exactly.
+    fn trim(x: f32, y: f32, w: f32, h: f32, b: PxRect) -> Option<(f32, f32, f32, f32)> {
+        if !rect_intersects(x, y, w, h, b) {
+            return None;
+        }
+        let (x0, y0) = (x.max(b.x as f32), y.max(b.y as f32));
+        let (x1, y1) = ((x + w).min(b.right() as f32), (y + h).min(b.bottom() as f32));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// THE bug: a titlebar-wide background fill, on a frame scissored to the far
+    /// RIGHT of that titlebar (where the `buf` meter changes), must not repaint
+    /// the left end — the title's glyphs live there, `draw_char` rejects them as
+    /// outside the clip, and nothing else would ever restore them.
+    #[test]
+    fn fill_does_not_paint_outside_the_clip() {
+        // titlebar background: full pane width, 25px tall, at y=303
+        let (x, y, w, h) = (8.0, 303.0, 944.0, 25.0);
+        // frame scissored to the meter at the right end only
+        let clip = PxRect { x: 700, y: 303, w: 244, h: 25 };
+        let (tx, ty, tw, th) = trim(x, y, w, h, clip).expect("touches the clip");
+        assert_eq!(tx, 700.0, "fill must start at the clip, not at the rect's own x");
+        assert!(tx + tw <= 944.0 + 8.0);
+        assert_eq!((ty, th), (303.0, 25.0), "vertically inside the clip already");
+        // The title's glyph cells (x=14..270) must be untouched by this fill.
+        assert!(tx >= 270.0, "the fill reached the title glyphs and would erase them");
+    }
+
+    #[test]
+    fn fill_is_unchanged_when_wholly_inside_the_clip() {
+        let clip = PxRect { x: 0, y: 0, w: 900, h: 700 };
+        assert_eq!(trim(10.0, 20.0, 30.0, 40.0, clip), Some((10.0, 20.0, 30.0, 40.0)));
+    }
+
+    #[test]
+    fn fill_outside_the_clip_is_dropped() {
+        let clip = PxRect { x: 700, y: 303, w: 244, h: 25 };
+        assert_eq!(trim(8.0, 10.0, 100.0, 20.0, clip), None, "wholly above the clip");
+        assert_eq!(trim(8.0, 303.0, 100.0, 25.0, clip), None, "wholly left of the clip");
     }
 }
 
