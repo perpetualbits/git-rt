@@ -195,11 +195,26 @@ in this document says the board was fine.
   reflowing off-screen scrollback, down in `Term::resize`.
 - **Panes overlap while shrinking**: during a drag panes draw their old, larger
   grid into a smaller rect, and nothing clips a pane's draw to its own rect.
-- **An unexplained frame artifact** ("orange rectangle"): measured at
-  `(0, 0, W-16, H-16)` while `content_bounds` is `(8, 8, W-16, H-16)` — the right
-  size at the wrong origin. A controlled capture shows the latency frame
-  correctly at (8,8), so this is likely a ghost of an earlier draw, but it is not
-  reproduced and not explained.
+- ~~An unexplained frame artifact ("orange rectangle")~~ **SOLVED — and worth
+  keeping as a cautionary tale.** It was the *broadcast indicator*, a deliberate
+  feature (ctrl-shift-g, then broadcast to group/all), drawn at
+  `(0, 0, bounds.w, bounds.h)` — the content SIZE at the WINDOW origin, ignoring
+  `bounds.x/y`. Pixel-measured at `(0,0,W-15,H-15)` against a content rect of
+  `(8,8,W-16,H-16)`, and the sampled `rgb(217,144,74)` was exactly the code's
+  `0xd9904a`.
+
+  The measurement was right and the *conclusion* was wrong: it read as a ghost of
+  an earlier draw, because the one hypothesis never considered was "this is a
+  feature working as coded". Controlled captures never showed it for a reason
+  nobody thought to check — no group had been created — and "it survives on
+  Wayland too" (the user's observation) falsified the whole XRender theory in one
+  line. **When an artifact is stable, positioned, and coloured, suspect intent
+  before corruption; and when a repro doesn't reproduce, ask what the reporter's
+  session has that the harness doesn't** — the same blind spot as the empty-pane
+  reflow, twice in one session.
+
+  Fixed by replacing it rather than repairing it: receiving panes now mark
+  themselves in their own titlebar, from the same rule `feed_input` fans out on.
 - **A single unreproduced input freeze**: after making tabs, typing was accepted
   nowhere — not even in other windows — and the queued text appeared in the
   launching terminal only once rt was closed. Suspected: rt saturating Xwayland
