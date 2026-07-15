@@ -533,6 +533,26 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
         }
     }
 
+    /// Would a keystroke reach pane `id` right now?
+    ///
+    /// Mirrors [`Session::feed_input`]'s fan-out exactly, and exists so the UI
+    /// cannot drift from it: an indicator that says "your typing goes here" must
+    /// be derived from the same rule that decides where typing goes, not from a
+    /// second copy of it. Broadcast is a mode where a keystroke hits several
+    /// shells at once, so a wrong indicator is worse than none.
+    pub fn receives_broadcast(&self, id: PaneId) -> bool {
+        match self.broadcast {
+            Broadcast::Off => id == self.focus,
+            Broadcast::All => true,
+            Broadcast::Group => match self.groups.get(&self.focus).copied() {
+                // Focus is grouped: everyone sharing its group.
+                Some(g) => self.groups.get(&id).copied() == Some(g),
+                // Focus is ungrouped: "just me".
+                None => id == self.focus,
+            },
+        }
+    }
+
     /// Assign the focused pane to `group` (a small integer group id). Used to
     /// build broadcast groups; a future GUI exposes this via the group menu.
     pub fn set_group(&mut self, group: u32) {

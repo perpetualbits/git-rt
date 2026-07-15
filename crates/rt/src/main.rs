@@ -3009,9 +3009,27 @@ impl App {
                 let text_top = full.y + (bar_h - cell_h) * 0.5; // vertically centre the glyph line
                 let mut left_x = full.x + pad; // running left cursor (px)
                 // Group swatch, if this pane is in an input group.
-                if let Some(g) = active.session.group_of(id) {
+                // Group swatch — and, while broadcasting, the warning that THIS
+                // pane is one of the shells your keystrokes will hit. Broadcast is
+                // a mode where one keypress lands in several shells at once, so
+                // the panes that receive it say so themselves; that is more use
+                // than a border round the window, which said only "some kind of
+                // broadcast is on" and (per the note above) said it in the wrong
+                // place. Ungrouped panes get a swatch too under Broadcast::All —
+                // they receive, so they must show it. `receives_broadcast` is the
+                // same rule `feed_input` fans out on, so this cannot drift from
+                // where the keystrokes really go.
+                let bcast = active.session.broadcast();
+                let receiving = !matches!(bcast, Broadcast::Off) && active.session.receives_broadcast(id);
+                let swatch = match (active.session.group_of(id), receiving) {
+                    (_, true) if matches!(bcast, Broadcast::All) => Some(Color::rgb(0xd9, 0x4a, 0x4a)), // red: ALL panes
+                    (_, true) => Some(Color::rgb(0xd9, 0x90, 0x4a)), // orange: this group
+                    (Some(g), false) => Some(group_hue(g)),          // not receiving: plain group hue
+                    (None, false) => None,
+                };
+                if let Some(col) = swatch {
                     let s = cell_h * 0.6; // swatch side length
-                    active.backend.fill_rect(left_x, full.y + (bar_h - s) * 0.5, s, s, group_hue(g));
+                    active.backend.fill_rect(left_x, full.y + (bar_h - s) * 0.5, s, s, col);
                     left_x += s + 5.0; // leave a gap before the title
                 }
                 // Size text ("COLSxROWS") pinned to the right edge.
@@ -3127,25 +3145,13 @@ impl App {
             }
         }
 
-        // Broadcast indicator: when typed input is being fanned out to more than
-        // the focused pane, draw a bold coloured border around the whole window
-        // (red = all panes, orange = group) so it's never a surprise.
-        match active.session.broadcast() {
-            Broadcast::Off => {}
-            mode => {
-                let col = if matches!(mode, Broadcast::All) {
-                    Color::rgb(0xd9, 0x4a, 0x4a) // red: broadcasting to ALL panes
-                } else {
-                    Color::rgb(0xd9, 0x90, 0x4a) // orange: broadcasting to the group
-                };
-                let t = 3.0; // border thickness
-                let (w, h) = (bounds.w, bounds.h);
-                active.backend.fill_rect(0.0, 0.0, w, t, col); // top
-                active.backend.fill_rect(0.0, h - t, w, t, col); // bottom
-                active.backend.fill_rect(0.0, 0.0, t, h, col); // left
-                active.backend.fill_rect(w - t, 0.0, t, h, col); // right
-            }
-        }
+        // (The broadcast indicator used to be a bold coloured border around the
+        // whole window here. It was drawn at (0, 0, bounds.w, bounds.h) — the
+        // content SIZE at the WINDOW origin, ignoring bounds.x/y — so it sat one
+        // WINDOW_MARGIN up-and-left of where it belonged, hugging the top/left
+        // edges while inset at the right/bottom. It is now a per-pane titlebar
+        // swatch: see `draw_panes`, which marks the panes that actually receive
+        // the input rather than ringing the window.)
 
         // Visible bell: a brief yellow/black hazard stripe on the border of just
         // the pane that rang — never a whole-window flash.
