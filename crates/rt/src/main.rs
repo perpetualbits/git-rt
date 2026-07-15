@@ -298,6 +298,9 @@ struct Active {
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
     last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
     resize_events: u64,                   // how many Resized events this session has paid for (diagnostics)
+    resize_pending: bool,                 // a Resized arrived; the reflow waits for the drag to settle
+    last_resize_at: Instant,              // when the most recent Resized arrived (drives the settle)
+    deferred_resizes: u64,                // Resized events coalesced into the pending reflow (diagnostics)
     instr_tick: bool,                     // redraw the instrument layer this frame (6fps, native path)
     last_instr_tick: Instant,             // when the instrument layer was last redrawn
     instr_layer_drawn: bool,              // the instrument layer has been drawn at least once since last shown
@@ -982,6 +985,9 @@ impl ApplicationHandler for App {
             force_full: true, // first frame is always a full redraw
             last_focus: init_focus,
             resize_events: 0,
+            resize_pending: false,
+            last_resize_at: Instant::now(),
+            deferred_resizes: 0,
             instr_tick: false,
             last_instr_tick: Instant::now(),
             instr_layer_drawn: false,
@@ -1431,14 +1437,23 @@ impl ApplicationHandler for App {
 
             // Window resized: resize the GL surface, viewport, and relayout PTYs.
             WindowEvent::Resized(size) => {
-                // Timing breakdown, reported under `RUST_LOG=rt=info`. An
-                // interactive edge-drag on a real WM has been seen to stall rt's
-                // whole window for 5-10s and then repaint at once; that is not
-                // reproducible headless (no WM, no compositor), so the resize path
-                // reports its own costs and lets the affected session say where the
-                // time goes. `relayout` is the prime suspect: it runs
-                // `Term::resize` per pane, which reflows the grid AND the whole
-                // scrollback (10k lines by default).
+                // Do the CHEAP work now (surface, viewport, blur region: ~0.1ms
+                // measured) and DEFER the reflow. `relayout` runs `Term::resize`
+                // per pane, which reflows the grid AND the entire scrollback (10k
+                // lines by default) synchronously on this thread — measured at a
+                // 676ms MEDIAN per event on a milkv with full history. A drag
+                // delivers ~20 configures, so reflowing on each one blocked the
+                // event loop for ~10.6s: the window froze solid, then repainted at
+                // once when the backlog drained. Every intermediate size is
+                // discarded within ~50ms anyway, so ~19 of those 20 reflows were
+                // pure waste. Reflow once, when the size stops changing (see
+                // RESIZE_SETTLE in `about_to_wait`), which is also what keeps the
+                // PTYs from taking 20 SIGWINCHes mid-drag.
+                //
+                // Cost of the trade: until it settles, panes draw their OLD grid at
+                // the NEW window size, so text can lag the frame during a drag. That
+                // is the normal look of a resizing terminal, and it resolves on the
+                // settle frame.
                 let t_evt = Instant::now();
                 // glutin needs non-zero dimensions to resize the surface.
                 if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
@@ -1450,24 +1465,16 @@ impl ApplicationHandler for App {
                 if let Some(fx) = &mut active.bg_effect {
                     fx.on_resize(size.width, size.height);
                 }
-                let t_fx = t_evt.elapsed() - t_surface;
-                // Recompute pane sizes from the new window bounds.
-                let bounds = content_bounds(size);
-                let t_relayout0 = Instant::now();
-                active.session.relayout(bounds); // push new sizes to PTYs
-                let t_relayout = t_relayout0.elapsed();
+                active.resize_pending = true; // reflow owed; `about_to_wait` pays it once quiet
+                active.last_resize_at = Instant::now();
+                active.deferred_resizes += 1;
                 active.force_full = true; // whole surface changed: next frame is full
                 active.instr_layer_drawn = false; // layer pixmap was recreated+cleared on resize — redraw it next frame
                 active.window.request_redraw(); // repaint at the new size
-                // Count resize events too: a drag delivers a stream of them, and
-                // each one pays the full cost above.
                 active.resize_events += 1;
-                let total = t_evt.elapsed();
-                log::info!(
-                    "resize #{} to {}x{}: surface={:.1}ms fx={:.1}ms relayout={:.1}ms total={:.1}ms",
-                    active.resize_events, size.width, size.height,
-                    t_surface.as_secs_f32() * 1e3, t_fx.as_secs_f32() * 1e3,
-                    t_relayout.as_secs_f32() * 1e3, total.as_secs_f32() * 1e3,
+                log::debug!(
+                    "resize #{} to {}x{}: surface={:.1}ms (reflow deferred)",
+                    active.resize_events, size.width, size.height, t_surface.as_secs_f32() * 1e3,
                 );
             }
 
@@ -1891,6 +1898,26 @@ impl ApplicationHandler for App {
                 active.wiring_from = None;
             }
         }
+        // A resize drag owes us exactly one reflow. Pay it once the size has held
+        // still for RESIZE_SETTLE — never per configure event (see the Resized
+        // handler for the measurements: 676ms median per reflow, ~20 events per
+        // drag, ~10.6s of frozen window). Uses the CURRENT size, so every
+        // intermediate size collapses into this single reflow.
+        if active.resize_pending && now.duration_since(active.last_resize_at) >= RESIZE_SETTLE {
+            let size = active.window.inner_size();
+            let bounds = content_bounds(size);
+            let t0 = Instant::now();
+            active.session.relayout(bounds); // reflow + push the settled size to the PTYs
+            let took = t0.elapsed();
+            log::info!(
+                "resize settled at {}x{}: relayout={:.1}ms, {} event(s) coalesced into 1 reflow",
+                size.width, size.height, took.as_secs_f32() * 1e3, active.deferred_resizes,
+            );
+            active.resize_pending = false;
+            active.deferred_resizes = 0;
+            active.force_full = true; // grid changed under us: repaint the lot
+            dirty = true;
+        }
         // Animated chrome: wire packets, the CPU-heat / output-flow border
         // instruments, and the latency flare. Keep calling the samplers (they
         // update state every tick), but collect whether anything WANTS to animate
@@ -1970,6 +1997,10 @@ impl ApplicationHandler for App {
         // remembered so the next tick judges latency against it (see the budget).
         let interval = if Instant::now() < active.active_until {
             ACTIVE_POLL
+        } else if active.resize_pending {
+            // A deferred reflow must not wait on IDLE_POLL: guarantee a wake-up
+            // to settle it even if nothing else asks for one.
+            RESIZE_SETTLE
         } else if blinking {
             BLINK_POLL
         } else if instruments_animating {
@@ -3935,6 +3966,19 @@ const WINDOW_MARGIN: f32 = 8.0;
 const ACTIVE_POLL: Duration = Duration::from_millis(16);
 /// Remote instrument layer redraw cadence: 6fps, decoupled from content frames.
 const INSTRUMENT_TICK: Duration = Duration::from_millis(166);
+
+/// How long the window size must hold still before the panes reflow.
+///
+/// A reflow is `Term::resize` per pane — the grid AND the whole scrollback (10k
+/// lines by default) — and it blocks the event loop: measured at a 676ms median
+/// per event on a milkv (riscv64) with full history. A drag delivers ~20
+/// configures; paying it on each froze the window for ~10.6s and then repainted
+/// everything at once. Every intermediate size is superseded within ~50ms, so
+/// only the final one is worth reflowing.
+///
+/// Long enough to swallow a drag's configure stream (~50ms apart), short enough
+/// that a single resize doesn't feel deferred.
+const RESIZE_SETTLE: Duration = Duration::from_millis(120);
 /// Idle wake interval: when nothing is happening we still wake this often to
 /// notice async PTY output and heat changes, but at ~10Hz instead of 60 — a
 /// fraction of the cost, still prompt enough that output appears without lag.
