@@ -50,7 +50,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use render::{Color, Renderer};
 use rt_config::Keymap;
@@ -298,6 +298,7 @@ struct Active {
     force_full: bool,                     // next frame must be a full redraw (scroll/resize/overlay/selection/etc.)
     last_focus: rt_core::PaneId,          // focused pane at the last paint; a change moves the focus border (not cell-damage) → force full
     resize_events: u64,                   // how many Resized events this session has paid for (diagnostics)
+    cursor_icon: Option<CursorIcon>,      // shape currently set (None = default); avoids a round trip per motion
     resize_pending: bool,                 // a Resized arrived; the reflow waits for the drag to settle
     last_resize_at: Instant,              // when the most recent Resized arrived (drives the settle)
     deferred_resizes: u64,                // Resized events coalesced into the pending reflow (diagnostics)
@@ -985,6 +986,7 @@ impl ApplicationHandler for App {
             force_full: true, // first frame is always a full redraw
             last_focus: init_focus,
             resize_events: 0,
+            cursor_icon: None,
             resize_pending: false,
             last_resize_at: Instant::now(),
             deferred_resizes: 0,
@@ -1529,6 +1531,28 @@ impl ApplicationHandler for App {
             // Track the cursor; when a menu is open, update its hover highlight.
             WindowEvent::CursorMoved { position, .. } => {
                 active.mouse = (position.x as f32, position.y as f32); // physical px
+                // A divider should say it can be dragged. Only while nothing else
+                // owns the pointer, and only re-issued when the shape actually
+                // changes — set_cursor is an X round trip, and motion events
+                // arrive at pointer-sample rate.
+                if active.dragging_divider.is_none()
+                    && active.scroll_drag.is_none()
+                    && active.mouse_report.is_none()
+                    && active.wiring_from.is_none()
+                    && !active.selecting
+                {
+                    let bounds = content_bounds(active.window.inner_size());
+                    let want = active
+                        .session
+                        .divider_at(active.mouse.0, active.mouse.1, bounds)
+                        // `horizontal` = the split's axis runs left/right, so the
+                        // divider is vertical and drags along x.
+                        .map(|h| if h.horizontal { CursorIcon::ColResize } else { CursorIcon::RowResize });
+                    if want != active.cursor_icon {
+                        active.window.set_cursor(want.unwrap_or(CursorIcon::Default));
+                        active.cursor_icon = want;
+                    }
+                }
                 if active.scroll_drag.is_some() {
                     // Dragging the scrollbar thumb: scroll to track the pointer.
                     Self::apply_scroll_drag(active, active.mouse.1);
@@ -1549,7 +1573,16 @@ impl ApplicationHandler for App {
                     // axis into a first-child ratio.
                     let axis = if handle.horizontal { active.mouse.0 } else { active.mouse.1 };
                     let ratio = ((axis - handle.start) / handle.len).clamp(0.05, 0.95);
-                    active.session.set_split_ratio(&handle, ratio);
+                    // Move the split now, reflow when the drag settles. Reflowing
+                    // per motion event cost ~676ms EACH on a milkv with full
+                    // scrollback, so the divider crawled in ~1s steps. The divider
+                    // itself still tracks the pointer live (pane rects come from
+                    // the tree); only the cell grids wait for the settle. Same
+                    // mechanism as WindowEvent::Resized — see RESIZE_SETTLE.
+                    active.session.set_split_ratio_no_reflow(&handle, ratio);
+                    active.resize_pending = true; // reflow owed once the drag stops
+                    active.last_resize_at = Instant::now();
+                    active.deferred_resizes += 1;
                     active.force_full = true; // layout changed: repaint the whole window
                     active.window.request_redraw();
                 } else if active.selecting {

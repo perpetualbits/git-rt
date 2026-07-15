@@ -327,6 +327,21 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
         self.relayout(self.bounds);
     }
 
+    /// Move a split WITHOUT reflowing the panes — the caller owes a later
+    /// [`Session::relayout`].
+    ///
+    /// For dragging a divider. [`Session::set_split_ratio`] relayouts, and
+    /// `relayout` is `Term::resize` per pane, which reflows the grid AND the
+    /// whole scrollback (10k lines by default): measured at ~676ms per call on a
+    /// milkv (riscv64) with full history. A drag fires one motion event per
+    /// pointer sample, so paying it per event made the divider move in ~1s steps.
+    /// The tree update alone is cheap, and pane RECTS come from the tree, so the
+    /// divider still tracks the pointer live; only the cell grids lag until the
+    /// caller reflows once the drag settles (see rt's `RESIZE_SETTLE`).
+    pub fn set_split_ratio_no_reflow(&mut self, handle: &rt_core::DragHandle, ratio: f32) {
+        self.tree.set_split_ratio(&handle.path, ratio);
+    }
+
     /// Select the tab whose first pane is `first_pane` (from a clicked
     /// [`TabBar`] tab), move focus into it, and reflow. Returns `true` if the
     /// tab was found. This is what a click on a tab label calls.
