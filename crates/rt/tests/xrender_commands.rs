@@ -17,9 +17,12 @@
 #![cfg(feature = "x11")]
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+mod common;
+use common::{free_display_name, have, start_xvfb_scan, wait_for_trace, x_test_lock};
 
 /// Write a private `$XDG_CONFIG_HOME/rt/config.toml` pinning `inst_remote =
 /// false`, so this guard measures CONTENT geometry only (CompositeGlyphs/
@@ -37,55 +40,19 @@ fn write_no_instruments_config(tag: &str) -> PathBuf {
     base
 }
 
-/// True if `prog` is runnable (resolves on PATH / is executable).
-fn have(prog: &str) -> bool {
-    Command::new(prog)
-        .arg("--help")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|_| true)
-        .unwrap_or(false)
-}
-
-/// Spawn `Xvfb :disp` and wait until its unix socket appears (up to ~3 s).
-/// Returns the owned child so the caller kills exactly this PID.
-fn start_xvfb(disp: u32) -> Option<Child> {
-    let child = Command::new("Xvfb")
-        .arg(format!(":{disp}"))
-        .args(["-screen", "0", "800x600x24", "-nolisten", "tcp"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let sock = format!("/tmp/.X11-unix/X{disp}");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if Path::new(&sock).exists() {
-            return Some(child);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // never came up — kill the one we started and give up
-    let mut c = child;
-    let _ = c.kill();
-    let _ = c.wait();
-    None
-}
-
 #[test]
 #[ignore = "needs Xvfb + xtrace; run with --ignored"]
 fn xrender_emits_commands_not_pixels() {
+    let _serial = x_test_lock(); // Xvfb+rt is heavy: never run these concurrently
     if !have("Xvfb") || !have("xtrace") {
         eprintln!("SKIP xrender_commands: needs both `Xvfb` and `xtrace` on PATH");
         return;
     }
 
-    // A display number unlikely to collide with a desktop or a parallel test.
-    let disp: u32 = 71 + (std::process::id() % 20);
-    let Some(mut xvfb) = start_xvfb(disp) else {
-        eprintln!("SKIP xrender_commands: Xvfb :{disp} did not come up");
-        return;
+    // Scan for a display Xvfb will actually serve: fixed guesses collide with
+    // the socket/lock litter that killed runs leave behind.
+    let Some((disp, mut xvfb)) = start_xvfb_scan(71) else {
+        panic!("no Xvfb came up at or after :71");
     };
 
     // Give rt a shell that prints known text then idles, so the very first XRender
@@ -97,7 +64,7 @@ fn xrender_emits_commands_not_pixels() {
         // Print known text, then idle well past rt's startup + first-render time
         // (llvmpipe cold start + GL context + XRender init is ~1.5 s), so the traced
         // frame always contains real glyph runs before `timeout` stops rt.
-        f.write_all(b"#!/bin/sh\nprintf 'hello world\\n'; printf 'second line\\n'; sleep 5\n")
+        f.write_all(b"#!/bin/sh\nprintf 'hello world\\n'; printf 'second line\\n'; sleep 120\n")
             .unwrap();
     }
     #[cfg(unix)]
@@ -114,14 +81,20 @@ fn xrender_emits_commands_not_pixels() {
     // (`-D :fake`) whose DISPLAY it hands the child, and dumps every request the
     // child sends. `-n` skips xauth copying (Xvfb here runs without auth). We bound
     // rt with `timeout` so it exits on its own; xtrace exits when the child does.
-    let fake = disp + 50;
-    let status = Command::new("xtrace")
+    // xtrace binds this proxy display itself, so it needs an unclaimed name.
+    let fake = free_display_name(disp + 1).expect("no free proxy display");
+    // No fixed `timeout` on rt: wait for it to actually paint, then stop it.
+    // A hard bound here was calibrated to a ~1.5s idle cold start; a debug build
+    // (which is what `cargo test` runs) under load takes ~3.5s, so rt was killed
+    // before drawing and the trace held only glyph uploads — making
+    // `CompositeGlyphs == 0` and, worse, `PutImage == 0` pass vacuously.
+    let mut child = Command::new("xtrace")
         .arg("-n")
         .args(["-d", &format!(":{disp}")])
         .args(["-D", &format!(":{fake}")])
         .args(["-o", trace.to_str().unwrap(), "--"])
         .arg("timeout")
-        .arg("3") // > rt's cold-start + first-render, < the shell's 5 s idle
+        .arg("60") // backstop only; we stop this child ourselves below
         .arg(rt_bin)
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
@@ -131,7 +104,15 @@ fn xrender_emits_commands_not_pixels() {
         .env("XDG_CONFIG_HOME", &cfg_home) // a temp dir containing rt/config.toml: "inst_remote = false\n"
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+        .expect("spawn xtrace");
+
+    let drew = wait_for_trace(&trace, "CompositeGlyphs", Duration::from_secs(30)).is_some();
+    if drew {
+        std::thread::sleep(Duration::from_millis(300)); // let a frame or two settle
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 
     // Tear down the Xvfb we own, and the temp shell, regardless of outcome.
     let _ = xvfb.kill();
@@ -139,13 +120,11 @@ fn xrender_emits_commands_not_pixels() {
     let _ = std::fs::remove_file(&shell);
     let _ = std::fs::remove_dir_all(&cfg_home);
 
-    let status = status.expect("run xtrace");
-    // timeout(1) kills rt with SIGTERM → exit 124; that's the normal path here.
-    eprintln!("xtrace/rt exited: {status:?}");
-
     let dump = std::fs::read_to_string(&trace).unwrap_or_default();
     let _ = std::fs::remove_file(&trace);
     assert!(!dump.is_empty(), "xtrace produced no output — did rt connect to :{disp}?");
+    assert!(drew, "rt connected to :{disp} but never rendered text within 30s — \
+                   a zero-count trace would satisfy the PutImage assertion vacuously");
 
     // Count the request kinds that matter. xtrace prints RENDER requests by name
     // (e.g. "RenderCompositeGlyphs32", "RenderFillRectangles") and core pixel blits
@@ -185,17 +164,16 @@ fn xrender_emits_commands_not_pixels() {
 #[test]
 #[ignore = "needs Xvfb + xtrace; run with --ignored"]
 fn xrender_chrome_is_commands_not_pixels() {
+    let _serial = x_test_lock(); // Xvfb+rt is heavy: never run these concurrently
     if !have("Xvfb") || !have("xtrace") {
         eprintln!("SKIP xrender_chrome_is_commands_not_pixels: needs both `Xvfb` and `xtrace` on PATH");
         return;
     }
 
-    // A different display number than the other test, so the two can run
-    // concurrently (or back-to-back with a lingering socket) without colliding.
-    let disp: u32 = 111 + (std::process::id() % 20);
-    let Some(mut xvfb) = start_xvfb(disp) else {
-        eprintln!("SKIP xrender_chrome_is_commands_not_pixels: Xvfb :{disp} did not come up");
-        return;
+    // A different base than the other test; the scan then finds a display that
+    // is genuinely free and answering.
+    let Some((disp, mut xvfb)) = start_xvfb_scan(111) else {
+        panic!("no Xvfb came up at or after :111");
     };
 
     // Give rt a shell that prints known text then idles, matching the sibling
@@ -204,7 +182,7 @@ fn xrender_chrome_is_commands_not_pixels() {
     shell.push(format!("rt_xrender_chrome_shell_{}.sh", std::process::id()));
     {
         let mut f = std::fs::File::create(&shell).expect("create temp shell");
-        f.write_all(b"#!/bin/sh\nprintf 'hello world\\n'; printf 'second line\\n'; sleep 5\n")
+        f.write_all(b"#!/bin/sh\nprintf 'hello world\\n'; printf 'second line\\n'; sleep 120\n")
             .unwrap();
     }
     #[cfg(unix)]
@@ -242,17 +220,18 @@ fn xrender_chrome_is_commands_not_pixels() {
     // only ~0.3 s margin and was observed to flip `triangles` to 0 or
     // truncate the trace under contention; `3` s restores the ~1.5 s margin
     // the sibling test relies on.
-    let fake = disp + 50;
-    let status = Command::new("timeout")
-        .arg("7") // comfortably larger than the inner 3s bound; ends xtrace deliberately
-        .arg("xtrace")
+    // xtrace binds this proxy display itself, so it needs an unclaimed name.
+    let fake = free_display_name(disp + 1).expect("no free proxy display");
+    // As above: wait for a real paint instead of bounding rt with a fixed
+    // timeout tuned to an idle machine's cold start.
+    let mut child = Command::new("xtrace")
         .arg("-n")
         .arg("-b")
         .args(["-d", &format!(":{disp}")])
         .args(["-D", &format!(":{fake}")])
         .args(["-o", trace.to_str().unwrap(), "--"])
         .arg("timeout")
-        .arg("3") // > rt's cold-start + first-render even under parallel-test CPU contention
+        .arg("60") // backstop only; we stop this child ourselves below
         .arg(rt_bin)
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
@@ -263,7 +242,15 @@ fn xrender_chrome_is_commands_not_pixels() {
         .env("XDG_CONFIG_HOME", &cfg_home) // a temp dir containing rt/config.toml: "inst_remote = false\n"
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+        .expect("spawn xtrace");
+
+    let drew = wait_for_trace(&trace, "CompositeGlyphs", Duration::from_secs(30)).is_some();
+    if drew {
+        std::thread::sleep(Duration::from_millis(300)); // let the overlay settle
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 
     // Tear down the Xvfb we own, and the temp shell, regardless of outcome.
     let _ = xvfb.kill();
@@ -271,11 +258,10 @@ fn xrender_chrome_is_commands_not_pixels() {
     let _ = std::fs::remove_file(&shell);
     let _ = std::fs::remove_dir_all(&cfg_home);
 
-    let status = status.expect("run xtrace");
-    eprintln!("xtrace/rt (chrome) exited: {status:?}");
-
     let dump = std::fs::read_to_string(&trace).unwrap_or_default();
     let _ = std::fs::remove_file(&trace);
+    assert!(drew, "rt (chrome) connected to :{disp} but never rendered text within 30s — \
+                   a zero-count trace would satisfy the PutImage assertion vacuously");
     assert!(!dump.is_empty(), "xtrace produced no output — did rt connect to :{disp}?");
 
     let put_image = dump.matches("PutImage").count();

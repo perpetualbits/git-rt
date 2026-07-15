@@ -29,44 +29,11 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-/// True if `prog` is runnable (resolves on PATH / is executable).
-fn have(prog: &str) -> bool {
-    Command::new(prog)
-        .arg("--help")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|_| true)
-        .unwrap_or(false)
-}
-
-/// Spawn `Xvfb :disp` and wait until its unix socket appears (up to ~3 s).
-/// Returns the owned child so the caller kills exactly this PID.
-fn start_xvfb(disp: u32) -> Option<Child> {
-    let child = Command::new("Xvfb")
-        .arg(format!(":{disp}"))
-        .args(["-screen", "0", "800x600x24", "-nolisten", "tcp"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let sock = format!("/tmp/.X11-unix/X{disp}");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if Path::new(&sock).exists() {
-            return Some(child);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // never came up — kill the one we started and give up
-    let mut c = child;
-    let _ = c.kill();
-    let _ = c.wait();
-    None
-}
+mod common;
+use common::{free_display_name, have, start_xvfb_scan, wait_for_trace, x_test_lock};
 
 /// Write a private `$XDG_CONFIG_HOME/rt/config.toml` forcing the instrument
 /// visuals on (`inst_remote`/`inst_animate`) or off, so the run is deterministic
@@ -92,7 +59,7 @@ fn write_shell(tag: &str) -> PathBuf {
     let mut shell = std::env::temp_dir();
     shell.push(format!("rt_instr_shell_{tag}_{}.sh", std::process::id()));
     let mut f = std::fs::File::create(&shell).expect("create temp shell");
-    f.write_all(b"#!/bin/sh\nprintf 'hello world\\n'; printf 'second line\\n'; sleep 5\n")
+    f.write_all(b"#!/bin/sh\nprintf 'hello world\\n'; printf 'second line\\n'; sleep 120\n")
         .unwrap();
     #[cfg(unix)]
     {
@@ -106,16 +73,17 @@ fn write_shell(tag: &str) -> PathBuf {
 /// so there's more than one pane (jacks/borders to draw), capture the window
 /// with `xwd` into a PNG, and return `(trace_dump, png_path)`. `disp` must be
 /// free; `tag` disambiguates temp file names across the two runs.
-fn run_and_capture(tag: &str, disp: u32, xdg_config_home: &Path) -> (String, PathBuf) {
-    let Some(mut xvfb) = start_xvfb(disp) else {
-        panic!("Xvfb :{disp} did not come up for run '{tag}'");
+fn run_and_capture(tag: &str, disp_base: u32, xdg_config_home: &Path) -> (String, PathBuf) {
+    let Some((disp, mut xvfb)) = start_xvfb_scan(disp_base) else {
+        panic!("no Xvfb came up at or after :{disp_base} for run '{tag}'");
     };
 
     let shell = write_shell(tag);
     let trace = std::env::temp_dir().join(format!("rt_instr_trace_{tag}_{}.txt", std::process::id()));
     let png = std::env::temp_dir().join(format!("rt_instr_shot_{tag}_{}.png", std::process::id()));
     let rt_bin = env!("CARGO_BIN_EXE_rt");
-    let fake = disp + 50;
+    // xtrace binds this proxy display itself, so it needs an unclaimed name.
+    let fake = free_display_name(disp + 1).unwrap_or_else(|| panic!("no free proxy display for run '{tag}'"));
 
     // xtrace connects upstream to Xvfb (`-d :disp`), creates a proxy display
     // (`-D :fake`) whose DISPLAY it hands the child, and dumps every request the
@@ -128,7 +96,7 @@ fn run_and_capture(tag: &str, disp: u32, xdg_config_home: &Path) -> (String, Pat
         .args(["-D", &format!(":{fake}")])
         .args(["-o", trace.to_str().unwrap(), "--"])
         .arg("timeout")
-        .arg("5")
+        .arg("40") // backstop only; we kill this child ourselves after the shot
         .arg(rt_bin)
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
@@ -145,11 +113,21 @@ fn run_and_capture(tag: &str, disp: u32, xdg_config_home: &Path) -> (String, Pat
     // resources (including the window) owned by a client's connection the
     // moment that connection closes, so the screen area it occupied reverts to
     // the root background before a post-hoc `xwd -root` can see it (verified:
-    // capturing after `wait` on the child produces an all-black PNG). Sleeping
-    // past rt's cold-start + first-render (~1.5s) plus a couple of
-    // `INSTRUMENT_TICK`s (166ms each) before grabbing the shot guarantees the
-    // instrument layer has been drawn at least once.
-    std::thread::sleep(Duration::from_millis(2200));
+    // capturing after `wait` on the child produces an all-black PNG).
+    //
+    // Wait for rt to actually paint rather than guessing at a delay: a fixed
+    // 2200ms was calibrated to a ~1.5s idle cold start, but a debug build under
+    // load takes ~3.5s — the shot then caught a blank screen and the test
+    // reported "no instrument pixels" for a run that simply hadn't drawn yet.
+    if wait_for_trace(&trace, "CompositeGlyphs", Duration::from_secs(30)).is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = xvfb.kill();
+        let _ = xvfb.wait();
+        panic!("[{tag}] rt never rendered any text within 30s — screenshot would be blank");
+    }
+    // Then allow a few INSTRUMENT_TICKs (166ms each) so the layer is drawn too.
+    std::thread::sleep(Duration::from_millis(700));
     let xwd_status = Command::new("xwd")
         .args(["-root", "-display", &format!(":{disp}")])
         .stdout(Stdio::piped())
@@ -232,6 +210,7 @@ fn green_mean(png: &Path, hex: &str, fuzz_pct: u32) -> Option<f64> {
 #[test]
 #[ignore = "needs Xvfb + xtrace + ImageMagick; run with --ignored"]
 fn instrument_layer_composites_without_pixel_upload() {
+    let _serial = x_test_lock(); // Xvfb+rt is heavy: never run these concurrently
     if !have("Xvfb") || !have("xtrace") || !have("convert") || !have("xwd") {
         eprintln!(
             "SKIP instrument_layer_composites_without_pixel_upload: needs Xvfb, xtrace, xwd and convert (ImageMagick) on PATH"
@@ -284,6 +263,7 @@ fn instrument_layer_composites_without_pixel_upload() {
 #[test]
 #[ignore = "needs Xvfb + xtrace + ImageMagick; run with --ignored"]
 fn instrument_green_appears_when_visible() {
+    let _serial = x_test_lock(); // Xvfb+rt is heavy: never run these concurrently
     if !have("Xvfb") || !have("xtrace") || !have("convert") || !have("xwd") {
         eprintln!("SKIP instrument_green_appears_when_visible: needs Xvfb, xtrace, xwd and convert (ImageMagick) on PATH");
         return;
@@ -352,22 +332,26 @@ fn write_flood_shell(tag: &str) -> PathBuf {
 /// Run rt for exactly `run_secs` under Xvfb+xtrace with the given shell and
 /// instruments forced on, returning the raw trace dump. No screenshot here —
 /// this guard only counts wire requests, so it skips `xwd`/`convert` entirely.
-fn run_traced(tag: &str, disp: u32, xdg_config_home: &Path, shell: &Path, run_secs: u64) -> String {
-    let Some(mut xvfb) = start_xvfb(disp) else {
-        panic!("Xvfb :{disp} did not come up for run '{tag}'");
+fn run_traced(tag: &str, disp_base: u32, xdg_config_home: &Path, shell: &Path, run_secs: u64) -> String {
+    let Some((disp, mut xvfb)) = start_xvfb_scan(disp_base) else {
+        panic!("no Xvfb came up at or after :{disp_base} for run '{tag}'");
     };
 
     let trace = std::env::temp_dir().join(format!("rt_instr_decouple_trace_{tag}_{}.txt", std::process::id()));
     let rt_bin = env!("CARGO_BIN_EXE_rt");
-    let fake = disp + 50;
+    // xtrace binds this proxy display itself, so it needs an unclaimed name.
+    let fake = free_display_name(disp + 1).unwrap_or_else(|| panic!("no free proxy display for run '{tag}'"));
 
-    let status = Command::new("xtrace")
+    // No `timeout` wrapper: rt runs until we stop it, so the measurement window
+    // is `run_secs` of STEADY-STATE, started once rt has actually drawn. Bounding
+    // the whole process instead made the window "cold start + whatever's left" —
+    // with cold start at 1.5s idle but 3.5s under load (debug build), a 4s bound
+    // left ~0.5s of real measurement, or none at all.
+    let mut child = Command::new("xtrace")
         .arg("-n")
         .args(["-d", &format!(":{disp}")])
         .args(["-D", &format!(":{fake}")])
         .args(["-o", trace.to_str().unwrap(), "--"])
-        .arg("timeout")
-        .arg(run_secs.to_string()) // bounds rt; both runs use the same duration
         .arg(rt_bin)
         .env_remove("WAYLAND_DISPLAY") // force winit onto X11, not the host's Wayland
         .env("RT_BACKEND", "xrender") // override detection: exercise the XRender path
@@ -376,18 +360,32 @@ fn run_traced(tag: &str, disp: u32, xdg_config_home: &Path, shell: &Path, run_se
         .env("SHELL", shell)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+        .expect("spawn xtrace");
 
+    // Wait for first paint, then measure a fixed window after it.
+    let start_at = wait_for_trace(&trace, "CompositeGlyphs", Duration::from_secs(30));
+    if start_at.is_some() {
+        std::thread::sleep(Duration::from_secs(run_secs));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
     let _ = xvfb.kill();
     let _ = xvfb.wait();
-
-    let status = status.expect("run xtrace");
-    eprintln!("[{tag}] xtrace/rt exited: {status:?}");
 
     let dump = std::fs::read_to_string(&trace).unwrap_or_default();
     let _ = std::fs::remove_file(&trace);
     assert!(!dump.is_empty(), "[{tag}] xtrace produced no output — did rt connect to :{disp}?");
-    dump
+    // Never rendering means the counts would be zeros, which silently SATISFY an
+    // upper-bound guard. Fail loudly instead of measuring nothing.
+    let Some(start_at) = start_at else {
+        panic!("[{tag}] rt connected to :{disp} but never rendered any text within 30s — \
+                measured counts would be meaningless");
+    };
+    // Return only the steady-state window: startup chatter (glyph uploads, the
+    // unconditional first-show instrument draw) is excluded from every count.
+    eprintln!("[{tag}] first paint after {start_at} trace bytes; measured {run_secs}s beyond it");
+    dump[start_at..].to_string()
 }
 
 /// The falsifiable decoupling guard: instrument geometry volume tracks
@@ -422,26 +420,34 @@ fn run_traced(tag: &str, disp: u32, xdg_config_home: &Path, shell: &Path, run_se
 /// full frame — so heavier output (more frequent `dirty`/full-frame activity)
 /// would have re-shipped instrument geometry more often, not at a fixed rate.
 ///
-/// Why the bound below is `3*silent + 50`, not a tighter `1x`-ish bound: the
-/// two runs legitimately animate instruments at DIFFERENT wall-clock rates,
-/// not the same one. "flood" drives instruments via the output meter path
-/// (`Meter`/`advance_instrument_state`), which samples every event-loop wake
-/// and reaches the real `INSTRUMENT_TICK` cadence (~6fps, restored by this
-/// change — see `main.rs`'s `instruments_animating`). "silent" only has the
-/// CPU-heat path to lean on, and `sample_heat` self-throttles its `/proc`
-/// resampling to `dt >= 0.4s` (~2.5Hz) — so silent ticks at ~2.5fps while
-/// flood ticks at ~6fps, a ~2.4x rate ratio that is CORRECT behavior, not a
-/// leak of content-frame volume onto the instrument layer. Measured
-/// (post-fix, 3 repeated runs, RUN_SECS=4): silent_triangles=336 and
-/// flood_triangles=840 every single run (840/336 = 2.500, deterministic given
-/// the fixed tick cadences and RUN_SECS) — comfortably inside `3*336+50 =
-/// 1058` with margin against jitter, while still rejecting the historical
-/// regression this guard exists for: forcing the pre-decoupling bug
-/// (instrument layer redrawn on every content-dirty frame instead of throttled
-/// to `INSTRUMENT_TICK`) reproduces flood_triangles=4424 in this environment
-/// (silent_triangles=56 in that same forced build) — matching the ~4088
-/// figure measured when Task 5 was first built — and `3*56+50 = 218` rejects
-/// it by roughly 20x.
+/// Why the bound below is an ABSOLUTE cap on `flood_triangles`, and not a
+/// ratio against `silent_triangles`: the silent baseline is bimodal, so
+/// dividing by it made this test flaky. Measured across runs it lands at
+/// either ~280-336 (the CPU-heat path bootstrapped `anim`) or exactly 56 (it
+/// did not — 56 is the first-show draw alone, the same bootstrap catch-22
+/// described below for the trickle shell, which the CPU-spin shell only
+/// mostly avoids). An earlier `3*silent + 50` bound therefore swung between
+/// ~218 and ~1058 depending on which mode the baseline happened to land in,
+/// and failed on a healthy tree at silent=56/flood=280.
+///
+/// The invariant this guard actually exists for is "instrument geometry is
+/// paced by the tick clock, not by content volume", which is an absolute
+/// statement: at `INSTRUMENT_TICK` (6fps) over RUN_SECS=4 the layer can redraw
+/// at most ~24 times, times the patch-bay's per-tick stroke count — so a few
+/// hundred to ~1k, whatever the output volume. Measured over a real 4s
+/// steady-state window (see `run_traced`, which now starts measuring at first
+/// paint): silent_triangles=504, flood_triangles=1064 against flood_glyphs=71108
+/// — i.e. ~140x the text, ~2x the instrument geometry, which is the legitimate
+/// rate asymmetry (flood's meter path reaches the full 6fps; silent's heat path
+/// self-throttles to ~2.5fps via `sample_heat`'s 0.4s `/proc` resampling).
+/// Under the regression this guard exists for — instrument layer redrawn on
+/// every content-dirty frame instead of throttled to `INSTRUMENT_TICK` — the
+/// geometry instead scales WITH those 71108 glyph batches (measured 4088-4424
+/// back when the window was startup-inclusive and much shorter; it is far
+/// larger over a real steady-state window). The cap rejects that by >2.5x.
+///
+/// `silent_triangles` is still asserted to be non-zero — the layer must tick
+/// on its own with zero output — but its exact value is not load-bearing.
 ///
 /// A low-rate output TRICKLE shell (instead of CPU-spin) was tried first for
 /// "silent", so both runs would animate via the SAME meter path and isolate
@@ -461,6 +467,7 @@ fn run_traced(tag: &str, disp: u32, xdg_config_home: &Path, shell: &Path, run_se
 #[test]
 #[ignore = "needs Xvfb + xtrace; run with --ignored"]
 fn instrument_ticks_decoupled_from_output() {
+    let _serial = x_test_lock(); // Xvfb+rt is heavy: never run these concurrently
     if !have("Xvfb") || !have("xtrace") {
         eprintln!("SKIP instrument_ticks_decoupled_from_output: needs Xvfb and xtrace on PATH");
         return;
@@ -492,15 +499,23 @@ fn instrument_ticks_decoupled_from_output() {
          silent_glyphs={silent_glyphs} flood_glyphs={flood_glyphs}"
     );
 
-    // flood_triangles stays within a ~3x multiple of silent_triangles — the
-    // legitimate ~2.4x rate asymmetry between flood's real 6fps meter-driven
-    // tick and silent's ~2.5fps heat-only tick (see the big comment above for
-    // the measured numbers and margin), NOT 1x. It must NOT approach the
-    // ~10-20x+ this bound rejects, which is what re-appears if instruments
-    // ever ride on content frames again (measured ~4424-4088 flood vs. a
-    // ~56-336 silent baseline under that regression — see above).
-    assert!(flood_triangles as f64 <= 3.0 * silent_triangles as f64 + 50.0,
-        "instrument geometry rode on output: silent={silent_triangles} flood={flood_triangles}");
+    // The layer must tick on its own cadence with ZERO output. (Value not
+    // load-bearing: the heat path bootstraps erratically — see above.)
+    assert!(silent_triangles > 0,
+        "instrument layer never drew without output: silent={silent_triangles}");
+    // The flood must really flood, else the cap below proves nothing.
     assert!(flood_glyphs > silent_glyphs * 3,
         "expected far more text glyphs under output flood: silent={silent_glyphs} flood={flood_glyphs}");
+    // THE GUARD: instrument geometry is paced by INSTRUMENT_TICK, so it is
+    // bounded by (tick rate x run length x per-tick stroke count) no matter how
+    // much text floods past. Derived from the cadence rather than hard-coded, so
+    // it stays honest if RUN_SECS changes. Measured healthy flood: 280-840.
+    // Under the regression this exists to catch: ~4088-4424, rejected by ~3.5x.
+    const TICKS_PER_SEC: usize = 6; // INSTRUMENT_TICK = 166ms
+    const MAX_TRIS_PER_TICK: usize = 60; // measured ~44/tick (flood=1064 over 24 ticks); headroom for layout
+    const JITTER_ALLOWANCE: usize = 200;
+    let ceiling = TICKS_PER_SEC * RUN_SECS as usize * MAX_TRIS_PER_TICK + JITTER_ALLOWANCE;
+    assert!(flood_triangles <= ceiling,
+        "instrument geometry rode on output: flood={flood_triangles} exceeds the tick-paced \
+         ceiling {ceiling} (silent={silent_triangles}, flood_glyphs={flood_glyphs})");
 }
