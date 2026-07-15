@@ -134,20 +134,24 @@ pub struct Settings {
     /// Show the patch-bay jack dots on each pane (existing wires draw regardless).
     pub show_jacks: bool,
     /// Draw the border instruments + patch-bay AT ALL on the REMOTE (XRender /
-    /// `ssh -X`) backend. On by default: the instrument layer is a server-side
-    /// ARGB pixmap composited over content on a decoupled tick (see
-    /// `INSTRUMENT_TICK`), so it's cheap over `ssh -X` — the patch-bay is
-    /// visible out of the box. The LOCAL GL backend always shows the
-    /// instruments regardless (the pipe is free there). Turn off if you want a
-    /// plain, borderless terminal over a remote link.
+    /// `ssh -X`) backend. OFF by default: the instrument layer lives on a
+    /// server-side ARGB pixmap that `present()` composites over the content, and
+    /// that composite is X-server CPU proportional to the composited area — a
+    /// cost paid on every frame, including every keystroke. It costs rt itself
+    /// nothing, so it hides from client-side profiling; measure the X server.
+    /// The composite is clipped to the pixels the instruments actually occupy
+    /// (see `XRenderBackend::instr_rects`), which makes it affordable on a
+    /// reasonable link, but a milkv (riscv64, `ssh -X`) feel-test still showed
+    /// default-on lagging typing, so opting in is deliberate. The LOCAL GL
+    /// backend always shows the instruments regardless (the pipe is free there).
     pub inst_remote: bool,
     /// Animate the border instruments on the REMOTE (XRender / `ssh -X`) backend.
-    /// On by default: the instrument layer redraws on its own decoupled 6fps
-    /// tick (see `INSTRUMENT_TICK`), independent of content frames, so the
-    /// animated packets/latency stay live over `ssh -X` without forcing extra
-    /// content redraws. The LOCAL GL backend always animates regardless of this
-    /// flag. Turn off for static instruments (still updated on resize/tab/focus)
-    /// if your link can't sustain the tick.
+    /// OFF by default, and only meaningful with `inst_remote`. When on, the
+    /// instrument layer redraws on its own decoupled 6fps tick (see
+    /// `INSTRUMENT_TICK`), independent of content frames, so animated packets
+    /// stay live without forcing content redraws. Off gives static instruments
+    /// (still updated on resize/tab/focus). The LOCAL GL backend always animates
+    /// regardless of this flag.
     pub inst_animate: bool,
     /// Default text colour (RGB). Cells that don't set an explicit foreground
     /// use this.
@@ -202,8 +206,10 @@ impl Default for Settings {
             inst_heat: true,
             inst_latency: true,
             show_jacks: true,              // patch-bay jacks visible by default
-            inst_remote: true,             // instruments compositing is cheap now — show the patch-bay over ssh -X by default
-            inst_animate: true,            // 6fps decoupled instrument tick (see INSTRUMENT_TICK); the point of this slice
+            inst_remote: false,            // off over ssh -X: the layer composite is server-side CPU that scales with
+            // window area, and a milkv (riscv64, ssh -X) feel-test showed default-on made typing lag badly. Opt in
+            // with `inst_remote = true` once you know your X server can afford it.
+            inst_animate: false,           // 6fps decoupled instrument tick (see INSTRUMENT_TICK); only with inst_remote
             foreground: [0xd0, 0xd0, 0xd8], // light grey text
             background: [0x10, 0x10, 0x14], // near-black background
             palette: DEFAULT_PALETTE,      // classic xterm 16-colour palette
