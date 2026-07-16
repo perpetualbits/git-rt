@@ -714,6 +714,13 @@ impl Renderer {
             // One draw call for the whole frame's quads.
             self.gl.draw_arrays(glow::TRIANGLES, 0, vertex_count);
         }
+        // Clear the batch so end_frame is idempotent: a caller may flush again
+        // after the content pass (to emit native chrome batched during the
+        // overlay pass), and with verts empty that second call early-returns
+        // above. begin_frame also clears verts at the top of every frame, and
+        // nothing between end_frame and the next begin_frame reads verts, so
+        // clearing here changes no observable behaviour.
+        self.verts.clear();
     }
 }
 

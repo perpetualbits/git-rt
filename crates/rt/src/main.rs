@@ -3497,6 +3497,13 @@ impl App {
         Self::draw_panes(active, bounds, &snapshots);
         active.backend.end_frame(); // upload + draw call
         Self::paint_overlays_or_instruments(active);
+        // Flush any native-chrome geometry (the preferences dialog) that the
+        // overlay pass batched after the content end_frame above. On XRender
+        // this is a no-op (empty end_frame; chrome already drew immediately).
+        // On GL it is the ONLY flush for that geometry, and a no-op whenever
+        // the overlay pass batched nothing (egui self-flushes, so verts is
+        // empty and end_frame early-returns).
+        active.backend.end_frame();
         // Present the full window (X11 Route-1 full present, else swap_buffers).
         active.backend.present(&active.window, None);
     }
