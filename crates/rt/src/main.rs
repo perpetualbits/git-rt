@@ -26,6 +26,7 @@ mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
 mod preferences; // egui preferences dialog
+mod prefs_model; // which setting each preferences row edits, and how a step clamps
 mod render; // the GL glyph-atlas renderer
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
