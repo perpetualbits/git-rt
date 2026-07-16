@@ -3,10 +3,6 @@
 //! Pure: no UI, no backend, no X server. Split out of `chrome::prefs` so the
 //! clamping rules can be tested exhaustively without constructing a `Geom`.
 
-// Foundation-only for now: nothing calls into this module until the
-// geometry/drawing/wiring tasks land on top of it. Remove once they do.
-#![allow(dead_code)]
-
 use rt_config::Settings;
 
 /// Which setting a preferences row edits. `Close` is the dismiss action and

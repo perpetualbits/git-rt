@@ -2,11 +2,6 @@
 //! drawn as fills + glyphs. Mirrors `chrome/menu.rs` — a pure `layout()` split
 //! from `draw()` so the geometry is unit-testable with no X server.
 
-// Foundation-only for now: nothing calls into this module until the drawing
-// (Task 3) and event-loop wiring (Task 4) land on top of it. Remove once they
-// do. (Same scaffolding Task 1 added to `prefs_model.rs`.)
-#![allow(dead_code)]
-
 use crate::backend::Backend;
 use crate::chrome::Recti;
 use crate::prefs_model::{enabled, preset_name, PrefRow};
@@ -66,6 +61,13 @@ pub struct Geom {
 pub enum Hit {
     Row(usize),
     Step(usize, i32),
+    // `Close` is redundant with `Row`: the Close action row carries
+    // `pref: Some(PrefRow::Close)`, so `hit()` already reports a click on it as
+    // `Hit::Row(i)` and the caller matches `rows[i].pref` to find Close. Never
+    // constructed by `hit()` — kept as a documented, intentional dead variant
+    // rather than removed, in case a future caller wants to distinguish it
+    // without re-deriving the row's `pref`.
+    #[allow(dead_code)]
     Close,
 }
 

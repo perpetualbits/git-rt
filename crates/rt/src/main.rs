@@ -25,7 +25,6 @@ mod damage; // pure pixel-rect damage accumulator
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
 mod menu; // right-click context menu (Terminator-style)
-mod preferences; // egui preferences dialog
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
 mod render; // the GL glyph-atlas renderer
 
@@ -283,6 +282,11 @@ struct Active {
     egui_state: egui_winit::State,        // egui-winit input bridge
     egui_painter: egui_glow::Painter,     // egui_glow renderer (shares our GL context)
     prefs_open: bool,                     // whether the preferences dialog is showing
+    prefs_sel: usize,                     // selected row index into chrome::prefs::rows()
+    prefs_scroll: usize,                  // first visible row (the panel scrolls when it doesn't fit)
+    prefs_pending: Option<rt_config::Settings>, // edits not yet committed (see PREFS_SETTLE)
+    prefs_edits: u64,                     // edits folded into the pending commit (diagnostics)
+    last_prefs_edit: Instant,             // when the last edit landed
     manual_open: bool,                    // whether the built-in manual overlay is showing
     manual_scroll: usize,                 // scroll offset (cell rows) into the native manual panel
     search_open: bool,                    // whether the scrollback-search bar is showing
@@ -974,6 +978,11 @@ impl ApplicationHandler for App {
             egui_state,
             egui_painter,
             prefs_open: false,
+            prefs_sel: 0,
+            prefs_scroll: 0,
+            prefs_pending: None,
+            prefs_edits: 0,
+            last_prefs_edit: Instant::now(),
             manual_open: false,
             manual_scroll: 0,
             search_open: false,
@@ -1002,10 +1011,10 @@ impl ApplicationHandler for App {
             instr_layer_drawn: false,
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
-        // startup so its egui rendering can be screenshotted.
+        // startup so it can be screenshotted without synthetic input.
         if std::env::var("RT_PREFS").is_ok() {
             if let Some(active) = self.active.as_mut() {
-                active.prefs_open = true;
+                Self::open_prefs(active);
             }
         }
         // Debug/verification hook: RT_MANUAL opens the manual overlay at startup.
@@ -1037,6 +1046,14 @@ impl ApplicationHandler for App {
         if std::env::var_os("RT_OPEN_MANUAL").is_some() {
             if let Some(active) = self.active.as_mut() {
                 active.manual_open = true;
+            }
+        }
+        // Debug/verification hook: RT_OPEN_PREFS opens the preferences dialog at
+        // startup so the Xvfb gate can screenshot it without synthetic input
+        // (mirrors RT_OPEN_MANUAL).
+        if std::env::var_os("RT_OPEN_PREFS").is_some() {
+            if let Some(active) = self.active.as_mut() {
+                Self::open_prefs(active);
             }
         }
         // Debug/verification hook: RT_WIRE_DEMO builds a live patch-bay scene —
@@ -1076,49 +1093,104 @@ impl ApplicationHandler for App {
             active.active_until = Instant::now() + ACTIVE_TAIL;
         }
 
-        // Chrome degradation (Slice 2): the menu, manual, and search overlays now
-        // render natively on the XRender backend (drawn below via `chrome::*`), but
-        // Preferences is still egui-only (deferred). Never let Preferences open on
-        // the XRender backend, or an invisible dialog would swallow all terminal
-        // input (a soft hang). The other three fall through to the native input
-        // shims in the diversion blocks below.
-        if !active.backend.supports_egui() && active.prefs_open {
-            active.prefs_open = false;
-            static PREFS_HINT: std::sync::Once = std::sync::Once::new();
-            PREFS_HINT.call_once(|| {
-                eprintln!(
-                    "rt: Preferences is unavailable on the remote (XRender) backend yet — \
-                     the terminal and the other overlays are fully usable."
-                );
-            });
-        }
-
-        // While the preferences dialog is open, egui gets first look at events
-        // and terminal input is suspended (window lifecycle still flows through).
+        // Preferences: a native dialog on BOTH backends (Task 4) — no egui
+        // involved at all. Keys/clicks drive the dialog and never reach the PTY.
+        // Every edit is one discrete step (no drags — see PREFS_SETTLE and the
+        // design doc): it mutates PENDING settings and arms the settle;
+        // `commit_settings` applies+persists ONCE per run of edits. Esc / Close
+        // commit any pending edit immediately, so a fast Esc cannot strand it.
         if active.prefs_open {
-            let r = active.egui_state.on_window_event(&active.window, &event);
-            if r.repaint {
-                active.window.request_redraw();
-            }
-            match event {
-                // Escape closes the dialog.
-                WindowEvent::KeyboardInput { event: ref ke, .. }
-                    if ke.state == ElementState::Pressed
-                        && matches!(ke.logical_key, Key::Named(NamedKey::Escape)) =>
-                {
-                    active.prefs_open = false;
+            match &event {
+                WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
+                    let size = active.window.inner_size();
+                    let (cw, ch) = active.backend.cell_size();
+                    let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
+                    let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols);
+                    let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
+                    match &ke.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            active.prefs_open = false;
+                            // Do not strand a pending edit: commit it now rather
+                            // than wait out PREFS_SETTLE on a closed dialog.
+                            if let Some(new) = active.prefs_pending.take() {
+                                active.prefs_edits = 0;
+                                Self::commit_settings(active, new);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            active.prefs_sel = chrome::prefs::next_sel(&rws, active.prefs_sel, 1);
+                            active.prefs_scroll = chrome::prefs::scroll_for(&rws, active.prefs_sel, active.prefs_scroll, g.visible);
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            active.prefs_sel = chrome::prefs::next_sel(&rws, active.prefs_sel, -1);
+                            active.prefs_scroll = chrome::prefs::scroll_for(&rws, active.prefs_sel, active.prefs_scroll, g.visible);
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => Self::prefs_step(active, &rws, -1),
+                        Key::Named(NamedKey::ArrowRight) => Self::prefs_step(active, &rws, 1),
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => {
+                            if rws.get(active.prefs_sel).and_then(|r| r.pref) == Some(prefs_model::PrefRow::Close) {
+                                active.prefs_open = false;
+                                if let Some(new) = active.prefs_pending.take() {
+                                    active.prefs_edits = 0;
+                                    Self::commit_settings(active, new);
+                                }
+                            } else {
+                                Self::prefs_step(active, &rws, 1);
+                            }
+                        }
+                        _ => {}
+                    }
                     active.window.request_redraw();
                     return;
                 }
-                // Swallow terminal input while the dialog is up.
+                WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                    let size = active.window.inner_size();
+                    let (cw, ch) = active.backend.cell_size();
+                    let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
+                    let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+                    let rws = chrome::prefs::rows(&s, total_ram_bytes(), cols);
+                    let g = chrome::prefs::layout(&rws, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
+                    match chrome::prefs::hit(&g, active.mouse) {
+                        Some(chrome::prefs::Hit::Step(i, dir)) => {
+                            active.prefs_sel = i;
+                            Self::prefs_step(active, &rws, dir);
+                        }
+                        Some(chrome::prefs::Hit::Row(i)) => {
+                            if rws[i].pref.is_some() {
+                                active.prefs_sel = i;
+                                // A click on a Toggle toggles it; on a Step row it only selects.
+                                if matches!(rws[i].kind, chrome::prefs::RowKind::Toggle) {
+                                    Self::prefs_step(active, &rws, 1);
+                                } else if rws[i].pref == Some(prefs_model::PrefRow::Close) {
+                                    active.prefs_open = false;
+                                    if let Some(new) = active.prefs_pending.take() {
+                                        active.prefs_edits = 0;
+                                        Self::commit_settings(active, new);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    active.window.request_redraw();
+                    return;
+                }
+                // Keep the last-known cursor position current while the dialog is
+                // up, so a click that follows (without further motion outside the
+                // dialog) hit-tests against where the pointer actually is, rather
+                // than a stale pre-open position.
+                WindowEvent::CursorMoved { position, .. } => {
+                    active.mouse = (position.x as f32, position.y as f32);
+                    return;
+                }
+                // Swallow all other input so it cannot reach the PTY.
                 WindowEvent::KeyboardInput { .. }
                 | WindowEvent::MouseInput { .. }
-                | WindowEvent::CursorMoved { .. }
                 | WindowEvent::MouseWheel { .. }
                 | WindowEvent::Ime(_)
                 | WindowEvent::ModifiersChanged(_) => return,
-                // Close / resize / redraw fall through to the normal handling.
-                _ => {}
+                _ => {} // Close / resize / redraw fall through
             }
         }
 
@@ -1964,6 +2036,19 @@ impl ApplicationHandler for App {
             active.force_full = true; // grid changed under us: repaint the lot
             dirty = true;
         }
+        // Preferences: one commit per run of edits, not one per keystroke (see
+        // PREFS_SETTLE and `commit_settings`).
+        if active.prefs_pending.is_some() && now.duration_since(active.last_prefs_edit) >= PREFS_SETTLE {
+            let new = active.prefs_pending.take().unwrap();
+            let n = std::mem::take(&mut active.prefs_edits);
+            let t0 = Instant::now();
+            Self::commit_settings(active, new);
+            log::info!(
+                "prefs settled: commit={:.1}ms, {} edit(s) coalesced into 1 commit",
+                t0.elapsed().as_secs_f32() * 1e3, n,
+            );
+            dirty = true;
+        }
         // Broadcast pulse: while input is fanned out to more than the focused
         // pane, the receiving panes' swatches throb so an armed broadcast is hard
         // to miss. Bounded at BCAST_PULSE_TICK, and the frame builder damages ONLY
@@ -2063,6 +2148,8 @@ impl ApplicationHandler for App {
             // A deferred reflow must not wait on IDLE_POLL: guarantee a wake-up
             // to settle it even if nothing else asks for one.
             RESIZE_SETTLE
+        } else if active.prefs_pending.is_some() {
+            PREFS_SETTLE // a commit is owed; wake to pay it
         } else if blinking {
             BLINK_POLL
         } else if instruments_animating {
@@ -2191,7 +2278,15 @@ impl App {
                 active.window.request_redraw();
             }
             Action::Preferences => {
-                active.prefs_open = !active.prefs_open; // toggle the dialog
+                // The keybinding only ever reaches here while the dialog is
+                // closed — once open, the input shim below intercepts every
+                // key (including this one) before it can be dispatched as an
+                // Action. So this is always an OPEN, never a toggle-closed.
+                if active.prefs_open {
+                    active.prefs_open = false;
+                } else {
+                    Self::open_prefs(active);
+                }
                 active.window.request_redraw();
             }
             Action::ZoomIn => {
@@ -3235,11 +3330,17 @@ impl App {
     /// Runs after the pane draw + `end_frame`, blending over the current
     /// framebuffer (inside the cleared scissor bbox on the partial path).
     fn paint_overlays_or_instruments(active: &mut Active) {
+        // Preferences: one native dialog on BOTH backends (Task 4) — drawn via
+        // the `Backend` trait directly, no egui pass involved. Checked before the
+        // per-backend split below (which still governs menu/manual/search/
+        // instruments, each of which keeps a separate egui-vs-native rendering).
+        if active.prefs_open {
+            Self::paint_prefs(active);
+            return;
+        }
         if active.backend.supports_egui() {
             // GL path: today's egui chrome, unchanged.
-            if active.prefs_open {
-                Self::paint_egui(active);
-            } else if active.menu.is_some() {
+            if active.menu.is_some() {
                 Self::paint_menu(active);
             } else if active.manual_open {
                 Self::paint_manual(active);
@@ -3250,8 +3351,7 @@ impl App {
             }
             return;
         }
-        // Native (XRender) path: preferences is egui-only (force-closed above), so
-        // it is never open here. The instrument layer is a persistent, separate
+        // Native (XRender) path. The instrument layer is a persistent, separate
         // ARGB picture composited over content by `present()` (Task 3/4); it is
         // redrawn only on a 6fps `instr_tick` (or the first time it's shown), NOT
         // on every content frame — so a keystroke/output burst on the scissored
@@ -3481,79 +3581,107 @@ impl App {
         }
     }
 
-    /// Run the egui preferences UI for this frame and paint it. Applies any
-    /// changed settings (persisting them) and closes the dialog when requested.
-    fn paint_egui(active: &mut Active) {
-        let raw_input = active.egui_state.take_egui_input(&active.window); // gather input
-        let ctx = active.egui_ctx.clone(); // cheap Arc clone (avoids borrowing active in the closure)
-        let mut settings = active.settings.clone(); // the UI edits this clone
-        let mut close = false; // set by the Close button
-        // egui 0.35 frame API: begin_pass → build UI → end_pass.
-        ctx.begin_pass(raw_input);
-        // Estimate scrollback memory against a full-width pane at the current
-        // font, so the dialog can warn before the slider picks an unrunnable size.
-        let cols = (content_bounds(active.window.inner_size()).w / active.backend.cell_size().0).max(1.0) as usize;
-        let ram = total_ram_bytes();
-        preferences::ui(&ctx, &mut settings, &mut close, &active.mono_families, ram, cols); // build the dialog
-        let output = ctx.end_pass();
-        // Apply + persist any change the user made.
-        if settings != active.settings {
-            // What changed drives which subsystem we refresh.
-            let colours_changed = settings.foreground != active.settings.foreground
-                || settings.background != active.settings.background
-                || settings.palette != active.settings.palette;
-            let family_changed = settings.font_family != active.settings.font_family;
-            let fonts_changed = family_changed || settings.font_size != active.settings.font_size;
-            let titlebar_changed = settings.show_titlebar != active.settings.show_titlebar;
-            // The blur decision depends on both the toggle and the opacity slider.
-            let blur_changed = want_blur(&settings) != want_blur(&active.settings);
-            active.settings = settings; // commit
-            Self::persist(&active.settings);
-            // Scrollback: newly spawned panes read this live cell.
-            active.scrollback.set(active.settings.scrollback);
-            // Background blur: toggle live if the config or opacity moved it.
-            if blur_changed {
-                apply_blur(active);
-            }
-            // Titlebar toggle changes every pane's content height → re-reserve and
-            // resize all PTYs.
-            if titlebar_changed {
-                active.session.set_show_titlebar(active.settings.show_titlebar);
-                let size = active.window.inner_size();
-                active.session.relayout(content_bounds(size));
-            }
-            // Colours: rebuild the palette and apply it live to every pane.
-            if colours_changed {
-                let pal = rt_engine::Palette::new(
-                    active.settings.foreground,
-                    active.settings.background,
-                    active.settings.palette,
-                );
-                if let Ok(mut p) = active.palette.lock() {
-                    *p = pal.clone(); // future panes inherit these colours
-                }
-                active.session.set_all_palettes(pal); // recolour existing panes
-            }
-            // Fonts: reload the family (if changed) and/or size, then re-measure
-            // the cell and resize every pane to the new (cols, rows).
-            if fonts_changed {
-                Self::refresh_fonts(active, family_changed);
-            }
-        }
-        if close {
-            active.prefs_open = false;
-        }
-        active.egui_state.handle_platform_output(&active.window, output.platform_output);
-        // Tessellate and paint egui's shapes over the current framebuffer.
-        let ppp = output.pixels_per_point;
-        let primitives = ctx.tessellate(output.shapes, ppp);
+    /// Open the preferences dialog, selecting the first REAL row.
+    ///
+    /// Row 0 of `chrome::prefs::rows()` is `sec("Font")` — a `Section` header,
+    /// not selectable. Opening on index 0 would make the first Down call
+    /// `next_sel(rows, 0, 1)`, whose `.unwrap_or(0)` fallback (0 isn't among the
+    /// selectable indices) lands on the SECOND selectable row, silently skipping
+    /// "Size (px)". Selecting the first real row up front avoids that entirely.
+    fn open_prefs(active: &mut Active) {
+        active.prefs_open = true;
         let size = active.window.inner_size();
-        active.egui_painter.paint_and_update_textures(
-            [size.width, size.height],
-            ppp,
-            &primitives,
-            &output.textures_delta,
-        );
+        let (cw, _ch) = active.backend.cell_size();
+        let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+        let rows = chrome::prefs::rows(&active.settings, total_ram_bytes(), cols);
+        active.prefs_sel = chrome::prefs::selectable(&rows).first().copied().unwrap_or(0);
+        active.prefs_scroll = 0;
+    }
+
+    /// Apply and persist `new`, doing only the work each change actually needs.
+    ///
+    /// Lifted verbatim out of the old egui `paint_egui`: it was always
+    /// backend-agnostic, and deleting the egui dialog leaves it one caller.
+    /// Called ONCE per settle (see PREFS_SETTLE), never per keystroke.
+    fn commit_settings(active: &mut Active, new: rt_config::Settings) {
+        if new == active.settings {
+            return; // nothing to do
+        }
+        // What changed drives which subsystem we refresh.
+        let colours_changed = new.foreground != active.settings.foreground
+            || new.background != active.settings.background
+            || new.palette != active.settings.palette;
+        let family_changed = new.font_family != active.settings.font_family;
+        let fonts_changed = family_changed || new.font_size != active.settings.font_size;
+        let titlebar_changed = new.show_titlebar != active.settings.show_titlebar;
+        // The blur decision depends on both the toggle and the opacity slider.
+        let blur_changed = want_blur(&new) != want_blur(&active.settings);
+        active.settings = new; // commit
+        Self::persist(&active.settings);
+        // Scrollback: newly spawned panes read this live cell.
+        active.scrollback.set(active.settings.scrollback);
+        // Background blur: toggle live if the config or opacity moved it.
+        if blur_changed {
+            apply_blur(active);
+        }
+        // Titlebar toggle changes every pane's content height → re-reserve and
+        // resize all PTYs.
+        if titlebar_changed {
+            active.session.set_show_titlebar(active.settings.show_titlebar);
+            let size = active.window.inner_size();
+            active.session.relayout(content_bounds(size));
+        }
+        // Colours: rebuild the palette and apply it live to every pane.
+        if colours_changed {
+            let pal = rt_engine::Palette::new(
+                active.settings.foreground,
+                active.settings.background,
+                active.settings.palette,
+            );
+            if let Ok(mut p) = active.palette.lock() {
+                *p = pal.clone(); // future panes inherit these colours
+            }
+            active.session.set_all_palettes(pal); // recolour existing panes
+        }
+        // Fonts: reload the family (if changed) and/or size, then re-measure
+        // the cell and resize every pane to the new (cols, rows).
+        if fonts_changed {
+            Self::refresh_fonts(active, family_changed);
+        }
+        active.force_full = true; // chrome + metrics changed: repaint the lot
+    }
+
+    /// Draw the preferences dialog from the PENDING settings, so the value you
+    /// just stepped is on screen immediately — the terminal behind it changes
+    /// once, on settle.
+    fn paint_prefs(active: &mut Active) {
+        let size = active.window.inner_size();
+        let (cw, ch) = active.backend.cell_size();
+        let s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
+        // Exactly how the old egui dialog derived it: a full-width pane at the
+        // current font size. There is no `pane.cols()`.
+        let cols = (content_bounds(size).w / cw).max(1.0) as usize;
+        let rows = chrome::prefs::rows(&s, total_ram_bytes(), cols);
+        let g = chrome::prefs::layout(&rows, active.prefs_scroll, cw, ch, size.width as f32, size.height as f32);
+        let mut sw = vec![Color::rgb(s.foreground[0], s.foreground[1], s.foreground[2])];
+        sw.push(Color::rgb(s.background[0], s.background[1], s.background[2]));
+        sw.extend(s.palette.iter().map(|c| Color::rgb(c[0], c[1], c[2])));
+        chrome::prefs::draw(&mut *active.backend, &g, &rows, active.prefs_sel, &sw, cw, ch);
+    }
+
+    /// Apply one step to the selected row: mutate the PENDING settings and arm
+    /// the settle. Never applies or persists — that is `commit_settings`, once,
+    /// after PREFS_SETTLE.
+    fn prefs_step(active: &mut Active, rows: &[chrome::prefs::Row], dir: i32) {
+        let Some(pref) = rows.get(active.prefs_sel).and_then(|r| r.pref) else { return };
+        if pref == prefs_model::PrefRow::Close {
+            return;
+        }
+        let mut s = active.prefs_pending.clone().unwrap_or_else(|| active.settings.clone());
+        prefs_model::step(&mut s, pref, dir, &active.mono_families);
+        active.prefs_pending = Some(s);
+        active.prefs_edits += 1;
+        active.last_prefs_edit = Instant::now();
     }
 
     /// Run the egui context menu for this frame and paint it. Applies the picked
@@ -4176,6 +4304,15 @@ const INSTRUMENT_TICK: Duration = Duration::from_millis(166);
 /// Long enough to swallow a drag's configure stream (~50ms apart), short enough
 /// that a single resize doesn't feel deferred.
 const RESIZE_SETTLE: Duration = Duration::from_millis(120);
+/// How long a preferences value must hold still before it is applied+persisted.
+///
+/// Applying is expensive — a font change re-rasterises every glyph and reflows
+/// every pane (~700ms on a milkv) — and `persist()` writes `config.toml`. So
+/// stepping 18 → 24 must cost ONE of each, not six. Long enough to swallow a run
+/// of key-repeat presses (~30ms apart), short enough that a single toggle feels
+/// immediate. Same rule as RESIZE_SETTLE, same reason: never pay for an
+/// intermediate value nobody keeps.
+const PREFS_SETTLE: Duration = Duration::from_millis(150);
 /// Idle wake interval: when nothing is happening we still wake this often to
 /// notice async PTY output and heat changes, but at ~10Hz instead of 60 — a
 /// fraction of the cost, still prompt enough that output appears without lag.
