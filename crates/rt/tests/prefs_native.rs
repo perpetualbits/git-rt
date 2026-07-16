@@ -174,6 +174,11 @@ fn a_run_of_steps_commits_once() {
 
     // Wait for the window, then focus it: with no WM, XTEST goes to the focused
     // window and `xdotool type --window` (XSendEvent) is ignored by winit.
+    // Capture whether it appeared into a bool rather than asserting here: an
+    // assert on this path would panic with the rt child AND the Xvfb display
+    // still held (exactly the failure this gate exists to catch — the dialog-
+    // open regression returning — leaks the display name for every later run).
+    // ALL teardown runs unconditionally below; the assert comes afterward.
     let mut win = String::new();
     for _ in 0..60 {
         let out = Command::new("xdotool")
@@ -189,21 +194,28 @@ fn a_run_of_steps_commits_once() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    assert!(!win.is_empty(), "rt's window never appeared on :{disp}");
-    std::thread::sleep(Duration::from_millis(3000)); // cold start + first paint
-    let dpy = format!(":{disp}");
-    let run = |args: &[&str]| {
-        let _ = Command::new("xdotool").args(args).env("DISPLAY", &dpy).status();
-    };
-    run(&["windowfocus", &win]);
-    std::thread::sleep(Duration::from_millis(300));
-    // Select "Size (px)" (the first selectable row) and step it SIX times fast.
-    for _ in 0..6 {
-        run(&["key", "Right"]);
-        std::thread::sleep(Duration::from_millis(30)); // key-repeat speed: inside PREFS_SETTLE
+    let window_appeared = !win.is_empty();
+    // Only drive input when the window actually appeared; on the not-found path
+    // we skip straight to teardown so nothing is held when we panic below.
+    if window_appeared {
+        std::thread::sleep(Duration::from_millis(3000)); // cold start + first paint
+        let dpy = format!(":{disp}");
+        let run = |args: &[&str]| {
+            let _ = Command::new("xdotool").args(args).env("DISPLAY", &dpy).status();
+        };
+        run(&["windowfocus", &win]);
+        std::thread::sleep(Duration::from_millis(300));
+        // Select "Size (px)" (the first selectable row) and step it SIX times fast.
+        for _ in 0..6 {
+            run(&["key", "Right"]);
+            std::thread::sleep(Duration::from_millis(30)); // key-repeat speed: inside PREFS_SETTLE
+        }
+        std::thread::sleep(Duration::from_millis(1200)); // let it settle and log
     }
-    std::thread::sleep(Duration::from_millis(1200)); // let it settle and log
 
+    // Unconditional teardown: kill+reap the child we spawned, stop the Xvfb we
+    // own, clean the temp files. Runs on BOTH the success and window-not-found
+    // paths, so no assert below can leak a process or a display name.
     let _ = child.kill();
     let _ = child.wait();
     stop_xvfb(xvfb, disp);
@@ -212,6 +224,8 @@ fn a_run_of_steps_commits_once() {
 
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_file(&log);
+    // Now that everything is torn down, it is safe to fail on a missing window.
+    assert!(window_appeared, "rt's window never appeared on :{disp}");
     let settles: Vec<&str> = text.lines().filter(|l| l.contains("prefs settled")).collect();
     eprintln!("settle lines:\n{}", settles.join("\n"));
     assert_eq!(
