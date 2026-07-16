@@ -79,10 +79,14 @@ pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String]) {
             if families.is_empty() {
                 return; // nothing installed to cycle through; leave the name alone
             }
-            let cur = families.iter().position(|f| *f == s.font_family).unwrap_or(0);
-            let n = families.len() as i32;
-            // rem_euclid keeps the index positive when stepping left off zero.
-            let next = ((cur as i32 + dir).rem_euclid(n)) as usize;
+            let n = families.len();
+            // When the current family isn't installed, land on the natural end
+            // for the direction rather than falling back to 0-then-step (which
+            // would skip index 0 on a first Right / jump to n-1 on a first Left).
+            let next = match families.iter().position(|f| *f == s.font_family) {
+                Some(cur) => (cur as i32 + dir).rem_euclid(n as i32) as usize,
+                None => if dir > 0 { 0 } else { n - 1 },
+            };
             s.font_family = families[next].clone();
         }
         // Reuse the existing rule rather than write a second one: `Settings`
@@ -96,11 +100,15 @@ pub fn step(s: &mut Settings, row: PrefRow, dir: i32, families: &[String]) {
             s.scrollback = next.clamp(SCROLLBACK_MIN, Settings::MAX_SCROLLBACK);
         }
         PrefRow::Preset => {
-            let n = rt_config::SCHEMES.len() as i32;
-            // Start from the scheme we currently match; "custom" starts at 0 so
-            // a first press lands on a real scheme rather than jumping about.
-            let cur = rt_config::SCHEMES.iter().position(|c| c.name == preset_name(s)).unwrap_or(0);
-            let next = ((cur as i32 + dir).rem_euclid(n)) as usize;
+            let n = rt_config::SCHEMES.len();
+            // Start from the scheme we currently match. When the colours match
+            // no scheme ("custom"), land on the natural end for the direction
+            // rather than 0-then-step: a first Right must hit SCHEMES[0], not
+            // skip it to SCHEMES[1], and a first Left must hit the last scheme.
+            let next = match rt_config::SCHEMES.iter().position(|c| c.name == preset_name(s)) {
+                Some(cur) => (cur as i32 + dir).rem_euclid(n as i32) as usize,
+                None => if dir > 0 { 0 } else { n - 1 },
+            };
             let c = &rt_config::SCHEMES[next];
             s.foreground = c.foreground;
             s.background = c.background;
@@ -223,6 +231,43 @@ mod tests {
         let mut s = Settings::default();
         s.foreground = [1, 2, 3]; // the user's own, hand-edited in config.toml
         assert_eq!(preset_name(&s), "custom");
+    }
+
+    #[test]
+    fn preset_from_custom_lands_on_the_first_scheme_not_the_second() {
+        // Hand-edited colours match no scheme (preset_name -> "custom"). A first
+        // Right must land on SCHEMES[0], not skip past it to SCHEMES[1].
+        let mut s = Settings::default();
+        s.foreground = [248, 194, 0]; // the user's own; matches nothing
+        s.background = [1, 2, 3];
+        step(&mut s, PrefRow::Preset, 1, &fams());
+        let first = &rt_config::SCHEMES[0];
+        assert_eq!(s.foreground, first.foreground, "Right from custom -> first scheme");
+        assert_eq!(s.background, first.background);
+        assert_eq!(s.palette, first.palette);
+        // And from custom, a first Left lands on the LAST scheme.
+        let mut s = Settings::default();
+        s.foreground = [248, 194, 0];
+        s.background = [1, 2, 3];
+        step(&mut s, PrefRow::Preset, -1, &fams());
+        let last = &rt_config::SCHEMES[rt_config::SCHEMES.len() - 1];
+        assert_eq!(s.foreground, last.foreground, "Left from custom -> last scheme");
+        assert_eq!(s.background, last.background);
+        assert_eq!(s.palette, last.palette);
+    }
+
+    #[test]
+    fn family_from_unmatched_lands_on_the_first_family_not_the_second() {
+        // Current family isn't among the installed ones. Right -> first (index 0),
+        // Left -> last (index n-1); neither skips index 0.
+        let mut s = Settings::default();
+        s.font_family = "Not Installed".to_string();
+        step(&mut s, PrefRow::FontFamily, 1, &fams());
+        assert_eq!(s.font_family, "Alpha Mono", "Right from unmatched -> first family");
+        let mut s = Settings::default();
+        s.font_family = "Not Installed".to_string();
+        step(&mut s, PrefRow::FontFamily, -1, &fams());
+        assert_eq!(s.font_family, "Gamma Mono", "Left from unmatched -> last family");
     }
 
     #[test]
