@@ -9,6 +9,7 @@ use crate::render::Color;
 pub mod instruments;
 pub mod manual;
 pub mod menu;
+pub mod prefs;
 pub mod search;
 
 /// An axis-aligned layout rectangle in window pixels.
