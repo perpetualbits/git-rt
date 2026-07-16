@@ -7,8 +7,10 @@
 // do. (Same scaffolding Task 1 added to `prefs_model.rs`.)
 #![allow(dead_code)]
 
+use crate::backend::Backend;
 use crate::chrome::Recti;
 use crate::prefs_model::{enabled, preset_name, PrefRow};
+use crate::render::Color;
 use rt_config::Settings;
 
 // NOTE: line counts use the EXISTING `crate::fmt_lines` (main.rs), which already
@@ -275,6 +277,81 @@ pub fn hit(g: &Geom, p: (f32, f32)) -> Option<Hit> {
         }
     }
     None
+}
+
+const PANEL_BG: Color = Color(0.10, 0.10, 0.12, 0.97);
+const PANEL_EDGE: Color = Color(0.35, 0.35, 0.42, 1.0);
+const SEL_BG: Color = Color(0.18, 0.20, 0.28, 1.0);
+const TEXT: Color = Color(0.82, 0.82, 0.86, 1.0);
+const TEXT_DIM: Color = Color(0.45, 0.45, 0.50, 1.0);
+const SECTION: Color = Color(0.55, 0.72, 0.90, 1.0);
+
+/// Paint the dialog. `swatches` is `[fg, bg, palette…]`, painted into the
+/// `Swatches` row; `sel` is the selected row index.
+pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], sel: usize, swatches: &[Color], cell_w: f32, cell_h: f32) {
+    // Panel: a 1px edge drawn as four thin fills around an opaque body.
+    let p = g.panel;
+    be.fill_rect(p.x, p.y, p.w, p.h, PANEL_BG);
+    be.fill_rect(p.x, p.y, p.w, 1.0, PANEL_EDGE);
+    be.fill_rect(p.x, p.y + p.h - 1.0, p.w, 1.0, PANEL_EDGE);
+    be.fill_rect(p.x, p.y, 1.0, p.h, PANEL_EDGE);
+    be.fill_rect(p.x + p.w - 1.0, p.y, 1.0, p.h, PANEL_EDGE);
+
+    for (i, row) in rows.iter().enumerate() {
+        // Skip rows scrolled out of view (layout parked them off-panel).
+        if i < g.scroll || i >= g.scroll + g.visible {
+            continue;
+        }
+        let r = g.rows[i];
+        if i == sel {
+            be.fill_rect(r.x + 1.0, r.y, r.w - 2.0, r.h, SEL_BG);
+        }
+        let ty = r.y + 2.0;
+        let colour = if !row.enabled {
+            TEXT_DIM
+        } else {
+            match row.kind {
+                RowKind::Section => SECTION,
+                RowKind::Display => TEXT_DIM,
+                _ => TEXT,
+            }
+        };
+        // Label: sections sit flush, everything else indents one cell.
+        let lx = if matches!(row.kind, RowKind::Section) { r.x + PAD_X } else { r.x + PAD_X + cell_w };
+        for (c, ch) in row.label.chars().enumerate() {
+            be.draw_char(lx, ty, c, 0, ch, colour, matches!(row.kind, RowKind::Section), false);
+        }
+        // A Display row's text IS its value, and it can be long: start at the
+        // label column rather than the value column so it is not clipped.
+        if matches!(row.kind, RowKind::Display) {
+            for (c, ch) in row.value.chars().enumerate() {
+                be.draw_char(lx, ty, c, 0, ch, colour, false, false);
+            }
+            continue;
+        }
+        // Swatches: fg, bg, then the 16 palette colours, as small squares.
+        if matches!(row.kind, RowKind::Swatches) {
+            let s = cell_h * 0.6;
+            let mut sx = r.x + r.w - PAD_X - swatches.len() as f32 * (s + 2.0);
+            for c in swatches {
+                be.fill_rect(sx, r.y + (r.h - s) * 0.5, s, s, *c);
+                sx += s + 2.0;
+            }
+            continue;
+        }
+        // Value, in the value column (right side of the row, sized to the
+        // widest value so it lines up across every row and never collides
+        // with the arrow zones `layout` reserved at the same `vx`).
+        let vx = r.x + r.w - PAD_X - VALUE_COLS as f32 * cell_w;
+        for (c, ch) in row.value.chars().enumerate() {
+            be.draw_char(vx, ty, c, 0, ch, colour, false, false);
+        }
+        // Arrows, only where a step is possible.
+        if let (Some(l), Some(right)) = (g.left[i], g.right[i]) {
+            be.draw_char(l.x, ty, 0, 0, '◄', colour, false, false);
+            be.draw_char(right.x, ty, 0, 0, '►', colour, false, false);
+        }
+    }
 }
 
 #[cfg(test)]
