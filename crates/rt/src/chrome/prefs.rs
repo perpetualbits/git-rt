@@ -361,9 +361,6 @@ mod tests {
     use super::*;
     use rt_config::Settings;
 
-    fn fams() -> Vec<String> {
-        vec!["DejaVu Sans Mono".to_string()]
-    }
     fn rs(s: &Settings) -> Vec<Row> {
         rows(s, 16 * 1024 * 1024 * 1024, 80) // 16 GB of RAM, an 80-column pane
     }
