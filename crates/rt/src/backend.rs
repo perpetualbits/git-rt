@@ -89,10 +89,13 @@ pub trait Backend {
     fn partial_present_available(&self) -> bool;
     /// Whether the X11 Route-1 damage-rect present path is active.
     fn x11_present_active(&self) -> bool;
-    /// Whether this backend can render the `egui_glow` chrome (menu, preferences,
-    /// manual, search, border instruments). The GL backend can; the XRender
-    /// backend has no GL context, so it returns `false` and the overlays are
-    /// skipped (Slice 1 chrome degradation — see the mechanism-C spec).
+    /// Whether this backend can render the `egui_glow` chrome (menu, manual,
+    /// search, border instruments). The GL backend can; the XRender backend has
+    /// no GL context, so it returns `false` and those overlays are skipped
+    /// (Slice 1 chrome degradation — see the mechanism-C spec). NOTE: preferences
+    /// is deliberately NOT in this list — it is drawn natively through `fill_rect`
+    /// / `draw_char` on BOTH backends (`chrome/prefs.rs`), so it no longer gates
+    /// on egui support.
     fn supports_egui(&self) -> bool {
         true
     }

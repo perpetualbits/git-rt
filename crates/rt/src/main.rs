@@ -882,8 +882,11 @@ impl ApplicationHandler for App {
             };
         }
 
-        // egui overlay for chrome (preferences, colour pickers). Shares our GL
-        // context via egui_glow's painter; egui-winit bridges window input.
+        // egui overlay for the GL-path chrome that still uses it: menu, manual,
+        // search, and the border instruments. (Preferences moved to a native
+        // dialog on both backends — see `chrome/prefs.rs` — so it no longer needs
+        // this.) Shares our GL context via egui_glow's painter; egui-winit
+        // bridges window input.
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
