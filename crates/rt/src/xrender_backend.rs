@@ -109,6 +109,22 @@ fn premultiply(c: Color) -> render::Color {
     render::Color { red: s(c.0 * c.3), green: s(c.1 * c.3), blue: s(c.2 * c.3), alpha: s(c.3) }
 }
 
+/// The RENDER colour to clear the background with, given the window `depth`.
+///
+/// On a 32-bit ARGB window the clear is PREMULTIPLIED (Wayland/Xwayland surfaces
+/// expect premultiplied alpha, like the GL path's premultiplied `clear_color`) so
+/// the compositor blends `background_opacity` correctly. On a 24-bit window there
+/// is no alpha channel, so premultiplying would just darken the RGB — use the
+/// straight colour, which the opaque drawable renders exactly as today. At the
+/// default opacity 1.0 the two are identical.
+fn bg_clear_color(depth: u8, bg: Color) -> render::Color {
+    if depth == 32 {
+        premultiply(bg)
+    } else {
+        to_render_color(bg)
+    }
+}
+
 pub struct XRenderBackend {
     conn: RustConnection,
     window: u32,                // X window id (CopyArea destination)
@@ -694,7 +710,7 @@ impl Backend for XRenderBackend {
         // Clear the whole BACK buffer (off-screen) — the window is untouched until
         // `present` copies the finished frame, so a full repaint never flashes.
         let rect = xproto::Rectangle { x: 0, y: 0, width: self.win_w, height: self.win_h };
-        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, to_render_color(bg), &[rect]);
+        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, bg_clear_color(self.depth, bg), &[rect]);
     }
     fn begin_frame_scissored(&mut self, bg: Color, bbox: PxRect) {
         if self.debug_fill {
@@ -702,7 +718,7 @@ impl Backend for XRenderBackend {
         }
         self.clip = Some(bbox);
         let rect = xproto::Rectangle { x: bbox.x as i16, y: bbox.y as i16, width: bbox.w as u16, height: bbox.h as u16 };
-        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, to_render_color(bg), &[rect]);
+        let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, bg_clear_color(self.depth, bg), &[rect]);
     }
     fn clear_scissor(&mut self) {
         self.clip = None;
@@ -1090,6 +1106,50 @@ mod premult_tests {
     fn premultiply_fully_transparent_is_zero() {
         let c = premultiply(Color(1.0, 1.0, 1.0, 0.0));
         assert_eq!((c.red, c.green, c.blue, c.alpha), (0, 0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod bg_clear_tests {
+    use super::*;
+    use crate::render::Color;
+
+    // NOTE: x11rb's `render::Color` only derives PartialEq/Debug under the
+    // `extra-traits` feature (not enabled here), so assert on FIELDS, not the
+    // whole struct — matching the existing `premult_tests` in this file.
+
+    #[test]
+    fn depth_32_premultiplies_the_translucent_background() {
+        // 35% opaque pure-red bg on a 32-bit ARGB window: the clear must be
+        // PREMULTIPLIED (red scaled by alpha) so the compositor blends it
+        // correctly, and must carry the alpha.
+        let c = bg_clear_color(32, Color(1.0, 0.0, 0.0, 0.35));
+        let want = premultiply(Color(1.0, 0.0, 0.0, 0.35));
+        assert_eq!((c.red, c.green, c.blue, c.alpha), (want.red, want.green, want.blue, want.alpha));
+        assert_eq!(c.alpha, (0.35 * 65535.0) as u16, "alpha must be carried");
+        assert_eq!(c.red, (1.0 * 0.35 * 65535.0) as u16, "red must be premultiplied");
+    }
+
+    #[test]
+    fn depth_24_is_opaque_straight_colour_not_premultiplied() {
+        // Same bg on a 24-bit window: the drawable has no alpha channel, so the
+        // clear must NOT premultiply (that would darken the RGB to a wrong dark
+        // opaque background). It uses the straight colour, exactly as before.
+        let c = bg_clear_color(24, Color(1.0, 0.0, 0.0, 0.35));
+        let want = to_render_color(Color(1.0, 0.0, 0.0, 0.35));
+        assert_eq!((c.red, c.green, c.blue, c.alpha), (want.red, want.green, want.blue, want.alpha));
+        assert_eq!(c.red, 65535, "red must stay full, not scaled by alpha");
+    }
+
+    #[test]
+    fn opaque_background_is_identical_on_both_depths() {
+        // The default background_opacity is 1.0. premultiply at alpha 1.0 equals
+        // the straight colour, so a 32-bit and 24-bit clear are identical then —
+        // which is why the opacity-less Xvfb gates are unaffected.
+        let opaque = Color(0.1, 0.1, 0.12, 1.0);
+        let a = bg_clear_color(32, opaque);
+        let b = bg_clear_color(24, opaque);
+        assert_eq!((a.red, a.green, a.blue, a.alpha), (b.red, b.green, b.blue, b.alpha));
     }
 }
 
