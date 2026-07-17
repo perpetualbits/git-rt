@@ -668,11 +668,27 @@ impl ApplicationHandler for App {
         // which is the supported winit-0.30/glutin-0.32 pattern.
         let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attrs));
         let (window, gl_config) = match display_builder.build(event_loop, template, |configs| {
-            // Pick a config that HAS an alpha channel first (needed for a
-            // transparent window), then, among equal alpha, the most samples.
+            // Prefer a config whose X11 VISUAL supports transparency, before any
+            // other criterion. On X11 the WINDOW's visual — not the GL drawable's
+            // alpha_size — decides transparency: a config can report alpha_size 8
+            // yet have a 24-bit visual, giving an OPAQUE window (background_opacity
+            // is then silently dropped over ssh -X). supports_transparency() is
+            // Some(true) only when the config's native visual is 32-bit ARGB, which
+            // is what a translucent window over Xwayland needs. Native Wayland
+            // already reports transparency-capable configs, so this is a no-op
+            // there; and where no such config exists (bare X, no compositor) we
+            // fall through to the alpha/sample preference and stay 24-bit.
             configs
                 .reduce(|a, b| {
-                    let better_alpha = b.alpha_size() > a.alpha_size(); // prefer any alpha
+                    let (at, bt) = (
+                        a.supports_transparency().unwrap_or(false),
+                        b.supports_transparency().unwrap_or(false),
+                    );
+                    if at != bt {
+                        return if bt { b } else { a }; // the transparency-capable one wins
+                    }
+                    // Tie on transparency: prefer more alpha, then more samples.
+                    let better_alpha = b.alpha_size() > a.alpha_size();
                     let same_more_samples = b.alpha_size() == a.alpha_size() && b.num_samples() > a.num_samples();
                     if better_alpha || same_more_samples { b } else { a }
                 })
