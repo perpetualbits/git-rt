@@ -395,34 +395,22 @@ impl XRenderBackend {
         // Same family as the half-drawn borders that made `present()` full-window.
         // That fix made the WINDOW show the whole back buffer; it could not help
         // when the back buffer itself had been overwritten. This is the other half.
-        let (in_x, in_y, in_w, in_h) = (x, y, w, h); // pre-trim floats, for RT_DEBUG_FILL
-        let (mut x, mut y, mut w, mut h) = (x, y, w, h);
-        if let Some(b) = self.clip {
-            if !rect_intersects(x, y, w, h, b) {
-                return; // wholly outside: nothing to do
+        let Some(rect) = trim_to_clip(x, y, w, h, self.clip) else {
+            if self.debug_fill {
+                log::info!("FILL in=({x:.3},{y:.3},{w:.3},{h:.3}) clip={:?} -> SKIP", self.clip);
             }
-            let (x0, y0) = (x.max(b.x as f32), y.max(b.y as f32));
-            let (x1, y1) = ((x + w).min(b.right() as f32), (y + h).min(b.bottom() as f32));
-            if x1 <= x0 || y1 <= y0 {
-                return; // degenerate after trimming
-            }
-            x = x0;
-            y = y0;
-            w = x1 - x0;
-            h = y1 - y0;
-        }
-        let rect = xproto::Rectangle { x: x as i16, y: y as i16, width: w.max(0.0) as u16, height: h.max(0.0) as u16 };
+            return;
+        };
         if self.debug_fill {
-            // The float input pre-trim (x0/y0/w0/h0), the clip, and the int rect
-            // that actually gets issued. Adjacent cell fills whose int rects leave
-            // a horizontal gap (rect_n.x+width < rect_{n+1}.x) are the artefact.
             log::info!(
-                "FILL in=({in_x:.3},{in_y:.3},{in_w:.3},{in_h:.3}) clip={:?} -> rect=(x={} y={} w={} h={}) instr={}",
+                "FILL in=({x:.3},{y:.3},{w:.3},{h:.3}) clip={:?} -> rect=(x={} y={} w={} h={}) instr={}",
                 self.clip, rect.x, rect.y, rect.width, rect.height, self.drawing_instruments,
             );
         }
         if self.drawing_instruments {
             // ARGB layer: OVER with premultiplied colour so alpha blends correctly.
+            // Instruments draw with clip=None (see begin_instrument_layer), so the
+            // untrimmed float coords ARE what got issued; note them for the composite.
             self.note_instr_rect(x, y, w, h); // clip the composite to what we paint
             let _ = render::fill_rectangles(&self.conn, render::PictOp::OVER, self.dst_pic, premultiply(c), &[rect]);
         } else {
@@ -564,6 +552,49 @@ fn outward_rect(x: f32, y: f32, w: f32, h: f32, win_w: u16, win_h: u16) -> Optio
         return None; // empty, or wholly off the window
     }
     Some(xproto::Rectangle { x: x0 as i16, y: y0 as i16, width: (x1 - x0) as u16, height: (y1 - y0) as u16 })
+}
+
+/// Trim a float fill rect to `clip` (if any) and convert it to an integer pixel
+/// `Rectangle`, or `None` when nothing lands inside the clip.
+///
+/// The subtle part is FLOORING the trimmed origin before deriving the width and
+/// height. A pane whose split is not cell-aligned has a FRACTIONAL origin, so its
+/// cells sit at `x.5` positions. The damage clip is integer pixels, so its far
+/// edge cuts the cell's trailing sub-pixel; then, without flooring, the fractional
+/// origin loses the LEADING sub-pixel to the `as u16` width truncation as well —
+/// two half-pixels gone, a whole pixel column dropped. That produced the 1px black
+/// gaps at cell boundaries in right/nested panes' titlebars, and the missing
+/// cursor right-edge, on scissored XRender frames. Confirmed with RT_DEBUG_FILL on
+/// the milkv: a cell `x=892.5 w=11` under `clip.right=903` came out `width=10`
+/// (lost px 902), and the cursor's 1px right edge `x=902.5 w=1` came out `width=0`
+/// (not drawn). Flooring the origin restores both to their full width.
+///
+/// Full-frame fills (`clip == None`) are unaffected — they already tile, because
+/// the truncation of consistently-fractional cell origins is itself consistent.
+fn trim_to_clip(x: f32, y: f32, w: f32, h: f32, clip: Option<PxRect>) -> Option<xproto::Rectangle> {
+    let (mut x, mut y, mut w, mut h) = (x, y, w, h);
+    if let Some(b) = clip {
+        if !rect_intersects(x, y, w, h, b) {
+            return None; // wholly outside the damage
+        }
+        let (x0, y0) = (x.max(b.x as f32), y.max(b.y as f32));
+        let (x1, y1) = ((x + w).min(b.right() as f32), (y + h).min(b.bottom() as f32));
+        if x1 <= x0 || y1 <= y0 {
+            return None; // degenerate after trimming
+        }
+        // Floor the origin FIRST, then derive size to the (clip-clamped) far edge,
+        // so the leading sub-pixel is not also lost. See the doc comment.
+        x = x0.floor();
+        y = y0.floor();
+        w = x1 - x;
+        h = y1 - y;
+    }
+    let width = w.max(0.0) as u16;
+    let height = h.max(0.0) as u16;
+    if width == 0 || height == 0 {
+        return None; // nothing to paint
+    }
+    Some(xproto::Rectangle { x: x as i16, y: y as i16, width, height })
 }
 
 fn rect_intersects(x: f32, y: f32, w: f32, h: f32, b: PxRect) -> bool {
@@ -878,6 +909,64 @@ impl Drop for XRenderBackend {
         let _ = render::free_picture(&self.conn, self.instr_pic);
         let _ = xproto::free_pixmap(&self.conn, self.instr_pixmap);
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod trim_fractional_tests {
+    use super::*;
+
+    // The exact numbers RT_DEBUG_FILL captured on the milkv for the 1px-gap bug.
+    // clip = PxRect{x:189, y:38, w:714, h:21} => right edge = 189+714 = 903.
+    fn milkv_clip() -> PxRect {
+        PxRect { x: 189, y: 38, w: 714, h: 21 }
+    }
+
+    #[test]
+    fn fractional_cell_keeps_full_width_under_an_integer_clip() {
+        // A cell at x=892.5 spanning to 903.5, clip cuts the far edge at 903.
+        // Before the fix this came out width=10 (dropped px 902 -> the black gap).
+        let r = trim_to_clip(892.5, 38.0, 11.0, 21.0, Some(milkv_clip())).expect("inside clip");
+        assert_eq!(r.x, 892);
+        assert_eq!(r.width, 11, "must not lose the rightmost pixel column");
+    }
+
+    #[test]
+    fn fractional_cursor_right_edge_is_still_drawn() {
+        // The hollow cursor's 1px right edge at x=902.5, clip.right=903.
+        // Before the fix width=0 -> the cursor's right side vanished.
+        let r = trim_to_clip(902.5, 38.0, 1.0, 21.0, Some(milkv_clip())).expect("inside clip");
+        assert_eq!(r.width, 1, "the 1px edge must survive trimming, not collapse to 0");
+    }
+
+    #[test]
+    fn adjacent_fractional_cells_tile_with_no_gap() {
+        // Two neighbouring cells (cell_w=11) at fractional origins, both fully
+        // inside a wide clip. Their integer rects must abut (no gap, no overlap
+        // beyond 1px) so no black slit appears between them.
+        let clip = Some(PxRect { x: 0, y: 0, w: 2000, h: 100 });
+        let a = trim_to_clip(892.5, 0.0, 11.0, 21.0, clip).unwrap();
+        let b = trim_to_clip(903.5, 0.0, 11.0, 21.0, clip).unwrap();
+        let a_right = a.x as i32 + a.width as i32;
+        assert!(a_right >= b.x as i32, "gap between adjacent cells: a ends {a_right}, b starts {}", b.x);
+        assert!(a_right <= b.x as i32 + 1, "excessive overlap of adjacent cells");
+    }
+
+    #[test]
+    fn full_frame_fills_are_unchanged_and_tile() {
+        // clip=None: consistently-fractional origins truncate consistently, so
+        // adjacent cells already tile. The fix must not disturb this.
+        let a = trim_to_clip(892.5, 0.0, 11.0, 21.0, None).unwrap();
+        let b = trim_to_clip(903.5, 0.0, 11.0, 21.0, None).unwrap();
+        assert_eq!((a.x, a.width), (892, 11));
+        assert_eq!(a.x as i32 + a.width as i32, b.x as i32, "full-frame cells abut exactly");
+    }
+
+    #[test]
+    fn fully_outside_or_degenerate_yields_none() {
+        let clip = Some(PxRect { x: 100, y: 100, w: 50, h: 50 });
+        assert!(trim_to_clip(10.0, 10.0, 5.0, 5.0, clip).is_none(), "outside the clip");
+        assert!(trim_to_clip(50.0, 50.0, 0.0, 0.0, None).is_none(), "zero area");
     }
 }
 
