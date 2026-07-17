@@ -168,6 +168,7 @@ pub struct XRenderBackend {
     glyphs: HashMap<char, u32>,
     next_glyph_id: u32,
     clip: Option<PxRect>,  // damage clip; None = whole window
+    debug_fill: bool,      // RT_DEBUG_FILL: log every fill's float in / clip / int rect out
     win_w: u16,
     win_h: u16,
 }
@@ -292,6 +293,7 @@ impl XRenderBackend {
             glyphs: HashMap::new(),
             next_glyph_id: 1,
             clip: None,
+            debug_fill: std::env::var_os("RT_DEBUG_FILL").is_some(),
             win_w,
             win_h,
         })
@@ -393,6 +395,7 @@ impl XRenderBackend {
         // Same family as the half-drawn borders that made `present()` full-window.
         // That fix made the WINDOW show the whole back buffer; it could not help
         // when the back buffer itself had been overwritten. This is the other half.
+        let (in_x, in_y, in_w, in_h) = (x, y, w, h); // pre-trim floats, for RT_DEBUG_FILL
         let (mut x, mut y, mut w, mut h) = (x, y, w, h);
         if let Some(b) = self.clip {
             if !rect_intersects(x, y, w, h, b) {
@@ -409,6 +412,15 @@ impl XRenderBackend {
             h = y1 - y0;
         }
         let rect = xproto::Rectangle { x: x as i16, y: y as i16, width: w.max(0.0) as u16, height: h.max(0.0) as u16 };
+        if self.debug_fill {
+            // The float input pre-trim (x0/y0/w0/h0), the clip, and the int rect
+            // that actually gets issued. Adjacent cell fills whose int rects leave
+            // a horizontal gap (rect_n.x+width < rect_{n+1}.x) are the artefact.
+            log::info!(
+                "FILL in=({in_x:.3},{in_y:.3},{in_w:.3},{in_h:.3}) clip={:?} -> rect=(x={} y={} w={} h={}) instr={}",
+                self.clip, rect.x, rect.y, rect.width, rect.height, self.drawing_instruments,
+            );
+        }
         if self.drawing_instruments {
             // ARGB layer: OVER with premultiplied colour so alpha blends correctly.
             self.note_instr_rect(x, y, w, h); // clip the composite to what we paint
@@ -644,6 +656,9 @@ impl Backend for XRenderBackend {
     }
 
     fn begin_frame(&mut self, bg: Color) {
+        if self.debug_fill {
+            log::info!("--- FRAME begin_frame (FULL) ---");
+        }
         self.clip = None;
         // Clear the whole BACK buffer (off-screen) — the window is untouched until
         // `present` copies the finished frame, so a full repaint never flashes.
@@ -651,6 +666,9 @@ impl Backend for XRenderBackend {
         let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, to_render_color(bg), &[rect]);
     }
     fn begin_frame_scissored(&mut self, bg: Color, bbox: PxRect) {
+        if self.debug_fill {
+            log::info!("--- FRAME begin_frame_scissored bbox={bbox:?} ---");
+        }
         self.clip = Some(bbox);
         let rect = xproto::Rectangle { x: bbox.x as i16, y: bbox.y as i16, width: bbox.w as u16, height: bbox.h as u16 };
         let _ = render::fill_rectangles(&self.conn, render::PictOp::SRC, self.back_pic, to_render_color(bg), &[rect]);
