@@ -3142,6 +3142,30 @@ impl App {
                         Color::rgb(0x55, 0x55, 0x66) // at the bottom: dimmer
                     };
                     active.backend.fill_rect(bx, thumb_y, bw, thumb_h, thumb_col);
+                    // Scrollback-search hit markers: amber ticks on the track
+                    // where matches lie, like a browser's find bar. Drawn over the
+                    // thumb so every hit stays visible; the current hit gets a
+                    // brighter, taller tick. Only for the pane these matches belong
+                    // to, while the search bar is open.
+                    if active.search_open
+                        && active.search_pane == Some(id)
+                        && !active.search_matches.is_empty()
+                    {
+                        let mx = bx - 2.0; // overhang the track a touch so ticks read as markers
+                        let mw = bw + 4.0;
+                        let others =
+                            hit_marker_ys(active.search_matches.iter().map(|m| m.line), history, screen, rect);
+                        for y in others {
+                            active.backend.fill_rect(mx, y, mw, 2.0, Color::rgb(0xb0, 0x90, 0x30));
+                        }
+                        if let Some(m) = active.search_matches.get(active.search_index) {
+                            if let Some(&y) =
+                                hit_marker_ys(std::iter::once(m.line), history, screen, rect).first()
+                            {
+                                active.backend.fill_rect(mx, y - 1.0, mw, 3.0, Color::rgb(0xff, 0xd8, 0x55));
+                            }
+                        }
+                    }
                 }
             }
             // Per-pane titlebar strip (Terminator-style), drawn in the reserved
@@ -4491,6 +4515,34 @@ fn column_separator(fg: [u8; 3], bg: [u8; 3]) -> Color {
     Color::rgb(mid(fg[0], bg[0]), mid(fg[1], bg[1]), mid(fg[2], bg[2]))
 }
 
+/// Y positions (physical px) for scrollback-search hit markers on a pane's
+/// scrollbar track — Chrome/Firefox-style ticks showing where the matches lie in
+/// the whole buffer. `lines` are absolute grid lines (`<= 0` in history, up to
+/// `screen - 1` at the newest); the track `[rect.y, rect.y + rect.h]` spans the
+/// full `history + screen` lines, matching `scrollbar_metrics`' thumb mapping.
+///
+/// Positions are rounded to the pixel and de-duplicated, so a dense cluster of
+/// hits collapses into a single tick instead of a solid bar — this is both the
+/// "clusters too close together" behaviour and the cap that keeps the marker
+/// count bounded by the track height (never the hit count) over `ssh -X`.
+fn hit_marker_ys(
+    lines: impl Iterator<Item = i32>,
+    history: usize,
+    screen: usize,
+    rect: Rect,
+) -> Vec<f32> {
+    let total = (history + screen).max(1) as f32;
+    let mut rows: Vec<i32> = lines
+        .map(|l| {
+            let norm = ((l + history as i32) as f32 / total).clamp(0.0, 1.0);
+            (rect.y + norm * rect.h).round() as i32
+        })
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    rows.into_iter().map(|y| y as f32).collect()
+}
+
 /// A pointer action to report to the application running inside a pane.
 #[derive(Clone, Copy)]
 enum MouseReport {
@@ -4628,6 +4680,34 @@ mod sep_tests {
         // Per channel, not a single grey: colours mix independently.
         let c2 = column_separator([200, 100, 0], [0, 0, 40]);
         assert_eq!(c2, Color::rgb(100, 50, 20));
+    }
+
+    #[test]
+    fn hit_markers_span_the_track_and_dedupe() {
+        // A very tall buffer against a short track, so nearby lines share a row.
+        let rect = Rect::new(0.0, 100.0, 10.0, 200.0); // track y ∈ [100, 300]
+        let (history, screen) = (100_000usize, 100usize);
+
+        // The oldest line pins to the top of the track; the newest to the bottom.
+        let top = hit_marker_ys(std::iter::once(-(history as i32)), history, screen, rect);
+        assert_eq!(top, vec![100.0]);
+        let newest = hit_marker_ys(std::iter::once(screen as i32 - 1), history, screen, rect);
+        assert!(newest[0] > 298.0, "newest hit sits near the track bottom");
+
+        // Two adjacent lines collapse to one tick (the cluster behaviour) — at
+        // this scale a single line is far under a pixel of track.
+        let close = hit_marker_ys([0i32, 1].into_iter(), history, screen, rect);
+        assert_eq!(close.len(), 1);
+
+        // Hits spread across the whole buffer yield sorted, unique ticks.
+        let spread = hit_marker_ys(
+            [-(history as i32), -(history as i32) / 2, screen as i32 - 1].into_iter(),
+            history,
+            screen,
+            rect,
+        );
+        assert_eq!(spread.len(), 3);
+        assert!(spread.windows(2).all(|w| w[0] < w[1]));
     }
 }
 
