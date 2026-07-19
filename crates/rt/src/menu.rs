@@ -17,8 +17,6 @@ enum Item {
     Action(&'static str, Action),
     /// A thin divider line (not clickable).
     Separator,
-    /// A non-clickable informational line, drawn dim (e.g. the version footer).
-    Info(&'static str),
 }
 
 /// The menu's rows, top to bottom. Terminator-style pane actions first, then
@@ -46,9 +44,6 @@ fn items() -> Vec<Item> {
         Item::Action("Toggle Focus-Follows-Mouse", Action::ToggleFocusFollowsMouse),
         Item::Action("Preferences…", Action::Preferences),
         Item::Action("Manual", Action::Manual),
-        Item::Separator,
-        // A dim, non-clickable footer naming the running build.
-        Item::Info(concat!("rt v", env!("CARGO_PKG_VERSION"))),
     ]
 }
 
@@ -116,15 +111,17 @@ pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>) -> Vec<Row>
                 enabled: true,
             }),
             Item::Separator => out.push(sep()),
-            // Informational: a labelled but disabled, non-dispatching row.
-            Item::Info(label) => out.push(Row {
-                label: label.to_string(),
-                accel: None,
-                action: None,
-                enabled: false,
-            }),
         }
     }
+    // A dim, non-clickable footer: the crate version plus the git commit it was
+    // built from (via build.rs' RT_GIT_DESC), so which build is running — and
+    // whether all three machines match — is visible at a glance in the menu.
+    out.push(sep());
+    let ver = match option_env!("RT_GIT_DESC") {
+        Some(g) if !g.is_empty() => format!("rt v{} ({g})", env!("CARGO_PKG_VERSION")),
+        _ => format!("rt v{}", env!("CARGO_PKG_VERSION")),
+    };
+    out.push(Row { label: ver, accel: None, action: None, enabled: false });
     out
 }
 
