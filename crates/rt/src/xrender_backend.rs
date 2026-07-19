@@ -149,6 +149,14 @@ pub struct XRenderBackend {
     next_glyph_id: u32,
     clip: Option<PxRect>,  // damage clip; None = whole window
     debug_fill: bool,      // RT_DEBUG_FILL: log every fill's float in / clip / int rect out
+    // RT_XDIAG: per-second present / instrument-redraw / flush-blocking counters,
+    // to diagnose ssh -X flooding on a fast client (present rate vs the link's
+    // drain rate). flush() blocking time is the saturation signal.
+    xdiag: bool,
+    xd_last: std::time::Instant,
+    xd_present: u32,
+    xd_geom: u32,
+    xd_flush: std::time::Duration,
     win_w: u16,
     win_h: u16,
 }
@@ -274,6 +282,11 @@ impl XRenderBackend {
             next_glyph_id: 1,
             clip: None,
             debug_fill: std::env::var_os("RT_DEBUG_FILL").is_some(),
+            xdiag: std::env::var_os("RT_XDIAG").is_some(),
+            xd_last: std::time::Instant::now(),
+            xd_present: 0,
+            xd_geom: 0,
+            xd_flush: std::time::Duration::ZERO,
             win_w,
             win_h,
         })
@@ -793,6 +806,9 @@ impl Backend for XRenderBackend {
         self.drawing_instruments = true;   // fill() switches to OVER + premultiplied
     }
     fn end_instrument_layer(&mut self) {
+        if self.xdiag {
+            self.xd_geom += 1; // one instrument-geometry redraw (should be ~6/s)
+        }
         self.dst_pic = self.back_pic;      // back to the content buffer
         self.drawing_instruments = false;
         // Commit this tick's occupancy as the window Picture's clip region, so
@@ -845,7 +861,24 @@ impl Backend for XRenderBackend {
                 0, 0, 0, 0, 0, 0, self.win_w, self.win_h,
             );
         }
+        let ft = std::time::Instant::now();
         let _ = self.conn.flush();
+        if self.xdiag {
+            // flush() blocks when the X connection's send buffer is full (server
+            // not draining fast enough) — the ssh -X saturation signal.
+            self.xd_flush += ft.elapsed();
+            self.xd_present += 1;
+            if self.xd_last.elapsed() >= std::time::Duration::from_secs(1) {
+                eprintln!(
+                    "xdiag: {} present/s, flush blocked {} ms/s, {} instr-redraw/s",
+                    self.xd_present, self.xd_flush.as_millis(), self.xd_geom
+                );
+                self.xd_last = std::time::Instant::now();
+                self.xd_present = 0;
+                self.xd_geom = 0;
+                self.xd_flush = std::time::Duration::ZERO;
+            }
+        }
         false // never needs the GL fallback
     }
     fn full_swap(&mut self) {
