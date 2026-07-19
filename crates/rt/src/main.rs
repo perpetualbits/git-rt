@@ -234,6 +234,15 @@ const WIRE_BUSY_BYTES: f32 = 4096.0;
 /// Packets travelling along a wire at once.
 const WIRE_PACKETS: u32 = 3;
 
+/// Patch-bay jack disc radii (px), shared by the GL (`paint_instruments`) and
+/// native (`chrome::instruments`) paths so the two never drift. Bumped a notch
+/// from the original 6.0/4.6/4.3 — the ports read as too small against the grab
+/// radius (`jack_at`'s 12px). `RING_W` is the unwired-jack outline width.
+const JACK_R_BACK: f32 = 7.5; // dark backing halo
+const JACK_R_FILL: f32 = 5.8; // filled centre when a wire uses the jack
+const JACK_R_RING: f32 = 5.4; // outline radius when the jack is idle
+const JACK_RING_W: f32 = 1.8; // outline stroke width
+
 /// Everything that only exists once a window and GL context are created (which
 /// happens on the first `resumed`). Kept in an `Option` on the `App` so we can
 /// build it lazily and tear it down on suspend.
@@ -4053,23 +4062,6 @@ impl App {
                     prev = pt;
                 }
             }
-            // Jack dots on every pane (filled ● when a wire uses them).
-            for (id, r) in rects.iter().take_while(|_| active.settings.show_jacks) {
-                let has_in = active.wires.iter().any(|w| w.dst == *id);
-                let has_out = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
-                let has_err = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
-                let jack = |p: egui::Pos2, filled: bool, col: egui::Color32| {
-                    painter.circle_filled(p, 6.0, egui::Color32::from_black_alpha(180)); // dark backing
-                    if filled {
-                        painter.circle_filled(p, 4.6, col);
-                    } else {
-                        painter.circle_stroke(p, 4.3, egui::Stroke::new(1.6, col));
-                    }
-                };
-                jack(jack_pos(r, 0), has_in, egui::Color32::from_rgb(0x88, 0x88, 0x98));
-                jack(jack_pos(r, 1), has_out, egui::Color32::from_rgb(0x40, 0xc0, 0x54));
-                jack(jack_pos(r, 2), has_err, egui::Color32::from_rgb(0xd0, 0x54, 0x30));
-            }
             // Rubber-band the in-progress mouse wire from its source jack to the
             // cursor (a dashed bezier, so it reads like the finished wire).
             if let (Some((src, stream)), Some((cx, cy))) = (active.wiring_from, active.drag_cursor) {
@@ -4128,6 +4120,26 @@ impl App {
                         prev = pt;
                     }
                 }
+            }
+            // Jack dots on every pane (filled ● when a wire uses them). Drawn
+            // LAST so nothing crosses them: the latency frame and heat borders
+            // run along the very pane edges the jacks sit on, and would slice a
+            // vertical line through each disc if drawn afterwards.
+            for (id, r) in rects.iter().take_while(|_| active.settings.show_jacks) {
+                let has_in = active.wires.iter().any(|w| w.dst == *id);
+                let has_out = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
+                let has_err = active.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
+                let jack = |p: egui::Pos2, filled: bool, col: egui::Color32| {
+                    painter.circle_filled(p, JACK_R_BACK, egui::Color32::from_black_alpha(180)); // dark backing
+                    if filled {
+                        painter.circle_filled(p, JACK_R_FILL, col);
+                    } else {
+                        painter.circle_stroke(p, JACK_R_RING, egui::Stroke::new(JACK_RING_W, col));
+                    }
+                };
+                jack(jack_pos(r, 0), has_in, egui::Color32::from_rgb(0x88, 0x88, 0x98));
+                jack(jack_pos(r, 1), has_out, egui::Color32::from_rgb(0x40, 0xc0, 0x54));
+                jack(jack_pos(r, 2), has_err, egui::Color32::from_rgb(0xd0, 0x54, 0x30));
             }
         }
         let output = ctx.end_pass();

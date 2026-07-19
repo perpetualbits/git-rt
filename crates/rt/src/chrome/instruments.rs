@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use crate::backend::Backend;
 use crate::chrome::col;
 use crate::{content_bounds, cubic_bezier, flow_point, heat_color32, latency_color, Meter, Wire,
-            BUSY_WAKEUPS, FLOW_PACKETS, WIRE_BUSY_BYTES, WIRE_PACKETS};
+            BUSY_WAKEUPS, FLOW_PACKETS, WIRE_BUSY_BYTES, WIRE_PACKETS,
+            JACK_R_BACK, JACK_R_FILL, JACK_R_RING, JACK_RING_W};
 use rt_core::{PaneId, Rect};
 use crate::Stream;
 
@@ -110,23 +111,6 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
         }
     }
 
-    // Jack dots on every pane.
-    if ctx.show_jacks {
-        for (id, r) in rects {
-            let has_in = ctx.wires.iter().any(|w| w.dst == *id);
-            let has_out = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
-            let has_err = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
-            let mut jack = |p: (f32, f32), filled: bool, c: crate::render::Color| {
-                be.fill_circle(p.0, p.1, 6.0, crate::render::Color(0.0, 0.0, 0.0, 0.70));
-                if filled { be.fill_circle(p.0, p.1, 4.6, c); }
-                else { be.stroke_circle(p.0, p.1, 4.3, 1.6, c); }
-            };
-            jack(jack_pos(r, 0), has_in, crate::render::Color::rgb(0x88, 0x88, 0x98));
-            jack(jack_pos(r, 1), has_out, crate::render::Color::rgb(0x40, 0xc0, 0x54));
-            jack(jack_pos(r, 2), has_err, crate::render::Color::rgb(0xd0, 0x54, 0x30));
-        }
-    }
-
     // Rubber-band wire (dashed) while dragging.
     if let (Some((src, stream)), Some((cx, cy))) = (ctx.wiring_from, ctx.drag_cursor) {
         if let Some(sr) = rect_of(src) {
@@ -178,6 +162,25 @@ pub fn draw(be: &mut dyn Backend, ctx: &InstrCtx) {
                 be.stroke_line(prev.0, prev.1, pt.0, pt.1, 2.0, c);
                 prev = pt;
             }
+        }
+    }
+
+    // Jack dots on every pane. Drawn LAST so nothing crosses them: the latency
+    // frame and heat borders run along the very pane edges the jacks sit on, and
+    // would otherwise slice a vertical line through each disc.
+    if ctx.show_jacks {
+        for (id, r) in rects {
+            let has_in = ctx.wires.iter().any(|w| w.dst == *id);
+            let has_out = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stdout);
+            let has_err = ctx.wires.iter().any(|w| w.src == *id && w.stream == Stream::Stderr);
+            let mut jack = |p: (f32, f32), filled: bool, c: crate::render::Color| {
+                be.fill_circle(p.0, p.1, JACK_R_BACK, crate::render::Color(0.0, 0.0, 0.0, 0.70));
+                if filled { be.fill_circle(p.0, p.1, JACK_R_FILL, c); }
+                else { be.stroke_circle(p.0, p.1, JACK_R_RING, JACK_RING_W, c); }
+            };
+            jack(jack_pos(r, 0), has_in, crate::render::Color::rgb(0x88, 0x88, 0x98));
+            jack(jack_pos(r, 1), has_out, crate::render::Color::rgb(0x40, 0xc0, 0x54));
+            jack(jack_pos(r, 2), has_err, crate::render::Color::rgb(0xd0, 0x54, 0x30));
         }
     }
 }
