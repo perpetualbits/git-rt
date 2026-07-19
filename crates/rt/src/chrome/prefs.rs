@@ -103,6 +103,16 @@ pub fn rows(s: &Settings, mem_total: u64, cols: usize) -> Vec<Row> {
     // `prefs_model::step` needs the installed list, to cycle through it.
     let mut v = Vec::new();
 
+    // The running build, as a dim readout at the very top (a Display row: its
+    // value IS its text, drawn from the label column).
+    v.push(Row {
+        kind: RowKind::Display,
+        label: String::new(),
+        value: crate::version_string(),
+        pref: None,
+        enabled: true,
+    });
+
     v.push(sec("Font"));
     v.push(stepper("Size (px)", format!("{:.0}", s.font_size), PrefRow::FontSize));
     v.push(stepper("Family", s.font_family.clone(), PrefRow::FontFamily));
@@ -451,7 +461,12 @@ mod tests {
         s.scrollback = 1_000_000;
         // 16 GB of RAM, 80 columns.
         let rows = rows(&s, 16 * 1024 * 1024 * 1024, 80);
-        let readout = rows.iter().find(|r| matches!(r.kind, RowKind::Display)).unwrap();
+        // Find the scrollback readout specifically — there is also a version
+        // Display row at the top now.
+        let readout = rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Display) && r.value.contains("per pane"))
+            .unwrap();
         assert!(readout.value.contains("per pane"), "got {:?}", readout.value);
         assert!(readout.value.contains('%'), "must state its share of RAM: {:?}", readout.value);
         assert!(readout.value.contains("80 cols"), "must state the width it assumed");

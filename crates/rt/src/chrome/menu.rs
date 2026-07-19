@@ -73,7 +73,10 @@ pub fn draw(be: &mut dyn Backend, g: &Geom, rows: &[Row], hover: Option<usize>, 
     be.fill_rect(g.panel.x, g.panel.y, 1.0, g.panel.h, border);
     be.fill_rect(g.panel.x + g.panel.w - 1.0, g.panel.y, 1.0, g.panel.h, border);
     for (i, (row, rect)) in rows.iter().zip(&g.rows).enumerate() {
-        if row.action.is_none() {
+        // A separator is the only row with an empty label (matches `layout`); an
+        // info row like the version footer has a label but no action and draws as
+        // dimmed text, not a rule.
+        if row.label.is_empty() {
             // Separator: a thin line centred in its rect.
             be.fill_rect(rect.x + PAD_X, rect.y + rect.h / 2.0, rect.w - PAD_X * 2.0, 1.0, sep);
             continue;

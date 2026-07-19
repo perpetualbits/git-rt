@@ -414,11 +414,7 @@ fn parse_cli() -> Cli {
                 // from-source build (e.g. "rt 0.2.1 (a1b2c3d)") so a dev build is
                 // never mistaken for the release it sits ahead of. option_env!
                 // keeps this compiling even if the build script didn't run.
-                let v = env!("CARGO_PKG_VERSION");
-                match option_env!("RT_GIT_DESC") {
-                    Some(g) if !g.is_empty() => println!("rt {v} ({g})"),
-                    _ => println!("rt {v}"),
-                }
+                println!("{}", version_string());
                 std::process::exit(0);
             }
             "-h" | "--help" => {
@@ -4197,6 +4193,19 @@ fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -
 /// user's colours and sits clearly above the background without reaching the
 /// weight of text. (Wishlist: "column separator lines can be a bit more
 /// visible … a colour halfway between foreground and background".)
+/// The running build's identity — crate version plus the git commit stamped in
+/// by build.rs (e.g. `rt 0.2.8 (42c5ba7)`), so a from-source build is never
+/// mistaken for the release it sits ahead of. Shown by `--version` and in the
+/// menu, manual and preferences. `option_env!` keeps it compiling if build.rs
+/// didn't run (then it's just `rt <version>`).
+pub fn version_string() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    match option_env!("RT_GIT_DESC") {
+        Some(g) if !g.is_empty() => format!("rt {v} ({g})"),
+        _ => format!("rt {v}"),
+    }
+}
+
 fn column_separator(fg: [u8; 3], bg: [u8; 3]) -> Color {
     let mid = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
     Color::rgb(mid(fg[0], bg[0]), mid(fg[1], bg[1]), mid(fg[2], bg[2]))

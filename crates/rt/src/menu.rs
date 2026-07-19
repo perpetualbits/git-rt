@@ -113,15 +113,11 @@ pub fn rows(keymap: &Keymap, has_selection: bool, url: Option<&str>) -> Vec<Row>
             Item::Separator => out.push(sep()),
         }
     }
-    // A dim, non-clickable footer: the crate version plus the git commit it was
-    // built from (via build.rs' RT_GIT_DESC), so which build is running — and
-    // whether all three machines match — is visible at a glance in the menu.
+    // A dim, non-clickable footer naming the running build (version + git commit),
+    // so which build is running — and whether all machines match — is visible at a
+    // glance in the menu.
     out.push(sep());
-    let ver = match option_env!("RT_GIT_DESC") {
-        Some(g) if !g.is_empty() => format!("rt v{} ({g})", env!("CARGO_PKG_VERSION")),
-        _ => format!("rt v{}", env!("CARGO_PKG_VERSION")),
-    };
-    out.push(Row { label: ver, accel: None, action: None, enabled: false });
+    out.push(Row { label: crate::version_string(), accel: None, action: None, enabled: false });
     out
 }
 
@@ -158,7 +154,7 @@ mod tests {
     #[test]
     fn version_row_is_a_disabled_info_footer() {
         let r = rows(&Keymap::default(), false, None);
-        let v = r.iter().find(|r| r.label.starts_with("rt v")).expect("a version row");
+        let v = r.iter().find(|r| r.label.starts_with("rt ")).expect("a version row");
         assert!(v.label.contains(env!("CARGO_PKG_VERSION")), "shows the crate version");
         assert!(!v.enabled, "the version row is informational, not clickable");
         assert!(v.action.is_none(), "the version row dispatches nothing");
