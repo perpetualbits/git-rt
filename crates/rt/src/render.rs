@@ -39,7 +39,7 @@ pub struct FontBlobs {
 }
 
 /// An RGBA colour in 0..=1 floats, matching the shader's vertex colour input.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Color(pub f32, pub f32, pub f32, pub f32);
 
 impl Color {

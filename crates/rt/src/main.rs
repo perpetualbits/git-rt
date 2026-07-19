@@ -2959,7 +2959,7 @@ impl App {
 
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, cell_h) = active.backend.cell_size(); // px per cell
-        let sep = Color::rgb(0x2a, 0x2a, 0x33); // subtle inter-column separator colour
+        let sep = column_separator(active.settings.foreground, cfg_bg); // fg/bg midpoint: visible but not text-weight
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.) Iterates the pre-fetched
         // snapshots so the engine's damage state is not advanced again here.
@@ -4468,6 +4468,17 @@ fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -
     (bx, bw, thumb_y, thumb_h)
 }
 
+/// Colour for the thin rules between newspaper columns: the midpoint of the
+/// pane's foreground and background. A fixed near-background grey (the old
+/// `0x2a2a33`) was too faint to read on most schemes; the fg/bg mean tracks the
+/// user's colours and sits clearly above the background without reaching the
+/// weight of text. (Wishlist: "column separator lines can be a bit more
+/// visible … a colour halfway between foreground and background".)
+fn column_separator(fg: [u8; 3], bg: [u8; 3]) -> Color {
+    let mid = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
+    Color::rgb(mid(fg[0], bg[0]), mid(fg[1], bg[1]), mid(fg[2], bg[2]))
+}
+
 /// A pointer action to report to the application running inside a pane.
 #[derive(Clone, Copy)]
 enum MouseReport {
@@ -4590,6 +4601,21 @@ fn main() {
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod sep_tests {
+    use super::*;
+
+    #[test]
+    fn column_separator_is_the_fg_bg_midpoint() {
+        // A light-on-dark scheme: each channel is the mean of fg and bg.
+        let c = column_separator([210, 210, 210], [30, 30, 30]);
+        assert_eq!(c, Color::rgb(120, 120, 120));
+        // Per channel, not a single grey: colours mix independently.
+        let c2 = column_separator([200, 100, 0], [0, 0, 40]);
+        assert_eq!(c2, Color::rgb(100, 50, 20));
     }
 }
 
