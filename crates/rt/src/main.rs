@@ -276,6 +276,14 @@ struct Active {
     lat_phase: f32,                       // phase of the latency frame's undulation
     stall: f32,                           // latency-spike severity (decays); flares on a late wake
     last_wake: Instant,                   // wall-clock of the previous event-loop wake
+    // RT_XDIAG loop-side diagnostic: is the event loop iterating fast (input
+    // delivery is the bottleneck) or stalling (a blocking op per iteration)?
+    ld_on: bool,
+    ld_last: Instant,
+    ld_prev: Instant,
+    ld_wakes: u32,
+    ld_keys: u32,
+    ld_maxgap_us: u128,
     active_until: Instant,                // poll fast (animate) until here; set on input/output, else idle-throttle
     last_input: Instant,                  // last keystroke; the cursor soft-blinks for a bounded window after it
     last_anim: Instant,                   // last animation-driven repaint; throttled hard on a software renderer
@@ -967,6 +975,12 @@ impl ApplicationHandler for App {
             lat_phase: 0.0,
             stall: 0.0,
             last_wake: Instant::now(),
+            ld_on: std::env::var_os("RT_XDIAG").is_some(),
+            ld_last: Instant::now(),
+            ld_prev: Instant::now(),
+            ld_wakes: 0,
+            ld_keys: 0,
+            ld_maxgap_us: 0,
             active_until: Instant::now(),
             last_input: Instant::now(),
             last_anim: Instant::now(),
@@ -1090,6 +1104,9 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Everything here needs the active state; ignore events before resume.
         let Some(active) = self.active.as_mut() else { return };
+        if active.ld_on && matches!(&event, WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed) {
+            active.ld_keys += 1; // RT_XDIAG: key presses actually delivered to rt this second
+        }
         // Any real interaction (not our own repaint) keeps the loop in the fast,
         // animating poll for a moment; when nothing happens it idle-throttles.
         if !matches!(event, WindowEvent::RedrawRequested) {
@@ -1930,6 +1947,24 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         let wake_dt = now.duration_since(active.last_wake).as_secs_f32().min(0.5);
         active.last_wake = now;
+        if active.ld_on {
+            // Is the loop iterating briskly (input-delivery bound) or stalling
+            // (a blocking op per iteration = a huge max gap)?
+            let gap = now.duration_since(active.ld_prev).as_micros();
+            active.ld_prev = now;
+            active.ld_wakes += 1;
+            active.ld_maxgap_us = active.ld_maxgap_us.max(gap);
+            if active.ld_last.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "loopdiag: {} wake/s, max gap {} ms, {} key/s, poll={}ms",
+                    active.ld_wakes, active.ld_maxgap_us / 1000, active.ld_keys, active.poll_ms
+                );
+                active.ld_last = now;
+                active.ld_wakes = 0;
+                active.ld_maxgap_us = 0;
+                active.ld_keys = 0;
+            }
+        }
         // Compare against the interval we actually scheduled last tick, not a
         // fixed 16ms — otherwise an intentional idle wake (100ms apart) would be
         // misread as a stolen frame and flare the latency instrument forever,
