@@ -92,11 +92,24 @@ Shipped in `crates/vt-conformance` (dev-only; not built into the rt binary):
   hand-written spec cases (ED/CUP/SGR/autowrap/EL/alt-screen/DECCKM); fuzz property
   invariants (cursor in bounds, `offset ≤ history`, dims); resize round-trip.
 
-Still to do in Phase 1 (scaffolded, not yet filled):
-- **esctest/vttest runner** — the codified xterm spec (higher-leverage than any single
-  oracle). `corpus/` exists with a README; the runner + fixtures are next.
-- **Real-app replay corpora** — capture vim/tmux/emacs/htop/git streams into
-  `corpus/*.bytes`, replay + diff.
+Also landed (Phase 1 finished 2026-07-21):
+- **Spec-case runner** (`spec.rs`) — a declarative `(input, expected observable state)`
+  table encoding xterm/ECMA-48 behaviour, run against any `VtEngine`. Seeded with 32
+  cases across cursor motion, erase (ED/EL), SGR (incl. truecolor/indexed), autowrap
+  (incl. DECAWM off), screens, DECSC/DECRC, IND/RI/NEL, tabs, ICH/DCH/IL/DL, and
+  DECSTBM scroll regions. All pass against the oracle (which validates the cases too).
+  This is the esctest/vttest *role*; it reads state via `observe()` instead of the
+  terminal's report sequences, so it needs no query/report support in the engine.
+- **Replay corpus** (`corpus/*.bytes` + `replay.rs`) — real-world byte streams (a
+  captured colour `ls`, a hand-authored CR progress bar, a full-screen UTF-8 TUI
+  frame), replayed and checked for chunk-invariance across 8 framings incl. 1-byte
+  splits (stresses multibyte UTF-8 resumption). The corpus auto-discovers fixtures;
+  add more freely.
+
+Future options (not blocking; noted so they are not forgotten):
+- **Drive the actual Python esctest** — it relies on DSR/DECRQCRA report replies, so
+  hooking it additionally exercises the engine's query/report path; a good Phase-3
+  forcing function.
 - **(Deferred) foot** as an out-of-process tiebreak oracle — see "Deferred, do not
   forget".
 

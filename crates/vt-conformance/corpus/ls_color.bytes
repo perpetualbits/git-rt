@@ -1,0 +1,24 @@
+total 239
+drwxrwxr-x 15 roland roland    23 Jul 21 00:18 [0m[01;34m.[0m
+drwxrwxr-x 98 roland roland   101 Jul 18 23:02 [01;34m..[0m
+drwxrwxr-x  2 roland roland     3 Jul 10 19:50 [01;34mbench[0m
+drwxrwxr-x  2 roland roland     3 Jul 10 15:39 [01;34m.cargo[0m
+-rw-rw-r--  1 roland roland 68107 Jul 21 00:18 Cargo.lock
+-rw-rw-r--  1 roland roland  1954 Jul 21 00:18 Cargo.toml
+-rw-r--r--  1 roland roland 35149 Jul  9 22:33 COPYING
+drwxrwxr-x  9 roland roland     9 Jul 21 00:16 [01;34mcrates[0m
+drwxrwxr-x  4 roland roland    24 Jul 21 00:19 [01;34mdocs[0m
+drwxrwxr-x  4 roland roland     4 Jul 10 02:39 [01;34mextra[0m
+drwxrwxr-x  8 roland roland    15 Jul 21 00:20 [01;34m.git[0m
+drwxrwxr-x  3 roland roland     3 Jul  9 22:35 [01;34m.github[0m
+-rw-rw-r--  1 roland roland   548 Jul 10 15:40 .gitignore
+drwxrwxr-x  2 roland roland     3 Jul 11 07:54 [01;34mpackaging[0m
+-rw-rw-r--  1 roland roland 12079 Jul  6 12:43 PLAN.md
+-rw-rw-r--  1 roland roland  4606 Jul 10 23:18 README.md
+drwxrwxr-x  4 roland roland     4 Jul  6 10:27 [01;34mreference[0m
+-rw-rw-r--  1 roland roland    53 Jul 20 13:51 resume
+-rw-rw-r--  1 roland roland  1230 Jul  6 10:18 SETUP_INSTRUCTIONS
+drwxrwxr-x  2 roland roland     3 Jul 10 22:09 [01;34msnap[0m
+drwxrwxr-x  3 roland roland     3 Jul 12 10:19 [01;34m.superpowers[0m
+drwxrwxr-x 10 roland roland    13 Jul 12 22:19 [01;34mtarget[0m
+drwxrwxr-x  4 roland roland     4 Jul 10 02:06 [01;34mvendor[0m
