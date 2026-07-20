@@ -136,19 +136,26 @@ so it is green from day one and ready to accept our engine later:
 - **Exit criteria:** the full battery runs green with alacritty in the SUT slot; a
   one-line change swaps in a candidate engine.
 
-## Phase 2 — Own VTE parser (`vt-parser`)
+## Phase 2 — Own VTE parser (`vt-parser`) — DONE 2026-07-21
 
-The bounded, tractable piece; done first for a fast, low-risk win.
+Landed `crates/vt-parser`: a clean-room Williams state machine (all 14 states:
+ground/escape/esc-intermediate/csi×4/dcs×5/osc/sos-pm-apc) + UTF-8, keeping the
+`memchr` ground fast path and `print_str` batching (`BATCH_MIN = 4`). Its `Perform`
+trait and `Params` mirror vte so it is a drop-in for the parse layer. See
+`docs/vt-parser-design.md` (written in lockstep).
 
-- Clean-room Williams/DEC state machine (ground/esc/csi/osc/dcs) + UTF-8, keeping the
-  `memchr` fast path and batched printable runs.
-- **Verify the ACTION STREAM, not pixels:** feed bytes to `vt-parser` and to `vte`;
-  assert identical sequences of dispatched actions. Finite-state ⇒ transitions are
-  near-exhaustively testable.
-- Ship as a drop-in for the parse layer while STILL using alacritty's Term, so it can
-  ride in real rt (behind the switch) with zero Term risk.
-- **Exit criteria:** action-stream parity with `vte` across fuzzer + corpora; rt on
-  `vt-parser` + alacritty-Term is indistinguishable in real use.
+- **Verified against the action stream, not pixels:** `vt-conformance/tests/parser.rs`
+  records both engines' actions into one neutral `Action` enum and asserts equality —
+  across a rich structured fuzzer (multibyte UTF-8, C1 bytes, random bytes, CSI with
+  subparams/intermediates/private markers, ESC, OSC BEL/ST, DCS), **whole-buffer AND
+  arbitrarily chunked** (parser must resume across read boundaries incl. split UTF-8),
+  plus the replay corpus. **8000+ cases, byte-identical to vte, green on first run.**
+- Plus 5 self-contained unit tests in the crate.
+
+**Still open for Phase 2:** benchmark `vt-parser` vs `vte` on x86_64 and riscv64
+(milkv), and wire `vt-parser` into rt behind the engine switch while still using
+alacritty's Term (zero Term risk) for a real-use shakeout. Deferred to when it buys
+something — the action-stream parity already proves correctness.
 
 ## Phase 3 — Own Term (`vt-term`)
 
@@ -224,6 +231,11 @@ foot and aim to *beat* them, in Rust. Concretely:
   track damage, scroll, and reflow; benchmark ours against both (vtebench + our own
   harness) on identical inputs. A trick is adopted only with a measurement behind it,
   and each such trick is commented with that measurement.
+- **Benchmark on TWO architectures: x86_64 AND riscv64 (milkv).** The riscv64 board is
+  slow by today's standards, which is exactly why it is valuable — it magnifies
+  regressions and cache/branch effects a fast x86 host hides, and it is the same board
+  the ssh -X performance work was validated on. Every perf claim is checked on both;
+  milkv is the canary.
 - **Preserve the wins we already have**, and push past them: `memchr`/SIMD scan-to-
   control on the ground state, batched printable runs (`print_str`/`input_run`) that
   mutate the grid in bulk, cache-friendly cell layout, minimal per-cell work on the

@@ -11,3 +11,9 @@ publish = false
 # is dev/verification tooling — it is not built into the rt binary (deploy builds
 # `-p rt`), so depending on the engine directly here is intended.
 alacritty_terminal = { path = "../../vendor/alacritty_terminal" }
+
+[dev-dependencies]
+# The in-house parser under test, and the vendored vte it is diffed against (the
+# parser-layer oracle). Same vendored vte alacritty_terminal uses, so cargo unifies it.
+vt-parser = { path = "../vt-parser" }
+vte = { path = "../../vendor/vte" }

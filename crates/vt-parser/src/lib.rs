@@ -1,0 +1,731 @@
+//! # vt-parser — rt's in-house VT/ANSI parser
+//!
+//! A clean-room implementation of [Paul Williams' ANSI parser state machine], the
+//! byte→action layer of the in-house engine (`docs/own-engine-plan.md`, Phase 2, and
+//! `docs/vt-parser-design.md`). It turns a raw byte stream into a sequence of
+//! [`Perform`] actions (`print`/`execute`/CSI/ESC/OSC/DCS) and assigns them no
+//! meaning — that is the Term's job.
+//!
+//! **Correctness contract:** it must produce the *same action stream* as the vendored
+//! `vte` for any input, verified by differential testing (`vt-conformance`'s
+//! `parser.rs`). Where the spec leaves a choice, we make vte's choice deliberately so
+//! the streams match: UTF-8 input support, OSC terminated by BEL (0x07) as well as ST,
+//! C1 controls executed on lone-high-byte input, and printable runs batched into
+//! [`Perform::print_str`] once they reach [`BATCH_MIN`](Parser::BATCH_MIN).
+//!
+//! **Speed:** the ground state is left only by ESC, so it uses a `memchr` SIMD scan to
+//! the next ESC and hands the whole printable run over in one `print_str` — the two
+//! wins a naive per-byte parser would lose. See `docs/vt-parser-design.md`.
+//!
+//! [Paul Williams' ANSI parser state machine]: https://vt100.net/emu/dec_ansi_parser
+
+use core::str;
+
+const MAX_INTERMEDIATES: usize = 2;
+const MAX_PARAMS: usize = 32;
+const MAX_OSC_PARAMS: usize = 16;
+
+/// The CSI/DCS parameter list: a sequence of parameters, each of which may carry
+/// colon-separated sub-parameters (e.g. `38:2:255:0:0`). Mirrors vte's iteration
+/// exactly — `iter()` yields one `&[u16]` per parameter — so the two agree on the
+/// nested structure a `csi_dispatch` handler sees.
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
+pub struct Params {
+    groups: Vec<Vec<u16>>, // one inner Vec per parameter; its elements are the subparams
+    open: bool,            // the last group is still accepting subparams
+    total: usize,          // total values (params + subparams), for the fullness cap
+}
+
+impl Params {
+    fn clear(&mut self) {
+        self.groups.clear();
+        self.open = false;
+        self.total = 0;
+    }
+    fn is_full(&self) -> bool {
+        self.total >= MAX_PARAMS
+    }
+    /// Finalise `v` as a new parameter (the `;` separator, and the final byte).
+    fn push(&mut self, v: u16) {
+        if self.open {
+            self.groups.last_mut().unwrap().push(v);
+            self.open = false;
+        } else {
+            self.groups.push(vec![v]);
+        }
+        self.total += 1;
+    }
+    /// Add `v` as a sub-parameter of the current parameter (the `:` separator).
+    fn extend(&mut self, v: u16) {
+        if self.open {
+            self.groups.last_mut().unwrap().push(v);
+        } else {
+            self.groups.push(vec![v]);
+            self.open = true;
+        }
+        self.total += 1;
+    }
+    /// Iterate the parameters; each item is that parameter's sub-parameter slice.
+    pub fn iter(&self) -> impl Iterator<Item = &[u16]> {
+        self.groups.iter().map(|g| g.as_slice())
+    }
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+}
+
+/// The action sink. Mirrors vte's `Perform` so the Term can consume either engine's
+/// parser identically. Every method has an empty default so an implementation only
+/// overrides the actions it cares about.
+pub trait Perform {
+    /// A single printable character.
+    fn print(&mut self, _c: char) {}
+    /// A run of consecutive printable characters (never any control char) — the
+    /// batched form of [`print`](Self::print). The default forwards char-by-char, so
+    /// overriding is optional and changes nothing observable.
+    fn print_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.print(c);
+        }
+    }
+    /// Execute a C0 or C1 control byte.
+    fn execute(&mut self, _byte: u8) {}
+    /// A DCS sequence's final byte arrived; subsequent `put`s carry its data string.
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    /// A byte of a DCS data string.
+    fn put(&mut self, _byte: u8) {}
+    /// A DCS string terminated.
+    fn unhook(&mut self) {}
+    /// An OSC command: its `;`-separated parameters, and whether BEL (not ST) ended it.
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    /// A CSI sequence's final byte arrived.
+    fn csi_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    /// An ESC sequence's final byte arrived.
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+}
+
+#[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
+enum State {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    CsiEntry,
+    CsiParam,
+    CsiIntermediate,
+    CsiIgnore,
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    DcsPassthrough,
+    DcsIgnore,
+    OscString,
+    SosPmApcString,
+}
+
+/// The parser. Feed bytes with [`advance`](Parser::advance); actions are delivered to
+/// your [`Perform`]. Holds the partial state (current sequence's params/intermediates,
+/// any half-received UTF-8 codepoint) so it resumes correctly across calls.
+#[derive(Default)]
+pub struct Parser {
+    state: State,
+    intermediates: [u8; MAX_INTERMEDIATES],
+    intermediate_idx: usize,
+    params: Params,
+    param: u16, // the number currently being accumulated digit-by-digit
+    ignoring: bool,
+    osc_raw: Vec<u8>,
+    osc_params: [(usize, usize); MAX_OSC_PARAMS],
+    osc_num_params: usize,
+    partial_utf8: [u8; 4],
+    partial_utf8_len: usize,
+}
+
+impl Parser {
+    /// Minimum printable-run length dispatched via the batched [`Perform::print_str`]
+    /// rather than one `print` per char. Below this the batched path's setup is not
+    /// worth it, so short (control-heavy) output keeps per-char dispatch — matched to
+    /// vte so the action streams agree.
+    pub const BATCH_MIN: usize = 4;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn intermediates(&self) -> &[u8] {
+        &self.intermediates[..self.intermediate_idx]
+    }
+
+    /// Feed `bytes` to the parser, dispatching actions to `performer`.
+    pub fn advance<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
+        let mut i = 0;
+        // Finish any codepoint split across the previous call first.
+        if self.partial_utf8_len != 0 {
+            i += self.advance_partial_utf8(performer, bytes);
+        }
+        while i != bytes.len() {
+            match self.state {
+                State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                _ => {
+                    self.change_state(performer, bytes[i]);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn change_state<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match self.state {
+            State::Ground => unreachable!("ground is handled by advance_ground"),
+            State::Escape => self.advance_esc(performer, byte),
+            State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
+            State::CsiEntry => self.advance_csi_entry(performer, byte),
+            State::CsiParam => self.advance_csi_param(performer, byte),
+            State::CsiIntermediate => self.advance_csi_intermediate(performer, byte),
+            State::CsiIgnore => self.advance_csi_ignore(performer, byte),
+            State::DcsEntry => self.advance_dcs_entry(performer, byte),
+            State::DcsParam => self.advance_dcs_param(performer, byte),
+            State::DcsIntermediate => self.advance_dcs_intermediate(performer, byte),
+            State::DcsPassthrough => self.advance_dcs_passthrough(performer, byte),
+            State::DcsIgnore => self.anywhere(byte),
+            State::OscString => self.advance_osc_string(performer, byte),
+            State::SosPmApcString => self.anywhere(byte),
+        }
+    }
+
+    // ── C0/C1 "anywhere" transitions shared by many states ────────────────────
+    fn anywhere(&mut self, byte: u8) {
+        match byte {
+            0x18 | 0x1A => self.state = State::Ground,
+            0x1B => {
+                self.reset_params();
+                self.state = State::Escape;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Escape ────────────────────────────────────────────────────────────────
+    fn advance_esc<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
+            0x20..=0x2F => {
+                self.collect(byte);
+                self.state = State::EscapeIntermediate;
+            }
+            0x30..=0x4F | 0x51..=0x57 | 0x59..=0x5A | 0x5C | 0x60..=0x7E => {
+                performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
+                self.state = State::Ground;
+            }
+            0x50 => {
+                self.reset_params();
+                self.state = State::DcsEntry;
+            }
+            0x58 | 0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5B => {
+                self.reset_params();
+                self.state = State::CsiEntry;
+            }
+            0x5D => {
+                self.osc_raw.clear();
+                self.osc_num_params = 0;
+                self.state = State::OscString;
+            }
+            0x18 | 0x1A => {
+                performer.execute(byte);
+                self.state = State::Ground;
+            }
+            _ => {}
+        }
+    }
+
+    fn advance_esc_intermediate<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
+            0x20..=0x2F => self.collect(byte),
+            0x30..=0x7E => {
+                performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
+                self.state = State::Ground;
+            }
+            0x7F => {}
+            _ => self.anywhere(byte),
+        }
+    }
+
+    // ── CSI ───────────────────────────────────────────────────────────────────
+    fn advance_csi_entry<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
+            0x20..=0x2F => {
+                self.collect(byte);
+                self.state = State::CsiIntermediate;
+            }
+            0x30..=0x39 => {
+                self.paramnext(byte);
+                self.state = State::CsiParam;
+            }
+            0x3A => {
+                self.subparam();
+                self.state = State::CsiParam;
+            }
+            0x3B => {
+                self.param();
+                self.state = State::CsiParam;
+            }
+            0x3C..=0x3F => {
+                self.collect(byte);
+                self.state = State::CsiParam;
+            }
+            0x40..=0x7E => self.csi_dispatch(performer, byte),
+            _ => self.anywhere(byte),
+        }
+    }
+
+    fn advance_csi_param<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
+            0x20..=0x2F => {
+                self.collect(byte);
+                self.state = State::CsiIntermediate;
+            }
+            0x30..=0x39 => self.paramnext(byte),
+            0x3A => self.subparam(),
+            0x3B => self.param(),
+            0x3C..=0x3F => self.state = State::CsiIgnore,
+            0x40..=0x7E => self.csi_dispatch(performer, byte),
+            0x7F => {}
+            _ => self.anywhere(byte),
+        }
+    }
+
+    fn advance_csi_intermediate<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
+            0x20..=0x2F => self.collect(byte),
+            0x30..=0x3F => self.state = State::CsiIgnore,
+            0x40..=0x7E => self.csi_dispatch(performer, byte),
+            _ => self.anywhere(byte),
+        }
+    }
+
+    fn advance_csi_ignore<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
+            0x20..=0x3F => {}
+            0x40..=0x7E => self.state = State::Ground,
+            0x7F => {}
+            _ => self.anywhere(byte),
+        }
+    }
+
+    // ── DCS ───────────────────────────────────────────────────────────────────
+    fn advance_dcs_entry<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
+            0x20..=0x2F => {
+                self.collect(byte);
+                self.state = State::DcsIntermediate;
+            }
+            0x30..=0x39 => {
+                self.paramnext(byte);
+                self.state = State::DcsParam;
+            }
+            0x3A => {
+                self.subparam();
+                self.state = State::DcsParam;
+            }
+            0x3B => {
+                self.param();
+                self.state = State::DcsParam;
+            }
+            0x3C..=0x3F => {
+                self.collect(byte);
+                self.state = State::DcsParam;
+            }
+            0x40..=0x7E => self.hook(performer, byte),
+            0x7F => {}
+            _ => self.anywhere(byte),
+        }
+    }
+
+    fn advance_dcs_param<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
+            0x20..=0x2F => {
+                self.collect(byte);
+                self.state = State::DcsIntermediate;
+            }
+            0x30..=0x39 => self.paramnext(byte),
+            0x3A => self.subparam(),
+            0x3B => self.param(),
+            0x3C..=0x3F => self.state = State::DcsIgnore,
+            0x40..=0x7E => self.hook(performer, byte),
+            0x7F => {}
+            _ => self.anywhere(byte),
+        }
+    }
+
+    fn advance_dcs_intermediate<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => {}
+            0x20..=0x2F => self.collect(byte),
+            0x30..=0x3F => self.state = State::DcsIgnore,
+            0x40..=0x7E => self.hook(performer, byte),
+            0x7F => {}
+            _ => self.anywhere(byte),
+        }
+    }
+
+    fn advance_dcs_passthrough<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x7E => performer.put(byte),
+            0x18 | 0x1A => {
+                performer.unhook();
+                performer.execute(byte);
+                self.state = State::Ground;
+            }
+            0x1B => {
+                performer.unhook();
+                self.reset_params();
+                self.state = State::Escape;
+            }
+            0x7F => {}
+            0x9C => {
+                performer.unhook();
+                self.state = State::Ground;
+            }
+            _ => {}
+        }
+    }
+
+    // ── OSC ───────────────────────────────────────────────────────────────────
+    fn advance_osc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => {}
+            0x07 => {
+                self.osc_end(performer, byte);
+                self.state = State::Ground;
+            }
+            0x18 | 0x1A => {
+                self.osc_end(performer, byte);
+                performer.execute(byte);
+                self.state = State::Ground;
+            }
+            0x1B => {
+                self.osc_end(performer, byte);
+                self.reset_params();
+                self.state = State::Escape;
+            }
+            0x3B => self.osc_put_param(),
+            _ => self.osc_raw.push(byte),
+        }
+    }
+
+    // ── Actions ───────────────────────────────────────────────────────────────
+    fn csi_dispatch<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.push(self.param);
+        }
+        performer.csi_dispatch(&self.params, self.intermediates(), self.ignoring, byte as char);
+        self.state = State::Ground;
+    }
+
+    fn hook<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.push(self.param);
+        }
+        performer.hook(&self.params, self.intermediates(), self.ignoring, byte as char);
+        self.state = State::DcsPassthrough;
+    }
+
+    fn collect(&mut self, byte: u8) {
+        if self.intermediate_idx == MAX_INTERMEDIATES {
+            self.ignoring = true;
+        } else {
+            self.intermediates[self.intermediate_idx] = byte;
+            self.intermediate_idx += 1;
+        }
+    }
+
+    fn subparam(&mut self) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.extend(self.param);
+            self.param = 0;
+        }
+    }
+
+    fn param(&mut self) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.push(self.param);
+            self.param = 0;
+        }
+    }
+
+    fn paramnext(&mut self, byte: u8) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.param = self.param.saturating_mul(10).saturating_add((byte - b'0') as u16);
+        }
+    }
+
+    fn osc_put_param(&mut self) {
+        let idx = self.osc_raw.len();
+        let n = self.osc_num_params;
+        match n {
+            0 => self.osc_params[0] = (0, idx),
+            MAX_OSC_PARAMS => return,
+            _ => {
+                let begin = self.osc_params[n - 1].1;
+                self.osc_params[n] = (begin, idx);
+            }
+        }
+        self.osc_num_params += 1;
+    }
+
+    fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        self.osc_put_param();
+        // Build the parameter slices into the raw buffer and dispatch.
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(self.osc_num_params);
+        for i in 0..self.osc_num_params {
+            let (a, b) = self.osc_params[i];
+            slices.push(&self.osc_raw[a..b]);
+        }
+        performer.osc_dispatch(&slices, byte == 0x07);
+        self.osc_raw.clear();
+        self.osc_num_params = 0;
+    }
+
+    fn reset_params(&mut self) {
+        self.intermediate_idx = 0;
+        self.ignoring = false;
+        self.param = 0;
+        self.params.clear();
+    }
+
+    // ── Ground: the SIMD fast path + UTF-8 ────────────────────────────────────
+    fn advance_ground<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let num_bytes = bytes.len();
+        let plain = memchr::memchr(0x1B, bytes).unwrap_or(num_bytes);
+        if plain == 0 {
+            // The very next byte is ESC: switch and consume it.
+            self.reset_params();
+            self.state = State::Escape;
+            return 1;
+        }
+        match str::from_utf8(&bytes[..plain]) {
+            Ok(text) => {
+                Self::ground_dispatch(performer, text);
+                let mut processed = plain;
+                if processed < num_bytes {
+                    // The byte at `plain` is ESC.
+                    self.reset_params();
+                    self.state = State::Escape;
+                    processed += 1;
+                }
+                processed
+            }
+            Err(err) => {
+                let valid = err.valid_up_to();
+                let text = unsafe { str::from_utf8_unchecked(&bytes[..valid]) };
+                Self::ground_dispatch(performer, text);
+                match err.error_len() {
+                    Some(len) => {
+                        // Invalid sequence: a lone C1 byte executes, else replacement char.
+                        if len == 1 && bytes[valid] <= 0x9F {
+                            performer.execute(bytes[valid]);
+                        } else {
+                            performer.print('\u{FFFD}');
+                        }
+                        valid + len
+                    }
+                    None => {
+                        if plain < num_bytes {
+                            // Truncated by an escape mid-codepoint: emit replacement, take ESC.
+                            performer.print('\u{FFFD}');
+                            self.reset_params();
+                            self.state = State::Escape;
+                            plain + 1
+                        } else {
+                            // Truncated by the buffer end: stash the partial codepoint.
+                            let extra = num_bytes - valid;
+                            let end = self.partial_utf8_len + extra;
+                            self.partial_utf8[self.partial_utf8_len..end]
+                                .copy_from_slice(&bytes[valid..valid + extra]);
+                            self.partial_utf8_len = end;
+                            num_bytes
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn advance_partial_utf8<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let old = self.partial_utf8_len;
+        let to_copy = bytes.len().min(self.partial_utf8.len() - old);
+        self.partial_utf8[old..old + to_copy].copy_from_slice(&bytes[..to_copy]);
+        self.partial_utf8_len += to_copy;
+
+        match str::from_utf8(&self.partial_utf8[..self.partial_utf8_len]) {
+            Ok(parsed) => {
+                let c = parsed.chars().next().unwrap();
+                performer.print(c);
+                self.partial_utf8_len = 0;
+                c.len_utf8() - old
+            }
+            Err(err) => {
+                let valid = err.valid_up_to();
+                if valid > 0 {
+                    let c = {
+                        let s = unsafe { str::from_utf8_unchecked(&self.partial_utf8[..valid]) };
+                        s.chars().next().unwrap()
+                    };
+                    performer.print(c);
+                    self.partial_utf8_len = 0;
+                    return valid - old;
+                }
+                match err.error_len() {
+                    Some(invalid_len) => {
+                        performer.print('\u{FFFD}');
+                        self.partial_utf8_len = 0;
+                        invalid_len - old
+                    }
+                    None => to_copy,
+                }
+            }
+        }
+    }
+
+    /// Split a printable run at control characters (C0 and C1), `execute`-ing each and
+    /// batching the printable stretches. Preserves the exact `print`/`execute` order.
+    fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
+        let mut run_start = 0;
+        let mut idx = 0;
+        for c in text.chars() {
+            let len = c.len_utf8();
+            if matches!(c, '\x00'..='\x1f' | '\u{80}'..='\u{9f}') {
+                Self::flush_run(performer, &text[run_start..idx]);
+                performer.execute(c as u8);
+                run_start = idx + len;
+            }
+            idx += len;
+        }
+        Self::flush_run(performer, &text[run_start..]);
+    }
+
+    fn flush_run<P: Perform>(performer: &mut P, run: &str) {
+        if run.is_empty() {
+            return;
+        }
+        if run.len() >= Self::BATCH_MIN {
+            performer.print_str(run);
+        } else {
+            for c in run.chars() {
+                performer.print(c);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default, Debug, PartialEq)]
+    enum Ev {
+        #[default]
+        None,
+        Print(char),
+        PrintStr(String),
+        Execute(u8),
+        Csi(Vec<Vec<u16>>, Vec<u8>, char),
+        Esc(Vec<u8>, u8),
+        Osc(Vec<Vec<u8>>, bool),
+    }
+
+    #[derive(Default)]
+    struct Log(Vec<Ev>);
+    impl Perform for Log {
+        fn print(&mut self, c: char) {
+            self.0.push(Ev::Print(c));
+        }
+        fn print_str(&mut self, s: &str) {
+            self.0.push(Ev::PrintStr(s.to_string()));
+        }
+        fn execute(&mut self, b: u8) {
+            self.0.push(Ev::Execute(b));
+        }
+        fn csi_dispatch(&mut self, p: &Params, i: &[u8], _ig: bool, a: char) {
+            self.0.push(Ev::Csi(p.iter().map(|s| s.to_vec()).collect(), i.to_vec(), a));
+        }
+        fn esc_dispatch(&mut self, i: &[u8], _ig: bool, b: u8) {
+            self.0.push(Ev::Esc(i.to_vec(), b));
+        }
+        fn osc_dispatch(&mut self, p: &[&[u8]], bell: bool) {
+            self.0.push(Ev::Osc(p.iter().map(|s| s.to_vec()).collect(), bell));
+        }
+    }
+
+    fn run(bytes: &[u8]) -> Vec<Ev> {
+        let mut p = Parser::new();
+        let mut l = Log::default();
+        p.advance(&mut l, bytes);
+        l.0
+    }
+
+    #[test]
+    fn printable_run_batches_over_threshold() {
+        // 5 chars ≥ BATCH_MIN → one print_str; a 2-char run stays per-char.
+        assert_eq!(run(b"hello"), vec![Ev::PrintStr("hello".into())]);
+        assert_eq!(run(b"hi"), vec![Ev::Print('h'), Ev::Print('i')]);
+    }
+
+    #[test]
+    fn control_splits_runs_and_executes() {
+        assert_eq!(
+            run(b"ab\ncd"),
+            vec![Ev::Print('a'), Ev::Print('b'), Ev::Execute(b'\n'), Ev::Print('c'), Ev::Print('d')]
+        );
+    }
+
+    #[test]
+    fn csi_params_subparams_and_intermediates() {
+        assert_eq!(run(b"\x1b[1;2m"), vec![Ev::Csi(vec![vec![1], vec![2]], vec![], 'm')]);
+        assert_eq!(run(b"\x1b[38:2:1:2:3m"), vec![Ev::Csi(vec![vec![38, 2, 1, 2, 3]], vec![], 'm')]);
+        assert_eq!(run(b"\x1b[?25h"), vec![Ev::Csi(vec![vec![25]], vec![b'?'], 'h')]);
+        // Empty CSI has one implicit zero parameter.
+        assert_eq!(run(b"\x1b[m"), vec![Ev::Csi(vec![vec![0]], vec![], 'm')]);
+    }
+
+    #[test]
+    fn esc_and_osc() {
+        assert_eq!(run(b"\x1b(B"), vec![Ev::Esc(vec![b'('], b'B')]);
+        assert_eq!(run(b"\x1b]0;title\x07"),
+                   vec![Ev::Osc(vec![b"0".to_vec(), b"title".to_vec()], true)]);
+    }
+
+    #[test]
+    fn utf8_split_across_advance_calls() {
+        // "🦀" is 4 bytes; feeding it one byte at a time must still print exactly once.
+        let crab = "🦀".as_bytes();
+        let mut p = Parser::new();
+        let mut l = Log::default();
+        for b in crab {
+            p.advance(&mut l, &[*b]);
+        }
+        assert_eq!(l.0, vec![Ev::Print('🦀')]);
+    }
+}
+

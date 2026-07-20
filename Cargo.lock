@@ -2158,6 +2158,15 @@ name = "vt-conformance"
 version = "0.2.8"
 dependencies = [
  "alacritty_terminal",
+ "vt-parser",
+ "vte",
+]
+
+[[package]]
+name = "vt-parser"
+version = "0.2.8"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
