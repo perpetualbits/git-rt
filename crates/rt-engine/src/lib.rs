@@ -697,6 +697,56 @@ impl TermPane {
         (offset, history, screen)
     }
 
+    /// Extract the text of a selection given by two endpoints in ABSOLUTE grid
+    /// lines (the alacritty `Line` index — `0..screen_lines` is the visible
+    /// screen at the bottom, negative is scrollback history; the same coordinate
+    /// `search` returns in `SearchMatch::line`). Reading straight from the grid
+    /// means it works across scrollback the viewport is not currently showing —
+    /// unlike a snapshot, which only holds the visible rows. Linear (row-major
+    /// reading order) unless `block`, which takes the rectangle between the two
+    /// corners. Trailing blanks per line are trimmed; rows join with '\n'.
+    pub fn selection_text(&self, anchor: (usize, i32), head: (usize, i32), block: bool) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        let term = self.term.lock();
+        let grid = term.grid();
+        let cols = term.columns();
+        let (top, bot) = (term.topmost_line().0, term.bottommost_line().0); // readable line range
+        let last_col = cols.saturating_sub(1);
+        let mut lines: Vec<String> = Vec::new();
+        if block {
+            // Rectangle: the same column range on every line between the corners.
+            let (c0, c1) = (anchor.0.min(head.0), anchor.0.max(head.0).min(last_col));
+            let (l0, l1) = (anchor.1.min(head.1), anchor.1.max(head.1));
+            for l in l0..=l1 {
+                if l < top || l > bot {
+                    continue; // outside the readable buffer
+                }
+                let row = &grid[Line(l)];
+                let s: String = (c0..=c1).map(|c| row[Column(c)].c).collect();
+                lines.push(s.trim_end().to_string());
+            }
+        } else {
+            // Linear: order the endpoints by (line, col); first/last lines are
+            // bounded by their column, the middle lines run full width.
+            let (start, end) = if (anchor.1, anchor.0) <= (head.1, head.0) { (anchor, head) } else { (head, anchor) };
+            for l in start.1..=end.1 {
+                if l < top || l > bot {
+                    continue;
+                }
+                let row = &grid[Line(l)];
+                let cs = if l == start.1 { start.0.min(last_col) } else { 0 };
+                let ce = if l == end.1 { end.0.min(last_col) } else { last_col };
+                let s: String = if cs <= ce {
+                    (cs..=ce).map(|c| row[Column(c)].c).collect()
+                } else {
+                    String::new()
+                };
+                lines.push(s.trim_end().to_string());
+            }
+        }
+        lines.join("\n")
+    }
+
     /// The line-index bounds of everything currently in the grid, so a caller
     /// (notably newspaper-column view) can compute which slice of the line
     /// buffer to show and how far it may scroll.

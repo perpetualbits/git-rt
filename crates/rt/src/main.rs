@@ -328,24 +328,35 @@ struct Active {
     deferred_resizes: u64,                // Resized events coalesced into the pending reflow (diagnostics)
     instr_tick: bool,                     // advance the instrument animation this frame (6fps, native path)
     last_instr_tick: Instant,             // when the instrument animation last advanced
+    last_autoscroll: Instant,             // last drag-select edge auto-scroll step (#3)
 }
 
-/// A rectangular-by-lines text selection within one pane, in that pane's grid
-/// cell coordinates. `anchor` is where the drag started, `head` is the current
-/// end; text runs linearly (row-major) between the two.
+/// A text selection within one pane, anchored to ABSOLUTE buffer lines — the
+/// alacritty grid `Line` index (`0..screen_lines` is the visible screen at the
+/// bottom, negative is scrollback history), the same coordinate `search` uses.
+/// Anchoring to the buffer (not the viewport row) is what lets the highlight
+/// ride the scroll instead of staying pinned to the screen. `anchor` is where the
+/// drag began, `head` the current end. Text runs linearly (row-major) unless
+/// `block`, which selects the RECTANGLE between the two corners (Ctrl-drag).
+///
+/// A screen row `r` at scroll offset `d` shows absolute line `r - d`; conversely
+/// absolute line `l` draws at screen row `l + d`. Selection endpoints are stored
+/// as `r - d` at the moment they are set, so a later change in `d` moves the
+/// highlight with the text.
 #[derive(Clone, Copy)]
 struct Selection {
-    pane: rt_core::PaneId, // the pane the selection lives in
-    anchor: (usize, usize), // (col, row) where the drag began
-    head: (usize, usize),   // (col, row) current end of the drag
+    pane: rt_core::PaneId,  // the pane the selection lives in
+    anchor: (usize, i32),   // (col, abs_line) where the drag began
+    head: (usize, i32),     // (col, abs_line) current end of the drag
+    block: bool,            // rectangular (column-block) selection, not row-major
 }
 
 impl Selection {
     /// Return the selection's endpoints ordered so `start` precedes `end` in
     /// row-major reading order (top-to-bottom, left-to-right).
-    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
-        // Compare by (row, col) so multi-line selections read correctly.
-        let a = (self.anchor.1, self.anchor.0); // (row, col)
+    fn ordered(&self) -> ((usize, i32), (usize, i32)) {
+        // Compare by (line, col) so multi-line selections read correctly.
+        let a = (self.anchor.1, self.anchor.0); // (line, col)
         let b = (self.head.1, self.head.0);
         if a <= b {
             (self.anchor, self.head)
@@ -354,17 +365,23 @@ impl Selection {
         }
     }
 
-    /// Whether cell `(col, row)` falls inside the selection.
-    fn contains(&self, col: usize, row: usize) -> bool {
-        let (start, end) = self.ordered(); // start precedes end
-        let (sc, sr) = start;
-        let (ec, er) = end;
-        if row < sr || row > er {
-            return false; // outside the row span
+    /// Whether cell `(col, line)` (absolute grid line) falls inside the selection.
+    fn contains(&self, col: usize, line: i32) -> bool {
+        if self.block {
+            // Rectangle: independent column and line ranges between the corners.
+            let (c0, c1) = (self.anchor.0.min(self.head.0), self.anchor.0.max(self.head.0));
+            let (l0, l1) = (self.anchor.1.min(self.head.1), self.anchor.1.max(self.head.1));
+            return line >= l0 && line <= l1 && col >= c0 && col <= c1;
         }
-        // First and last rows are bounded by the columns; middle rows are full.
-        let lo = if row == sr { sc } else { 0 };
-        let hi = if row == er { ec } else { usize::MAX };
+        let (start, end) = self.ordered(); // start precedes end
+        let (sc, sr) = start; // (col, line)
+        let (ec, er) = end;
+        if line < sr || line > er {
+            return false; // outside the line span
+        }
+        // First and last lines are bounded by the columns; middle lines are full.
+        let lo = if line == sr { sc } else { 0 };
+        let hi = if line == er { ec } else { usize::MAX };
         col >= lo && col <= hi
     }
 }
@@ -1024,6 +1041,7 @@ impl ApplicationHandler for App {
             deferred_resizes: 0,
             instr_tick: false,
             last_instr_tick: Instant::now(),
+            last_autoscroll: Instant::now(),
         });
         // Debug/verification hook: RT_PREFS opens the preferences dialog at
         // startup so it can be screenshotted without synthetic input.
@@ -1666,11 +1684,13 @@ impl ApplicationHandler for App {
                     active.force_full = true; // layout changed: repaint the whole window
                     active.window.request_redraw();
                 } else if active.selecting {
-                    // Extend the selection to the cell under the pointer.
+                    // Extend the selection to the cell under the pointer, anchored to
+                    // the absolute buffer line (so it stays put as the view scrolls).
                     if let Some((pane, col, row)) = Self::cell_at(active, active.mouse.0, active.mouse.1) {
+                        let off = active.session.pane(pane).map(|p| p.scroll_info().0 as i32).unwrap_or(0);
                         if let Some(sel) = active.selection.as_mut() {
                             if sel.pane == pane {
-                                sel.head = (col, row); // move the drag end
+                                sel.head = (col, row as i32 - off); // move the drag end
                                 active.force_full = true; // selection highlight isn't engine-tracked damage
                                 active.window.request_redraw();
                             }
@@ -1832,22 +1852,31 @@ impl ApplicationHandler for App {
                             active.click_count = count;
                             // Single = start a drag-select; double = word; triple = line.
                             if let Some((pane, col, row)) = Self::cell_at(active, mx, my) {
+                                // Anchor to the absolute buffer line so the highlight
+                                // rides the scroll (screen row `row` at offset `d`
+                                // shows absolute line `row - d`).
+                                let off = active.session.pane(pane).map(|p| p.scroll_info().0 as i32).unwrap_or(0);
+                                let line = row as i32 - off;
                                 match count {
                                     2 => {
                                         if let Some((s, e)) = Self::word_at(active, pane, col, row) {
-                                            active.selection = Some(Selection { pane, anchor: (s, row), head: (e, row) });
+                                            active.selection = Some(Selection { pane, anchor: (s, line), head: (e, line), block: false });
                                         }
                                         active.selecting = false;
                                         Self::copy_selection_to_primary(active);
                                     }
                                     3 => {
                                         let last = Self::line_last_col(active, pane, row);
-                                        active.selection = Some(Selection { pane, anchor: (0, row), head: (last, row) });
+                                        active.selection = Some(Selection { pane, anchor: (0, line), head: (last, line), block: false });
                                         active.selecting = false;
                                         Self::copy_selection_to_primary(active);
                                     }
                                     _ => {
-                                        active.selection = Some(Selection { pane, anchor: (col, row), head: (col, row) });
+                                        // Ctrl-drag = rectangular block. (Ctrl-click ON a
+                                        // URL already returned above to open it, so a
+                                        // block only ever starts on non-link text.)
+                                        let block = active.mods.control_key();
+                                        active.selection = Some(Selection { pane, anchor: (col, line), head: (col, line), block });
                                         active.selecting = true;
                                     }
                                 }
@@ -2163,6 +2192,12 @@ impl ApplicationHandler for App {
             active.force_full = true;
             dirty = true;
         }
+        // Drag-select past the pane edge: auto-scroll + extend (#3). Keeps the loop
+        // awake (active_until) so it keeps scrolling while the pointer is held there.
+        if Self::autoscroll_selection(active, now) {
+            active.active_until = now + Duration::from_millis(120);
+            dirty = true;
+        }
         // While the search bar is open, keep its results current as new output
         // streams into the searched pane. Re-run only on a change, query set.
         if dirty && active.search_open && !active.search_query.is_empty() {
@@ -2436,29 +2471,68 @@ impl App {
     /// trailing blanks and joining rows with newlines. `None` if no selection.
     fn selected_text(active: &Active) -> Option<String> {
         let sel = active.selection.as_ref()?; // the active selection
-        let snap = active.session.pane(sel.pane)?.snapshot(); // that pane's grid
-        let ((sc, sr), (ec, er)) = sel.ordered(); // start precedes end (row-major)
-        let mut out = String::new();
-        for row in sr..=er {
-            let Some(line) = snap.rows.get(row) else { break }; // row out of range
-            let last = line.len().saturating_sub(1); // last valid column
-            let c0 = if row == sr { sc.min(last) } else { 0 }; // first column on this row
-            let c1 = if row == er { ec.min(last) } else { last }; // last column on this row
-            if c0 <= c1 {
-                let s: String = line[c0..=c1].iter().map(|cell| cell.c).collect();
-                out.push_str(s.trim_end()); // drop trailing blanks
-            }
-            if row != er {
-                out.push('\n'); // newline between rows
-            }
-        }
-        Some(out)
+        // Read straight from the pane's grid by ABSOLUTE line, so a selection that
+        // spans scrollback the viewport isn't currently showing still copies in
+        // full (the visible-only snapshot could not). Handles block mode too.
+        let text = active.session.pane(sel.pane)?.selection_text(sel.anchor, sel.head, sel.block);
+        Some(text)
     }
 
     /// Map a physical-pixel point to `(pane, col, row)` in that pane's grid, for
     /// selection. Returns `None` for column-mode panes (their re-tiled layout
     /// makes cell mapping ambiguous — selection there is a follow-up) or points
     /// outside any pane.
+    /// The grid (content) rectangle of a specific pane, or `None` if it isn't
+    /// currently visible. Like the per-pane branch of `cell_at`, but keyed by id.
+    fn pane_content_rect(active: &Active, pane: rt_core::PaneId) -> Option<Rect> {
+        let size = active.window.inner_size();
+        let bounds = content_bounds(size);
+        active.session.visible_rects(bounds)
+            .into_iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| active.session.content_rect(rect))
+    }
+
+    /// While a drag-select is active and the pointer is ABOVE or BELOW the pane's
+    /// grid, scroll that pane one line (rate-limited) and extend the selection head
+    /// to the edge — so you can select more than a screenful by dragging past the
+    /// edge (#3). Returns `true` whenever the pointer is in the edge zone (even on
+    /// a tick that didn't scroll yet), so the caller keeps the loop awake.
+    fn autoscroll_selection(active: &mut Active, now: Instant) -> bool {
+        if !active.selecting {
+            return false;
+        }
+        let Some(sel) = active.selection else { return false };
+        let Some(content) = Self::pane_content_rect(active, sel.pane) else { return false };
+        let my = active.mouse.1;
+        // +1 = scroll toward older history (pointer above top); -1 = toward newest.
+        let dir: isize = if my < content.y { 1 } else if my >= content.y + content.h { -1 } else { 0 };
+        if dir == 0 {
+            return false; // pointer is within the grid: normal motion handling covers it
+        }
+        // One line per ~35ms, independent of frame rate, so the scroll is smooth
+        // but not runaway-fast.
+        if now.duration_since(active.last_autoscroll) < Duration::from_millis(35) {
+            return true; // in the zone; ask the caller to keep waking us
+        }
+        active.last_autoscroll = now;
+        let (cw, _) = active.backend.cell_size();
+        let (off, col, edge_row) = {
+            let Some(pane) = active.session.pane(sel.pane) else { return false };
+            pane.scroll(dir); // move the view one line
+            let (offset, _, screen) = pane.scroll_info();
+            let col = ((active.mouse.0 - content.x) / cw).max(0.0) as usize;
+            // Extend to the top row when scrolling up, the bottom row when down.
+            let edge_row = if dir > 0 { 0i32 } else { screen.saturating_sub(1) as i32 };
+            (offset as i32, col, edge_row)
+        };
+        if let Some(s) = active.selection.as_mut() {
+            s.head = (col, edge_row - off); // screen edge row → absolute line
+        }
+        active.force_full = true; // selection + scroll: not engine-tracked damage
+        true
+    }
+
     fn cell_at(active: &Active, mx: f32, my: f32) -> Option<(rt_core::PaneId, usize, usize)> {
         let size = active.window.inner_size();
         let bounds = content_bounds(size);
@@ -2997,6 +3071,9 @@ impl App {
                 let geom = active.session.column_layout(id, rect); // count/col_cells/rows/gap
                 // The selection, if it belongs to this (single-column) pane.
                 let pane_sel: Option<Selection> = active.selection.filter(|s| n <= 1 && s.pane == id);
+                // Selection is stored in absolute buffer lines; a snapshot row `sub`
+                // shows absolute line `sub - sel_offset`, so it follows the scroll.
+                let sel_offset = pane.scroll_info().0 as i32;
                 let sel_bg = Color::rgb(0x33, 0x44, 0x66); // selection highlight colour
                 // Scrollback-search highlights for this pane: which (row, col)
                 // cells fall inside a match. The current hit gets a brighter tint
@@ -3053,7 +3130,7 @@ impl App {
                             active.backend.fill_cell(ox, rect.y, col_idx, sub, cur_hl);
                         } else if hl_other.contains(&(r, col_idx)) {
                             active.backend.fill_cell(ox, rect.y, col_idx, sub, other_hl);
-                        } else if pane_sel.map_or(false, |s| s.contains(col_idx, sub)) {
+                        } else if pane_sel.map_or(false, |s| s.contains(col_idx, sub as i32 - sel_offset)) {
                             active.backend.fill_cell(ox, rect.y, col_idx, sub, sel_bg);
                         } else if cell.bg != cfg_bg {
                             // A non-default background: draw it opaque (default-bg
@@ -4428,6 +4505,62 @@ fn main() {
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("rt: event loop error: {e}"); // surface any run-loop failure
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn sel(anchor: (usize, i32), head: (usize, i32), block: bool) -> Selection {
+        Selection { pane: rt_core::PaneId(1), anchor, head, block }
+    }
+
+    #[test]
+    fn linear_spans_rows_and_bounds_ends_by_column() {
+        // anchor at (col 5, line 2), head at (col 3, line 4): row-major from
+        // (5,2) to (3,4). First line clipped left, last clipped right, middle full.
+        let s = sel((5, 2), (3, 4), false);
+        assert!(!s.contains(4, 2)); // before the start column on the start line
+        assert!(s.contains(5, 2)); // start
+        assert!(s.contains(80, 2)); // rest of the start line
+        assert!(s.contains(0, 3)); // whole middle line
+        assert!(s.contains(999, 3));
+        assert!(s.contains(3, 4)); // up to the end column on the end line
+        assert!(!s.contains(4, 4)); // past the end column
+        assert!(!s.contains(0, 1) && !s.contains(0, 5)); // outside the line span
+    }
+
+    #[test]
+    fn linear_is_order_independent_and_handles_history_lines() {
+        // Same selection whichever end is the anchor, incl. negative (history) lines.
+        let a = sel((2, -3), (7, -1), false);
+        let b = sel((7, -1), (2, -3), false);
+        for line in -4..=0 {
+            for col in 0..10 {
+                assert_eq!(a.contains(col, line), b.contains(col, line), "col {col} line {line}");
+            }
+        }
+        assert!(a.contains(2, -3)); // start corner
+        assert!(a.contains(7, -1)); // end corner
+        assert!(a.contains(0, -2)); // full middle line
+        assert!(!a.contains(1, -3)); // left of start on the start line
+    }
+
+    #[test]
+    fn block_is_a_rectangle_not_row_major() {
+        // Ctrl-drag from (col 6, line 1) to (col 2, line 3): the rectangle
+        // cols 2..=6 on lines 1..=3 — NOT the flowing text between the corners.
+        let s = sel((6, 1), (2, 3), true);
+        for line in 1..=3 {
+            assert!(s.contains(2, line) && s.contains(6, line));
+            assert!(!s.contains(1, line) && !s.contains(7, line));
+        }
+        assert!(!s.contains(4, 0) && !s.contains(4, 4)); // outside the line span
+        // A linear selection with the same corners would include (col 0, line 2);
+        // the block must not.
+        assert!(!s.contains(0, 2));
+        assert!(sel((6, 1), (2, 3), false).contains(0, 2));
     }
 }
 
