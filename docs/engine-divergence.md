@@ -5,31 +5,33 @@ oracle. The Phase-3 process (see `docs/own-engine-plan.md`) is to drive this lis
 empty (or to *intentional*, documented differences) under the `vt-conformance` harness.
 Each entry: what diverges, the measured impact, and the plan.
 
-Status snapshot (2026-07-21, foundation landed):
+Status snapshot (2026-07-21):
 - Spec cases (`spec.rs`, 32 cases): **PASS** against vt-term.
 - Curated differential (`vtterm_diff.rs`, 16 scripts): **PASS**.
-- Random-fuzz grid divergence (scrollback ignored): **~3.5%** (104/3000 scripts).
-- Random-fuzz including scrollback: ~52% (dominated by the missing history counter).
+- Random-fuzz grid divergence, scrollback ignored (`vtterm_fuzz.rs`, 5000 scripts):
+  **0** — the grid, cursor, and modes match the oracle exactly. Locked in as a test.
+- Remaining full divergence is entirely the deferred scrollback counter (below).
+
+### Fixed under the harness (2026-07-21)
+Four alacritty behaviours the differential fuzz surfaced, each traced to a minimal
+reproducer via delta-debugging and matched:
+- **LF keeps `pending_wrap`** — linefeed/newline do NOT clear the deferred-wrap flag
+  (they did in the first draft), so a char after a bare LF wraps one more line. This
+  one fix took grid divergence 3.2%→0.36%.
+- **EL-Right is a no-op while a wrap is pending** (`clear_line … if input_needs_wrap`).
+- **Private-marker CSI** (`?…H` etc.) is ignored; only `?…h/l` (DECSET/DECRST) act.
+- **`pending_wrap` is part of the cursor** — saved/restored by the alternate screen and
+  DECSC/DECRC.
 
 ## Open divergences
 
-### 1. Scrollback / history (deferred feature) — HIGH volume, LOW risk
+### 1. Scrollback / history (deferred feature) — the ONLY remaining divergence
 vt-term has no scrollback: content scrolled off the top is dropped, so `history` stays
-0 and `display_offset` stays 0 while the oracle accumulates them. This is the single
-biggest source of raw fuzz divergence (~half of all scripts), but it is a *missing
-feature*, not a grid bug — with scrollback counters neutralised, grid divergence is
-~3.5%. **Plan:** implement a scrollback ring buffer (Phase-3 milestone), which also
-unlocks `snapshot_lines`/scroll for the eventual rt wiring.
-
-### 2. Last-column autowrap edge — ~most of the 3.5% grid divergence
-On some scripts a single cell at the last column differs (vt-term keeps a glyph the
-oracle wrapped/cleared). Everything else — including the cursor — matches. It is a
-pending-wrap × scroll/newline interaction. **Plan:** align the wrapline semantics with
-alacritty's `wrapline`/`input_needs_wrap` handling precisely.
-
-### 3. A few cursor-position edge cases
-A handful of scripts end with the cursor one row/column off (e.g. after a wrap-then-
-scroll). Same family as #2. **Plan:** fold into the wrapline fix.
+0 and `display_offset` stays 0 while the oracle accumulates them. With those counters
+neutralised, grid divergence is **0/5000**. It is a *missing feature*, not a bug.
+**Plan (next milestone):** a scrollback ring buffer, which also unlocks
+`snapshot_lines`/scroll for the eventual rt wiring, and lets the full differential
+(history included) go green.
 
 ## Known not-yet-implemented (will diverge when exercised)
 

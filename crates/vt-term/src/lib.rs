@@ -54,7 +54,7 @@ pub struct Term {
     rows: usize,
     grid: Vec<Vec<Cell>>,
     // Primary-screen state saved while the alternate screen is active.
-    saved_screen: Option<(Vec<Vec<Cell>>, usize, usize, Cell)>,
+    saved_screen: Option<(Vec<Vec<Cell>>, usize, usize, Cell, bool)>, // grid,row,col,pen,pending_wrap
     row: usize,
     col: usize,
     /// Template for printed/erased cells (fg/bg/attrs); its `c` is unused.
@@ -69,7 +69,7 @@ pub struct Term {
     /// Deferred wrap: the cursor sits on the last column having just printed there; the
     /// next printable char wraps first. This is xterm's DECAWM behaviour.
     pending_wrap: bool,
-    saved_cursor: (usize, usize, Cell, bool), // DECSC: row, col, pen, origin
+    saved_cursor: (usize, usize, Cell, bool, bool), // DECSC: row, col, pen, origin, pending_wrap
     parser: Parser,
 }
 
@@ -92,7 +92,7 @@ impl Term {
             app_cursor: false,
             alt: false,
             pending_wrap: false,
-            saved_cursor: (0, 0, Cell::default(), false),
+            saved_cursor: (0, 0, Cell::default(), false, false),
             parser: Parser::new(),
         }
     }
@@ -180,8 +180,9 @@ impl Term {
     }
 
     /// Line feed: cursor down one, scrolling the region if already at its bottom.
+    /// Does NOT clear `pending_wrap` — alacritty's linefeed/newline leave it set, so a
+    /// char printed after a bare LF still wraps once more (matched behaviour).
     fn line_feed(&mut self) {
-        self.pending_wrap = false;
         if self.row == self.scroll_bottom {
             self.scroll_up(1);
         } else if self.row + 1 < self.rows {
@@ -255,6 +256,11 @@ impl Term {
 
     // ── Erase ─────────────────────────────────────────────────────────────────
     fn erase_in_line(&mut self, mode: u16) {
+        // Match alacritty: EL-Right is a no-op while a wrap is pending (the cursor sits
+        // logically past the last column, so there is nothing from it to the edge).
+        if self.pending_wrap && mode != 1 && mode != 2 {
+            return;
+        }
         let blank = self.blank();
         let (lo, hi) = match mode {
             1 => (0, self.col),               // start .. cursor
@@ -436,14 +442,15 @@ impl Term {
     fn swap_alt(&mut self, to_alt: bool) {
         if to_alt && !self.alt {
             let saved = std::mem::replace(&mut self.grid, vec![vec![Cell::default(); self.cols]; self.rows]);
-            self.saved_screen = Some((saved, self.row, self.col, self.pen));
+            self.saved_screen = Some((saved, self.row, self.col, self.pen, self.pending_wrap));
             self.alt = true;
         } else if !to_alt && self.alt {
-            if let Some((grid, row, col, pen)) = self.saved_screen.take() {
+            if let Some((grid, row, col, pen, wrap)) = self.saved_screen.take() {
                 self.grid = grid;
                 self.row = row.min(self.rows - 1);
                 self.col = col.min(self.cols - 1);
                 self.pen = pen;
+                self.pending_wrap = wrap;
             }
             self.alt = false;
         }
@@ -489,7 +496,19 @@ impl Perform for Term {
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let p = flat(params);
-        let private = intermediates.first() == Some(&b'?');
+        // A CSI with any intermediate byte only matches specific handlers. We implement
+        // the `?`-private DECSET/DECRST (h/l); every other intermediate+action pair —
+        // e.g. `?…H` — is ignored, exactly as alacritty leaves it unhandled.
+        if !intermediates.is_empty() {
+            if intermediates.first() == Some(&b'?') {
+                match action {
+                    'h' => self.set_mode(&p, true),
+                    'l' => self.set_mode(&p, false),
+                    _ => {}
+                }
+            }
+            return;
+        }
         match action {
             'A' => self.cursor_up(count(&p, 0)),
             'B' | 'e' => self.cursor_down(count(&p, 0)),
@@ -509,8 +528,6 @@ impl Perform for Term {
             'T' => self.scroll_down(count(&p, 0)),
             'r' => self.set_scroll_region(&p),
             'm' => self.sgr(&p),
-            'h' if private => self.set_mode(&p, true),
-            'l' if private => self.set_mode(&p, false),
             _ => {}
         }
     }
@@ -520,21 +537,22 @@ impl Perform for Term {
             return; // charset designations etc. — ignored (ASCII assumed) for now
         }
         match byte {
-            b'7' => self.saved_cursor = (self.row, self.col, self.pen, self.origin), // DECSC
+            b'7' => self.saved_cursor = (self.row, self.col, self.pen, self.origin, self.pending_wrap), // DECSC
             b'8' => {
                 // DECRC
-                let (r, c, pen, origin) = self.saved_cursor;
+                let (r, c, pen, origin, wrap) = self.saved_cursor;
                 self.row = r.min(self.rows - 1);
                 self.col = c.min(self.cols - 1);
                 self.pen = pen;
                 self.origin = origin;
-                self.pending_wrap = false;
+                self.pending_wrap = wrap;
             }
             b'D' => self.line_feed(),         // IND
             b'M' => self.reverse_line_feed(),  // RI
             b'E' => {
-                // NEL
+                // NEL = CR + LF; the CR half clears the pending wrap.
                 self.col = 0;
+                self.pending_wrap = false;
                 self.line_feed();
             }
             b'c' => self.reset(), // RIS
