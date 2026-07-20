@@ -99,13 +99,20 @@ fn grow(pattern: &[u8], target: usize) -> Vec<u8> {
 
 fn main() {
     const SIZE: usize = 4 << 20; // 4 MiB per workload
-    let workloads: Vec<(&str, Vec<u8>)> = vec![
+    let mut workloads: Vec<(&str, Vec<u8>)> = vec![
         ("plain ascii", grow(b"The quick brown fox jumps over the lazy dog. 0123456789\n", SIZE)),
         ("unicode text", grow("héllo 你好世界 🦀 wörld café ™ ελληνικά — dash\n".as_bytes(), SIZE)),
         ("sgr heavy", grow(b"\x1b[38;5;196mERR\x1b[0m \x1b[1;32mOK\x1b[0m \x1b[3;4;33mwarn\x1b[0m \x1b[38;2;10;20;30mrgb\x1b[0m\n", SIZE)),
         ("control heavy", grow(b"\x1b[2;5Hx\x1b[3;1H\r\ty\x1b[H\x1b[Kz\x08\x08w\n", SIZE)),
         ("mixed tui", grow(b"\x1b[?1049h\x1b[2J\x1b[1;1H\x1b[44;37m top \x1b[0m\x1b[3;3H\xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90 data \x1b[10;1Hmore text here 123\n", SIZE)),
     ];
+    // Real captured output of aerie's `spiral_stress` demo — a full-screen animated TUI
+    // (truecolor SGR, box drawing, full clears): the most representative workload there
+    // is. Grown to SIZE by repetition.
+    let spiral = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/spiral_stress.bytes");
+    if let Ok(bytes) = std::fs::read(&spiral) {
+        workloads.push(("spiral (real)", grow(&bytes, SIZE)));
+    }
 
     let arch = std::env::consts::ARCH;
     println!("parser throughput — {arch}  (4 MiB workloads, higher MB/s is better)\n");
