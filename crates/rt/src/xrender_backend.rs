@@ -852,15 +852,27 @@ impl Backend for XRenderBackend {
         // bbox — the CONTINUOUS 6fps case) copies only the instrument bands, old
         // positions plus new, so the compositor recomposites thin bands not the
         // screen. Still zero PutImage.
-        let content_changed = match damage {
-            None => true,
-            Some((b, _)) => b.w > 0 && b.h > 0,
-        };
-        if content_changed {
+        // Full frames (chrome moved: force_full) copy the whole window — they are
+        // infrequent and a whole-window copy avoids the half-drawn-border bug.
+        // Everything else copies only the CHANGED content region plus the thin
+        // instrument bands (old + new positions), so cosmic-comp recomposites the
+        // changed cells + bands, never the whole screen — the back buffer is a
+        // valid full-content buffer, so copying any sub-region is correct.
+        let full = damage.is_none();
+        if full {
             let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
         } else {
-            // Erase the previous frame's instruments and refresh under the new
-            // ones by copying content back for each old + new band.
+            if let Some((b, _)) = damage {
+                let x = b.x.clamp(0, self.win_w as i32) as i16;
+                let y = b.y.clamp(0, self.win_h as i32) as i16;
+                let w = (b.w.min(self.win_w as i32 - x as i32)).max(0) as u16;
+                let h = (b.h.min(self.win_h as i32 - y as i32)).max(0) as u16;
+                if w > 0 && h > 0 {
+                    let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, x, y, x, y, w, h);
+                }
+            }
+            // Erase the previous frame's instruments and refresh content under the
+            // new bands, so moving instruments leave no trail.
             for r in self.prev_instr_clip.iter().chain(self.instr_clip.iter()) {
                 let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, r.x, r.y, r.x, r.y, r.width, r.height);
             }
