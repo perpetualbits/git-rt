@@ -129,6 +129,11 @@ pub struct XRenderBackend {
     // pixels — so every rect is rounded outward.
     instr_draw_rects: RefCell<Vec<xproto::Rectangle>>,
     instr_clip: Vec<xproto::Rectangle>,
+    // The instrument bands composited onto the window LAST present, so a pure
+    // instrument-animation frame can refresh (erase) exactly the old bands plus
+    // the new ones — copying thin bands instead of the whole window, which under
+    // Xwayland is a full-screen compositor recomposite per frame.
+    prev_instr_clip: Vec<xproto::Rectangle>,
     glyphset: render::Glyphset, // one shared glyph set (all styles)
     src_pixmap: xproto::Pixmap, // 1x1 repeating solid-colour source
     src_pic: render::Picture,   // the source Picture over `src_pixmap`
@@ -265,6 +270,7 @@ impl XRenderBackend {
             instr_pic,
             instr_draw_rects: RefCell::new(Vec::new()),
             instr_clip: Vec::new(), // nothing drawn yet: present() composites nothing
+            prev_instr_clip: Vec::new(),
             glyphset,
             src_pixmap,
             src_pic,
@@ -829,19 +835,36 @@ impl Backend for XRenderBackend {
         self.win_h = h.get() as u16;
         self.recreate_back(); // back buffer must match the new window size
     }
-    fn present(&mut self, _window: &Window, _damage: Option<(PxRect, &[PxRect])>) -> bool {
-        // ALWAYS copy the whole back buffer to the window, ignoring the damage
-        // bbox. A CopyArea is server-side (zero wire pixels), so a full-window
-        // copy costs the same as a partial one — but it guarantees the complete,
-        // consistent back buffer is what's on screen. Presenting only the damage
-        // bbox was the source of the "half-drawn / grows-as-you-type" borders:
-        // `fill()` draws a whole rect (focus border, divider) into the back buffer
-        // whenever it merely intersects the bbox, but a bbox-only present showed
-        // just the sliver inside the bbox, revealing the rest only as later
-        // frames' bboxes swept over it. The DRAW stays minimal (scissored to the
-        // changed cells — that is what keeps the *wire* small); only the present
-        // is full. Still zero PutImage, so mechanism C's invariant holds.
-        let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
+    fn present(&mut self, _window: &Window, damage: Option<(PxRect, &[PxRect])>) -> bool {
+        // Copy the finished back buffer to the window. A CopyArea is server-side
+        // (zero wire pixels), but under XWAYLAND the copied region becomes the
+        // compositor's damage: a full-window copy makes cosmic-comp recomposite
+        // the WHOLE screen. Run continuously by the 6fps instrument tick, that
+        // pegs the compositor and lags the entire desktop over `ssh -X` (loop
+        // stalls of seconds while flush stays 0 — the cost is the compositor, not
+        // the wire).
+        //
+        // Content frames (a real damage bbox) and full frames still copy the whole
+        // window — they are infrequent (a keystroke, a scroll) and a whole-window
+        // copy both stays fast AND avoids the "half-drawn borders" bug (chrome
+        // fills whole rects into the back buffer, so a bbox-only copy would show
+        // only slivers). But a PURE instrument-animation frame (empty content
+        // bbox — the CONTINUOUS 6fps case) copies only the instrument bands, old
+        // positions plus new, so the compositor recomposites thin bands not the
+        // screen. Still zero PutImage.
+        let content_changed = match damage {
+            None => true,
+            Some((b, _)) => b.w > 0 && b.h > 0,
+        };
+        if content_changed {
+            let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, 0, 0, 0, 0, self.win_w, self.win_h);
+        } else {
+            // Erase the previous frame's instruments and refresh under the new
+            // ones by copying content back for each old + new band.
+            for r in self.prev_instr_clip.iter().chain(self.instr_clip.iter()) {
+                let _ = self.conn.copy_area(self.back_pixmap, self.window, self.gc, r.x, r.y, r.x, r.y, r.width, r.height);
+            }
+        }
         // Instrument layer OVER the content, when visible this frame. `instr_pic`
         // is premultiplied ARGB (see `premultiply` + `fill`'s OVER path), so a
         // plain RENDER `Composite` with `PictOp::OVER` and no mask blends it
@@ -861,6 +884,9 @@ impl Backend for XRenderBackend {
                 0, 0, 0, 0, 0, 0, self.win_w, self.win_h,
             );
         }
+        // Remember which bands are on the window now, so the next pure-instrument
+        // frame erases exactly these before re-compositing (avoids ghost trails).
+        self.prev_instr_clip = if self.instr_visible { self.instr_clip.clone() } else { Vec::new() };
         let ft = std::time::Instant::now();
         let _ = self.conn.flush();
         if self.xdiag {
