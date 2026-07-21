@@ -10,7 +10,12 @@
 //! foundation — the common sequences — grown under that harness; scrollback and reflow
 //! land later (tracked on the divergence ledger).
 
+use std::collections::VecDeque;
+
 use vt_parser::{Params, Parser, Perform};
+
+/// Maximum scrollback lines, matching the vendored oracle's `scrolling_history`.
+const SCROLLBACK: usize = 10_000;
 
 /// A cell colour: the terminal default, a 0–255 palette index (named colours 0–15
 /// included), or a direct RGB triple.
@@ -70,6 +75,10 @@ pub struct Term {
     /// next printable char wraps first. This is xterm's DECAWM behaviour.
     pending_wrap: bool,
     saved_cursor: (usize, usize, Cell, bool, bool), // DECSC: row, col, pen, origin, pending_wrap
+    /// Lines scrolled off the top of the primary screen (oldest at the front), capped
+    /// at SCROLLBACK. Only its length is observed today (display_offset stays 0); it
+    /// exists so `history_size` tracks the oracle and future scrolling can read it.
+    history: VecDeque<Vec<Cell>>,
     parser: Parser,
 }
 
@@ -93,6 +102,7 @@ impl Term {
             alt: false,
             pending_wrap: false,
             saved_cursor: (0, 0, Cell::default(), false, false),
+            history: VecDeque::new(),
             parser: Parser::new(),
         }
     }
@@ -148,6 +158,16 @@ impl Term {
     pub fn app_cursor(&self) -> bool {
         self.app_cursor
     }
+    /// Number of lines held in scrollback (matches the oracle's `history_size`). The
+    /// alternate screen has no scrollback, so it reports 0 while active — the primary's
+    /// history is preserved and returns when the alt screen is left.
+    pub fn history_size(&self) -> usize {
+        if self.alt {
+            0
+        } else {
+            self.history.len()
+        }
+    }
 
     // ── Grid helpers ──────────────────────────────────────────────────────────
     fn blank(&self) -> Cell {
@@ -164,6 +184,17 @@ impl Term {
     fn scroll_up(&mut self, n: usize) {
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(b - t + 1);
+        // History grows only for a top-anchored scroll on the primary screen (matching
+        // alacritty's `scroll_up`: history increases iff `region.start == 0`; the alt
+        // screen has no scrollback).
+        if t == 0 && !self.alt {
+            for r in 0..n {
+                self.history.push_back(self.grid[r].clone());
+                if self.history.len() > SCROLLBACK {
+                    self.history.pop_front();
+                }
+            }
+        }
         self.grid[t..=b].rotate_left(n);
         for r in (b + 1 - n)..=b {
             self.grid[r] = self.blank_row();
@@ -287,11 +318,34 @@ impl Term {
                     self.grid[self.row][c] = blank;
                 }
             }
-            2 | 3 => {
+            2 => {
+                // ED-All = alacritty's clear_viewport: on the PRIMARY screen the used
+                // lines (row 0 down to the last non-empty row) scroll into history
+                // first, THEN the whole screen clears. The alt screen just clears.
+                if !self.alt {
+                    // `positions` = the row the oracle's backward "last non-empty" scan
+                    // stops at, +1. With content: last-non-empty + 1. All empty: the scan
+                    // stops at line 0 when there is no history yet (→ 1), or descends to
+                    // line −1 and breaks when history exists (→ 0). This exactly matches
+                    // alacritty's clear_viewport iterator, verified against the oracle.
+                    let last_non_empty = (0..self.rows).rev().find(|&r| self.grid[r].iter().any(|c| !cell_is_empty(c)));
+                    let positions = match last_non_empty {
+                        Some(r) => r + 1,
+                        None if self.history.is_empty() => 1,
+                        None => 0,
+                    };
+                    for r in 0..positions {
+                        self.history.push_back(self.grid[r].clone());
+                        if self.history.len() > SCROLLBACK {
+                            self.history.pop_front();
+                        }
+                    }
+                }
                 for r in 0..self.rows {
                     self.grid[r] = vec![blank; self.cols];
                 }
             }
+            3 => self.history.clear(), // ED-Saved: clear scrollback only
             _ => {
                 for c in self.col..self.cols {
                     self.grid[self.row][c] = blank;
@@ -460,6 +514,12 @@ impl Term {
         let (cols, rows) = (self.cols, self.rows);
         *self = Term::new(cols, rows);
     }
+}
+
+/// A cell alacritty treats as "empty" for the clear_viewport scan: a space or tab
+/// glyph with the default foreground/background and no attributes.
+fn cell_is_empty(c: &Cell) -> bool {
+    (c.c == ' ' || c.c == '\t') && c.fg == Color::Default && c.bg == Color::Default && c.attrs == Attrs::default()
 }
 
 /// First value of each parameter as a flat `Vec` (drops sub-parameters — the common

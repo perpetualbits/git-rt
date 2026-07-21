@@ -183,9 +183,16 @@ was unified (`Default`/`Indexed`/`Rgb`) so vt-term and alacritty compare directl
 two alacritty quirks (ED-above `line>1`, tab-glyph) were matched. Divergences tracked in
 `docs/engine-divergence.md`.
 
-**Next Phase-3 milestones:** scrollback ring; close the last-column wrap edge + cursor
-cases; random-fuzz + replay-corpus differential to green under `ci/verify.sh` (both
-arches); wide chars; then reflow (last, on the ledger). Original notes below.
+**Update 2026-07-21 — vt-term matches the oracle on all fuzzed input.** Drove the
+differential to zero under the harness: the grid/cursor/mode divergences (four
+pending-wrap/CSI quirks) AND scrollback are done. The **full** differential
+(`vtterm_fuzz.rs`, grid + cursor + modes + history) is **0/10000** vs the vendored
+oracle, green on x86_64 AND riscv64 via `ci/verify.sh`. Each fix was a delta-debugged
+minimal reproducer matched to alacritty's real behaviour; see `docs/engine-divergence.md`.
+
+**Remaining Phase-3 work:** wide characters; OSC/DCS semantics; then reflow (last, the
+hard part). After that, Phase 4 — wire `vt-term` into rt behind `RT_ENGINE`. Original
+notes below.
 
 ### Original design notes for Phase 3
 

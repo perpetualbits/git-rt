@@ -8,9 +8,12 @@ Each entry: what diverges, the measured impact, and the plan.
 Status snapshot (2026-07-21):
 - Spec cases (`spec.rs`, 32 cases): **PASS** against vt-term.
 - Curated differential (`vtterm_diff.rs`, 16 scripts): **PASS**.
-- Random-fuzz grid divergence, scrollback ignored (`vtterm_fuzz.rs`, 5000 scripts):
-  **0** — the grid, cursor, and modes match the oracle exactly. Locked in as a test.
-- Remaining full divergence is entirely the deferred scrollback counter (below).
+- Random-fuzz FULL differential (`vtterm_fuzz.rs`, 8000 scripts) — grid, cursor, modes,
+  AND scrollback history: **0 divergences** (verified 0/10000 in a wider sweep). Locked
+  in as a test, green on x86_64 and riscv64.
+
+**vt-term now matches the vendored oracle exactly on every fuzzed input.** The open
+items below are not-yet-exercised features (nothing in the fuzz reaches them yet).
 
 ### Fixed under the harness (2026-07-21)
 Four alacritty behaviours the differential fuzz surfaced, each traced to a minimal
@@ -23,15 +26,22 @@ reproducer via delta-debugging and matched:
 - **`pending_wrap` is part of the cursor** — saved/restored by the alternate screen and
   DECSC/DECRC.
 
+Scrollback (the ring buffer) reconciled to the oracle:
+- **History grows only on a top-anchored scroll** (`scroll_up` when the region starts at
+  row 0), never inside a DECSTBM region that starts below the top, never on the alt
+  screen.
+- **`\x1b[2J` scrolls the viewport into history** (alacritty's `clear_viewport`), not a
+  plain blank. `positions` = last-non-empty-row + 1; on an all-empty screen it is 1 when
+  history is empty (the scan stops at line 0) and 0 otherwise (it descends to line −1) —
+  a genuine iterator edge, matched exactly.
+- **The alt screen reports `history_size` 0** (no scrollback); the primary's history is
+  preserved and returns on exit. `\x1b[3J` clears scrollback.
+
 ## Open divergences
 
-### 1. Scrollback / history (deferred feature) — the ONLY remaining divergence
-vt-term has no scrollback: content scrolled off the top is dropped, so `history` stays
-0 and `display_offset` stays 0 while the oracle accumulates them. With those counters
-neutralised, grid divergence is **0/5000**. It is a *missing feature*, not a bug.
-**Plan (next milestone):** a scrollback ring buffer, which also unlocks
-`snapshot_lines`/scroll for the eventual rt wiring, and lets the full differential
-(history included) go green.
+None currently observed under the fuzz. The scrollback ring is implemented and the full
+differential (history included) is 0/10000. `display_offset` is always observed at 0
+(the bottom of the view); reading scrolled-back lines and viewport scrolling are future.
 
 ## Known not-yet-implemented (will diverge when exercised)
 

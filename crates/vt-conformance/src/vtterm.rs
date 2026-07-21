@@ -73,8 +73,8 @@ impl VtEngine for vt_term::Term {
             cursor,
             alt_screen: self.alt_screen(),
             app_cursor: self.app_cursor(),
-            display_offset: 0, // no scrollback yet (Phase-3 later)
-            history: 0,
+            display_offset: 0, // we always observe at the bottom of the view
+            history: self.history_size(),
         }
     }
     fn name() -> &'static str {

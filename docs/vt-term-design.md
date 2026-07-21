@@ -1,9 +1,10 @@
 # vt-term design
 
-> Status: **foundation implemented** (Phase 3 in progress). The common sequences are in
-> and pass the spec cases + curated differential; scrollback, reflow, wide chars, and
-> the last-column wrap edge are open (see `docs/engine-divergence.md`). Code:
-> `crates/vt-term/src/lib.rs`; doc and code stay in lockstep.
+> Status: **matches the oracle on all fuzzed input** (Phase 3). Common sequences +
+> scrollback are in; the full differential (grid, cursor, modes, history) is 0/10000 vs
+> the vendored oracle on x86_64 and riscv64. Reflow, wide chars, and OSC/DCS semantics
+> remain (see `docs/engine-divergence.md`). Code: `crates/vt-term/src/lib.rs`; doc and
+> code stay in lockstep.
 
 The in-house Term: consumes [`vt_parser`]'s action stream (it implements
 `vt_parser::Perform`) and maintains the terminal grid — cells, cursor, pen, scroll
@@ -32,6 +33,11 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
 - **Modes.** DECAWM (?7), DECTCEM (?25), DECCKM (?1), DECOM (?6), alternate screen
   (?47/?1047/?1049 with cursor+screen save/restore). DECSC/DECRC, RIS.
 - **Tabs.** Every-8 stops, matching alacritty's write-`\t`-into-the-start-cell quirk.
+- **Scrollback.** A ring (cap 10 000) of lines scrolled off the top of the *primary*
+  screen. Grows only on a top-anchored scroll and on `\x1b[2J` (which scrolls the
+  viewport into history, not a plain blank); the alt screen has none. `history_size`
+  tracks the oracle exactly. `display_offset` is observed at 0 (bottom); viewport
+  scrolling to read the ring is future work.
 
 ## Verification
 
