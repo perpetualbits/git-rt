@@ -54,6 +54,18 @@ fn map_charset(cs: Charset, c: char) -> char {
     }
 }
 
+/// Display width of `c` with an inline fast path for printable ASCII (`0x20..=0x7e`, always
+/// width 1) that skips the unicode-width table lookup — the dominant per-glyph cost in the
+/// print hot path, and especially on in-order cores (riscv).
+#[inline]
+fn char_width(c: char) -> usize {
+    if matches!(c, ' '..='~') {
+        1
+    } else {
+        c.width().unwrap_or(0)
+    }
+}
+
 // Packed [`Cell`] flag bits: the seven SGR attributes, plus the wide-glyph `SPACER` and
 // soft-wrap `WRAPLINE` structural markers. All live in one `u16` word.
 const BOLD: u16 = 1 << 0;
@@ -657,7 +669,7 @@ impl Term {
         // flag, here derived from width, then clears); fg/bg/attrs are kept.
         if self.col > 0
             && self.grid[self.row][self.col].spacer()
-            && self.grid[self.row][self.col - 1].c.width() == Some(2)
+            && char_width(self.grid[self.row][self.col - 1].c) == 2
         {
             self.grid[self.row][self.col - 1].c = ' ';
         }
@@ -675,7 +687,7 @@ impl Term {
     fn put_char(&mut self, c: char) {
         // Character display width (unicode-width): 0 = combining/zero-width, 1 = normal,
         // 2 = wide (CJK/emoji). Matches alacritty's `input`.
-        let width = c.width().unwrap_or(0);
+        let width = char_width(c);
         if width == 0 {
             // Zero-width/combining: alacritty attaches it to the previous cell's base
             // glyph without changing that cell's `.c` or the cursor — observably a no-op.
@@ -1044,12 +1056,12 @@ fn reflow_is_clear(row: &[Cell]) -> bool {
 }
 /// A double-width glyph (alacritty's `WIDE_CHAR`).
 fn reflow_is_wide(c: &Cell) -> bool {
-    c.c.width() == Some(2)
+    char_width(c.c) == 2
 }
 /// A *leading* wide-char spacer (alacritty's `LEADING_WIDE_CHAR_SPACER`): a spacer with no
 /// wide glyph immediately before it (as opposed to a wide glyph's trailing spacer).
 fn reflow_is_leading_spacer(row: &[Cell], i: usize) -> bool {
-    row[i].flags & SPACER != 0 && (i == 0 || row[i - 1].c.width() != Some(2))
+    row[i].flags & SPACER != 0 && (i == 0 || char_width(row[i - 1].c) != 2)
 }
 /// Split cells beyond `columns` off `row`, trimming trailing empties from the remainder —
 /// alacritty's `Row::shrink`. Returns the (non-empty) overflow, or `None` if it all fits.
@@ -1355,7 +1367,7 @@ impl Perform for Term {
         let mut it = s.chars().peekable();
         while let Some(&c) = it.peek() {
             // Wide (2) or zero-width/combining (0) glyphs take the exact slow path.
-            if c.width() != Some(1) {
+            if char_width(c) != 1 {
                 self.put_char(c);
                 it.next();
                 continue;
@@ -1374,7 +1386,7 @@ impl Perform for Term {
                 let row = &mut self.grid[self.row];
                 while col < cols - 1 {
                     match it.peek() {
-                        Some(&c) if c.width() == Some(1) => {
+                        Some(&c) if char_width(c) == 1 => {
                             row.cells[col] = Cell { c, fg, bg, flags };
                             col += 1;
                             it.next();
@@ -1389,7 +1401,7 @@ impl Perform for Term {
             // (write here, then set/defer the pending wrap per DECAWM).
             if self.col == cols - 1 {
                 if let Some(&c) = it.peek() {
-                    if c.width() == Some(1) {
+                    if char_width(c) == 1 {
                         self.put_char(c);
                         it.next();
                     }
