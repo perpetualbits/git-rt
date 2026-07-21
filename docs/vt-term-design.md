@@ -41,11 +41,17 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
   alacritty cell-for-cell (a `spacer` flag distinguishes a real spacer from an erased
   blank for the clear-wide and emptiness rules). Combining marks attach to the base
   (observably ignored) except the pending-wrap boundary edge (ledgered).
-- **Scrollback.** A ring (cap 10 000) of lines scrolled off the top of the *primary*
-  screen. Grows only on a top-anchored scroll and on `\x1b[2J` (which scrolls the
-  viewport into history, not a plain blank); the alt screen has none. `history_size`
-  tracks the oracle exactly. `display_offset` is observed at 0 (bottom); viewport
-  scrolling to read the ring is future work.
+- **Scrollback + viewport.** A ring (cap 10 000) of lines scrolled off the top of the
+  *primary* screen. Grows only on a top-anchored scroll and on `\x1b[2J` (which scrolls the
+  viewport into history, not a plain blank); the alt screen has none. `history_size` tracks
+  the oracle exactly. A `display_offset` scrolls the view up into history
+  (`scroll_display`/`scroll_to_bottom_view`); `cell_at(abs, col)` reads any absolute line
+  (`topmost..=bottommost`, history negative), so a host can render scrollback, extract
+  selections, and search. New output while scrolled keeps the view anchored.
+- **Reporting modes.** Mouse reporting (DECSET 1000/1002/1003 → `wants_mouse`/`wants_motion`,
+  1006 → `mouse_sgr`, mutually exclusive like alacritty), DECSCUSR cursor shape
+  (`cursor_shape`), and the OSC 0/2 window title (`take_title`) are tracked and exposed for
+  a host to act on.
 - **Reflow on resize.** Resize does lines first (a pure row move that scrolls to keep the
   cursor placed — into scrollback on the primary, discarded on the alt), then columns.
   Column reflow is a **faithful port of alacritty's `grow_columns`/`shrink_columns`**: a

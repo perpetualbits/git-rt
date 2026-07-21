@@ -8,11 +8,15 @@
 //! snapshot — goes through `vt_term`. A background thread reads the master fd and feeds
 //! `vt_term::Term`; the GUI thread writes/resizes via the raw fd and reads snapshots.
 //!
-//! **Degraded vs the alacritty backend** (vt-term doesn't implement these yet): no
-//! scrollback *viewport* (`display_offset` is always 0, so `scroll*` are no-ops and
-//! `snapshot_lines` returns the live screen), no selection/search, no mouse reporting,
-//! no OSC title, block cursor only, and damage is always `Full`. These are stubbed with
-//! sane defaults and called out inline.
+//! **Feature parity with the alacritty backend:** scrollback viewport (scroll / scroll-to
+//! / `snapshot_lines`), linewise + block selection (wrap-aware), buffer search, mouse
+//! reporting (DECSET 1000/1002/1003/1006), DECSCUSR cursor shape, OSC 0/2 window title,
+//! and precise per-line damage (computed by diffing successive rendered grids, since
+//! vt-term has no built-in damage tracking).
+//!
+//! **Still simplified:** damage is diff-derived rather than parser-tracked (correct, one
+//! grid-diff per frame); search is a plain substring scan (no regex); and any vt-term
+//! reflow edge (see `docs/engine-divergence.md`) shows through here too.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -25,8 +29,8 @@ use alacritty_terminal::tty::{self, EventedReadWrite, Options as PtyOptions, She
 
 use crate::palette::{self, Palette};
 use crate::{
-    CellAttrs, CursorPos, CursorShape, Damage, LineBounds, PaneEvent, SearchMatch, SnapCell,
-    Snapshot,
+    CellAttrs, CellDamage, CursorPos, CursorShape, Damage, LineBounds, PaneEvent, SearchMatch,
+    SnapCell, Snapshot,
 };
 
 /// A pane driven by the in-house `vt_term::Term`.
@@ -41,6 +45,9 @@ pub struct VtPane {
     events: Arc<Mutex<VecDeque<PaneEvent>>>,
     /// Set by the reader thread when new bytes have been applied (drives redraw).
     dirty: Arc<AtomicBool>,
+    /// The grid as of the last `render_snapshot`, diffed against the next to compute
+    /// precise per-line damage (vt-term has no built-in damage tracking).
+    last_render: Mutex<Vec<Vec<SnapCell>>>,
     /// Reader thread; detached — it ends on its own when the child closes the PTY.
     _reader: std::thread::JoinHandle<()>,
     cols: usize,
@@ -115,11 +122,18 @@ impl VtPane {
                         break;
                     }
                     Ok(n) => {
+                        let mut title = None;
                         if let Ok(mut t) = term_r.lock() {
                             t.feed(&buf[..n]);
+                            title = t.take_title(); // OSC 0/2 while holding the lock
                         }
+                        let mut q = events_r.lock().unwrap();
+                        if let Some(t) = title {
+                            q.push_back(PaneEvent::Title(t));
+                        }
+                        q.push_back(PaneEvent::Wakeup);
+                        drop(q);
                         dirty_r.store(true, Ordering::Release);
-                        events_r.lock().unwrap().push_back(PaneEvent::Wakeup);
                     }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
@@ -142,6 +156,7 @@ impl VtPane {
             _pty: pty,
             events,
             dirty,
+            last_render: Mutex::new(Vec::new()),
             _reader: reader,
             cols,
             rows,
@@ -208,39 +223,24 @@ impl VtPane {
     fn capture(&self) -> Snapshot {
         let t = self.term.lock().unwrap();
         let (cols, rows) = (t.cols(), t.rows());
+        let offset = t.display_offset() as i32;
         let blank = SnapCell { c: ' ', fg: self.palette.fg, bg: self.palette.bg, attrs: CellAttrs::default() };
         let mut grid = vec![vec![blank.clone(); cols]; rows];
         for r in 0..rows {
             for col in 0..cols {
-                let cell = t.cell(r, col);
-                let a = cell.attrs;
-                let mut fg = self.rgb(cell.fg, true);
-                let mut bg = self.rgb(cell.bg, false);
-                if a.dim {
-                    fg = palette::dim(fg);
-                }
-                if a.inverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                if a.hidden {
-                    fg = bg;
-                }
-                grid[r][col] = SnapCell {
-                    c: cell.c,
-                    fg,
-                    bg,
-                    attrs: CellAttrs {
-                        bold: a.bold,
-                        underline: a.underline,
-                        italic: a.italic,
-                        strikeout: a.strikeout,
-                    },
-                };
+                // Viewport row r shows absolute line `r - offset` (offset>0 = scrolled up).
+                grid[r][col] = self.snapcell(&t, r as i32 - offset, col);
             }
         }
-        let cursor = if t.cursor_visible() {
+        // Cursor is only drawn when live (not scrolled back into history).
+        let cursor = if t.cursor_visible() && offset == 0 {
             let (col, line) = t.cursor();
-            (line < rows && col < cols).then_some(CursorPos { col, line, shape: CursorShape::Block })
+            let shape = match t.cursor_shape() {
+                vt_term::CursorShape::Block => CursorShape::Block,
+                vt_term::CursorShape::Underline => CursorShape::Underline,
+                vt_term::CursorShape::Beam => CursorShape::Beam,
+            };
+            (line < rows && col < cols).then_some(CursorPos { col, line, shape })
         } else {
             None
         };
@@ -251,42 +251,188 @@ impl VtPane {
         self.capture()
     }
 
-    /// vt-term has no per-cell damage tracking, so every rendered frame is `Full`
-    /// (correct, just not minimal). Clears the dirty flag so the caller can coalesce.
+    /// Capture the grid and compute precise per-line damage by diffing it against the
+    /// previously-rendered grid — vt-term has no built-in damage, but a diff of the actual
+    /// output can't miss a change. `Full` on the first frame or a size change; otherwise
+    /// `Lines` with each changed row's `left..=right` span (empty when nothing changed, so
+    /// an idle pane reports no damage). Call once per pane per frame.
     pub fn render_snapshot(&self) -> Snapshot {
         self.dirty.store(false, Ordering::Release);
-        let mut snap = self.capture();
-        snap.damage = Damage::Full;
-        snap
+        let snap = self.capture();
+        let mut last = self.last_render.lock().unwrap();
+        let same_dims =
+            last.len() == snap.rows.len() && last.first().map_or(false, |r| r.len() == snap.cols);
+        let damage = if !same_dims {
+            Damage::Full
+        } else {
+            let mut lines = Vec::new();
+            for (i, (new, old)) in snap.rows.iter().zip(last.iter()).enumerate() {
+                if new != old {
+                    let left = (0..new.len()).find(|&c| new[c] != old[c]).unwrap_or(0);
+                    let right = (0..new.len()).rev().find(|&c| new[c] != old[c]).unwrap_or(0);
+                    lines.push(CellDamage { line: i, left, right });
+                }
+            }
+            Damage::Lines(lines)
+        };
+        *last = snap.rows.clone();
+        Snapshot { cols: snap.cols, rows: snap.rows, cursor: snap.cursor, damage }
     }
 
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
     }
 
-    // ── Scrollback viewport: vt-term always observes the bottom, so these are no-ops. ──
-    pub fn scroll(&self, _delta: isize) {}
-    pub fn scroll_to_bottom(&self) {}
-    pub fn scroll_to_line(&self, _line: i32) {}
+    // ── Scrollback viewport ────────────────────────────────────────────────────
+    pub fn scroll(&self, delta: isize) {
+        if let Ok(mut t) = self.term.lock() {
+            t.scroll_display(delta as i32); // positive = up into history
+        }
+    }
+    pub fn scroll_to_bottom(&self) {
+        if let Ok(mut t) = self.term.lock() {
+            t.scroll_to_bottom_view();
+        }
+    }
+    pub fn scroll_to_line(&self, line: i32) {
+        // Centre absolute `line` in the viewport, matching the alacritty backend.
+        if let Ok(mut t) = self.term.lock() {
+            let screen = t.rows() as i32;
+            let history = t.history_size() as i32;
+            let current = t.display_offset() as i32;
+            let desired = (screen / 2 - line).clamp(0, history);
+            t.scroll_display(desired - current);
+        }
+    }
     pub fn scroll_info(&self) -> (usize, usize, usize) {
         let t = self.term.lock().unwrap();
-        (0, t.history_size(), t.rows()) // offset 0 (bottom), history count, screen height
-    }
-
-    // ── Selection / search: not yet implemented for vt-term. ──
-    pub fn selection_text(&self, _anchor: (usize, i32), _head: (usize, i32), _block: bool) -> String {
-        String::new()
-    }
-    pub fn search(&self, _needle: &str, _case_sensitive: bool) -> Vec<SearchMatch> {
-        Vec::new()
+        (t.display_offset(), t.history_size(), t.rows())
     }
     pub fn line_bounds(&self) -> LineBounds {
         let t = self.term.lock().unwrap();
-        // Only the visible screen is addressable (no history viewport), so topmost = 0.
-        LineBounds { topmost: 0, bottommost: t.rows() as i32 - 1, screen_lines: t.rows(), cols: t.cols() }
+        LineBounds {
+            topmost: t.topmost(),
+            bottommost: t.bottommost(),
+            screen_lines: t.rows(),
+            cols: t.cols(),
+        }
     }
-    pub fn snapshot_lines(&self, _top: i32, _rows: usize) -> Snapshot {
-        self.capture() // no history view: always the live screen
+    /// Absolute lines `[top, top+rows)` for scrollback rendering; lines outside the
+    /// readable range come back blank. Matches the alacritty backend's `snapshot_lines`.
+    pub fn snapshot_lines(&self, top: i32, rows: usize) -> Snapshot {
+        let t = self.term.lock().unwrap();
+        let cols = t.cols();
+        let (topmost, bottommost) = (t.topmost(), t.bottommost());
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let abs = top + r as i32;
+            let mut line = vec![SnapCell::blank(); cols];
+            if abs >= topmost && abs <= bottommost {
+                for c in 0..cols {
+                    line[c] = self.snapcell(&t, abs, c);
+                }
+            }
+            out.push(line);
+        }
+        Snapshot { cols, rows: out, cursor: None, damage: Damage::default() }
+    }
+
+    // ── Selection ──────────────────────────────────────────────────────────────
+    /// Extract selected text between two absolute-grid endpoints, trimming trailing
+    /// blanks per line (linewise) or per rectangle (block), matching the alac backend.
+    pub fn selection_text(&self, anchor: (usize, i32), head: (usize, i32), block: bool) -> String {
+        let t = self.term.lock().unwrap();
+        let cols = t.cols();
+        // Order the endpoints top-to-bottom (then left-to-right on the same line).
+        let (mut a, mut h) = (anchor, head);
+        if (h.1, h.0) < (a.1, a.0) {
+            std::mem::swap(&mut a, &mut h);
+        }
+        let mut out = String::new();
+        for line in a.1..=h.1 {
+            let (lo, hi) = if block {
+                (a.0.min(h.0), a.0.max(h.0))
+            } else if a.1 == h.1 {
+                (a.0, h.0)
+            } else if line == a.1 {
+                (a.0, cols - 1)
+            } else if line == h.1 {
+                (0, h.0)
+            } else {
+                (0, cols - 1)
+            };
+            let mut s = String::new();
+            for c in lo..=hi.min(cols - 1) {
+                let cell = t.cell_at(line, c);
+                if !cell.spacer {
+                    s.push(cell.c);
+                }
+            }
+            // A soft-wrapped line (WRAPLINE on its last cell) continues into the next, so
+            // join without trimming or a newline — matching alacritty's copy behaviour.
+            let wrapped = !block && line != h.1 && t.cell_at(line, cols - 1).wrapline;
+            if wrapped {
+                out.push_str(&s);
+            } else {
+                out.push_str(s.trim_end());
+                if line != h.1 {
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    // ── Search ─────────────────────────────────────────────────────────────────
+    /// Scan every readable line for `needle`, returning one match per occurrence.
+    pub fn search(&self, needle: &str, case_sensitive: bool) -> Vec<SearchMatch> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let t = self.term.lock().unwrap();
+        let cols = t.cols();
+        let want = if case_sensitive { needle.to_string() } else { needle.to_lowercase() };
+        let mut hits = Vec::new();
+        for abs in t.topmost()..=t.bottommost() {
+            let mut text = String::with_capacity(cols);
+            for c in 0..cols {
+                let cell = t.cell_at(abs, c);
+                text.push(if cell.spacer { '\0' } else { cell.c });
+            }
+            let hay = if case_sensitive { text.clone() } else { text.to_lowercase() };
+            let mut from = 0;
+            while let Some(rel) = hay[from..].find(&want) {
+                let start = from + rel;
+                // byte offset → column: count chars before `start`.
+                let col = hay[..start].chars().count();
+                hits.push(SearchMatch { line: abs, col, len: want.chars().count() });
+                from = start + want.len().max(1);
+            }
+        }
+        hits
+    }
+
+    /// One resolved cell at absolute line/col, for history snapshots.
+    fn snapcell(&self, t: &vt_term::Term, abs: i32, col: usize) -> SnapCell {
+        let cell = t.cell_at(abs, col);
+        let a = cell.attrs;
+        let mut fg = self.rgb(cell.fg, true);
+        let mut bg = self.rgb(cell.bg, false);
+        if a.dim {
+            fg = palette::dim(fg);
+        }
+        if a.inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if a.hidden {
+            fg = bg;
+        }
+        SnapCell {
+            c: cell.c,
+            fg,
+            bg,
+            attrs: CellAttrs { bold: a.bold, underline: a.underline, italic: a.italic, strikeout: a.strikeout },
+        }
     }
 
     // ── Mode queries the GUI uses to encode input. ──
@@ -296,15 +442,14 @@ impl VtPane {
     pub fn is_alt_screen(&self) -> bool {
         self.term.lock().map(|t| t.alt_screen()).unwrap_or(false)
     }
-    // Mouse reporting isn't tracked yet, so the GUI treats the pane as mouse-off.
     pub fn wants_mouse(&self) -> bool {
-        false
+        self.term.lock().map(|t| t.wants_mouse()).unwrap_or(false)
     }
     pub fn wants_motion(&self) -> bool {
-        false
+        self.term.lock().map(|t| t.wants_motion()).unwrap_or(false)
     }
     pub fn mouse_sgr(&self) -> bool {
-        false
+        self.term.lock().map(|t| t.mouse_sgr()).unwrap_or(false)
     }
 
     pub fn drain_events(&self) -> Vec<PaneEvent> {

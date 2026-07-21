@@ -1113,12 +1113,22 @@ impl TermPane {
 mod vtpane_tests {
     use super::*;
 
-    /// The in-house backend drives a real PTY: spawn a shell that prints a marker, poll
-    /// the snapshot until it appears, and confirm the child-exit event arrives.
+    /// The in-house backend drives a real PTY: spawn a shell that prints many lines (so
+    /// scrollback builds), poll until the marker appears, confirm the child-exit event,
+    /// then exercise scroll / search / selection / title / resize.
     #[test]
     fn vtpane_runs_a_real_command() {
         let mut pane = vtpane::VtPane::spawn_env(
-            Some(("/bin/sh".into(), vec!["-c".into(), "printf HELLO_VTTERM".into()])),
+            Some((
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    // 20 lines (> 10 rows) so lines scroll into history, plus a title.
+                    "printf '\\033]0;VT TITLE\\007'; for i in $(seq 1 20); do echo LINE_$i; done; \
+                     echo HELLO_VTTERM"
+                        .into(),
+                ],
+            )),
             None,
             40,
             10,
@@ -1129,12 +1139,17 @@ mod vtpane_tests {
 
         let mut saw_text = false;
         let mut saw_exit = false;
+        let mut saw_title = false;
         for _ in 0..200 {
             if pane.snapshot().to_text().contains("HELLO_VTTERM") {
                 saw_text = true;
             }
-            if pane.drain_events().iter().any(|e| matches!(e, PaneEvent::Exited)) {
-                saw_exit = true;
+            for e in pane.drain_events() {
+                match e {
+                    PaneEvent::Exited => saw_exit = true,
+                    PaneEvent::Title(t) if t == "VT TITLE" => saw_title = true,
+                    _ => {}
+                }
             }
             if saw_text && saw_exit {
                 break;
@@ -1143,9 +1158,36 @@ mod vtpane_tests {
         }
         assert!(saw_text, "vt-term pane never rendered the child's output");
         assert!(saw_exit, "vt-term pane never reported the child exit");
-        // Resize must not panic and must keep the content addressable.
+        assert!(saw_title, "vt-term pane never reported the OSC title");
+
+        // Scrollback built up: history > 0, and scrolling up moves the viewport.
+        let (_, history, _) = pane.scroll_info();
+        assert!(history > 0, "expected scrollback, got {history}");
+        pane.scroll(5);
+        assert_eq!(pane.scroll_info().0, 5.min(history), "viewport scrolled up");
+        pane.scroll_to_bottom();
+        assert_eq!(pane.scroll_info().0, 0, "back to bottom");
+
+        // Search finds the marker somewhere in the readable buffer.
+        let hits = pane.search("LINE_7", true);
+        assert!(!hits.is_empty(), "search found no LINE_7");
+
+        // Selection of a full visible row yields its text.
+        let text = pane.selection_text((0, 0), (39, 0), false);
+        assert!(!text.is_empty(), "selection was empty");
+
+        // Resize must not panic and keeps content addressable.
         pane.resize(20, 6);
         let _ = pane.snapshot();
+        let _ = pane.wants_mouse();
+
+        // Precise damage: the child has exited (idle), so after one render establishes the
+        // baseline, the next render on unchanged content reports no damaged lines.
+        let _ = pane.render_snapshot(); // baseline
+        match pane.render_snapshot().damage {
+            Damage::Lines(l) => assert!(l.is_empty(), "idle pane reported damage: {l:?}"),
+            Damage::Full => panic!("idle pane reported Full damage"),
+        }
     }
 }
 

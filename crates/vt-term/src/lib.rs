@@ -89,6 +89,24 @@ impl Default for Cell {
     }
 }
 
+/// Cursor shape requested via DECSCUSR (`CSI Ps SP q`); blink is not distinguished.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Beam,
+}
+
+/// Mouse-reporting protocol. Mutually exclusive, matching xterm/alacritty: DECSET
+/// 1000 → `Click`, 1002 → `Drag` (button-motion), 1003 → `Motion` (any-motion).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseMode {
+    Off,
+    Click,
+    Drag,
+    Motion,
+}
+
 /// The terminal. Feed bytes with [`feed`](Term::feed); read state via the accessors.
 pub struct Term {
     cols: usize,
@@ -119,6 +137,17 @@ pub struct Term {
     /// at SCROLLBACK. Only its length is observed today (display_offset stays 0); it
     /// exists so `history_size` tracks the oracle and future scrolling can read it.
     history: VecDeque<Vec<Cell>>,
+    /// How many lines the view is scrolled up into scrollback (0 = at the bottom). The
+    /// snapshot reads viewport row `r` from absolute line `r - display_offset`.
+    display_offset: usize,
+    /// Cursor shape (DECSCUSR); Term-global, not saved by the alt screen or DECSC.
+    cursor_shape: CursorShape,
+    /// Active mouse-reporting protocol (DECSET 1000/1002/1003), and whether SGR encoding
+    /// (1006) is on. Term-global.
+    mouse_mode: MouseMode,
+    mouse_sgr: bool,
+    /// Pending window title set via OSC 0/2, consumed by [`take_title`](Term::take_title).
+    title: Option<String>,
     parser: Parser,
 }
 
@@ -145,6 +174,11 @@ impl Term {
             charsets: [Charset::Ascii; 4],
             gl: 0,
             history: VecDeque::new(),
+            display_offset: 0,
+            cursor_shape: CursorShape::Block,
+            mouse_mode: MouseMode::Off,
+            mouse_sgr: false,
+            title: None,
             parser: Parser::new(),
         }
     }
@@ -164,6 +198,9 @@ impl Term {
             return;
         }
         self.reflow(cols, rows);
+        // Reflow rebuilds scrollback; snap the view to the bottom rather than track a
+        // now-ambiguous scroll position (matching most terminals' resize behaviour).
+        self.display_offset = 0;
     }
 
     /// Resize the grid. alacritty always adjusts the line count first (a pure row move
@@ -324,6 +361,69 @@ impl Term {
     pub fn app_cursor(&self) -> bool {
         self.app_cursor
     }
+    /// The requested cursor shape (DECSCUSR).
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.cursor_shape
+    }
+    /// Whether any mouse reporting is enabled (DECSET 1000/1002/1003).
+    pub fn wants_mouse(&self) -> bool {
+        self.mouse_mode != MouseMode::Off
+    }
+    /// Whether *any-motion* reporting is enabled (DECSET 1003) — matching rt-engine's
+    /// `wants_motion`, which keys only on 1003, not 1002's button-motion.
+    pub fn wants_motion(&self) -> bool {
+        self.mouse_mode == MouseMode::Motion
+    }
+    /// Whether SGR mouse encoding (DECSET 1006) is active.
+    pub fn mouse_sgr(&self) -> bool {
+        self.mouse_sgr
+    }
+    /// Take the pending window title (OSC 0/2), clearing it. Returns `None` if unchanged
+    /// since the last call.
+    pub fn take_title(&mut self) -> Option<String> {
+        self.title.take()
+    }
+
+    // ── Scrollback viewport ────────────────────────────────────────────────────
+    /// Lines the view is scrolled up into scrollback (0 = at the bottom).
+    pub fn display_offset(&self) -> usize {
+        self.display_offset
+    }
+    /// Oldest readable absolute line (`<= 0`; the top of scrollback).
+    pub fn topmost(&self) -> i32 {
+        -(self.history_size() as i32)
+    }
+    /// Newest readable absolute line (`rows - 1`; the bottom of the screen).
+    pub fn bottommost(&self) -> i32 {
+        self.rows as i32 - 1
+    }
+    /// Scroll the view by `delta` whole lines (positive = up into history), clamped to the
+    /// scrollable range. The alt screen has no scrollback, so this is a no-op there.
+    pub fn scroll_display(&mut self, delta: i32) {
+        let max = self.history_size() as i32;
+        self.display_offset = (self.display_offset as i32 + delta).clamp(0, max) as usize;
+    }
+    /// Snap the view back to the bottom (live output).
+    pub fn scroll_to_bottom_view(&mut self) {
+        self.display_offset = 0;
+    }
+    /// The cell at absolute line `abs` (visible lines `0..rows`, history negative down to
+    /// `topmost`) and column `col`, or a blank cell if out of range.
+    pub fn cell_at(&self, abs: i32, col: usize) -> Cell {
+        let row = if abs >= 0 && (abs as usize) < self.rows {
+            &self.grid[abs as usize]
+        } else if abs < 0 {
+            let idx = self.history.len() as i32 + abs; // -history..-1 → 0..H-1
+            if idx >= 0 && (idx as usize) < self.history.len() {
+                &self.history[idx as usize]
+            } else {
+                return Cell::default();
+            }
+        } else {
+            return Cell::default();
+        };
+        row.get(col).copied().unwrap_or_default()
+    }
     /// Number of lines held in scrollback (matches the oracle's `history_size`). The
     /// alternate screen has no scrollback, so it reports 0 while active — the primary's
     /// history is preserved and returns when the alt screen is left.
@@ -347,6 +447,17 @@ impl Term {
 
     /// Scroll the scroll region up by `n` lines (content moves up; blanks fill in at
     /// the bottom of the region).
+    /// Push a line into scrollback (capped), and if the view is scrolled up, bump the
+    /// offset so it stays anchored on the same content (alacritty's `increase_scroll_limit`).
+    fn push_history(&mut self, line: Vec<Cell>) {
+        self.history.push_back(line);
+        if self.history.len() > SCROLLBACK {
+            self.history.pop_front();
+        } else if self.display_offset > 0 {
+            self.display_offset = (self.display_offset + 1).min(self.history.len());
+        }
+    }
+
     fn scroll_up(&mut self, n: usize) {
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(b - t + 1);
@@ -355,10 +466,7 @@ impl Term {
         // screen has no scrollback).
         if t == 0 && !self.alt {
             for r in 0..n {
-                self.history.push_back(self.grid[r].clone());
-                if self.history.len() > SCROLLBACK {
-                    self.history.pop_front();
-                }
+                self.push_history(self.grid[r].clone());
             }
         }
         self.grid[t..=b].rotate_left(n);
@@ -565,10 +673,7 @@ impl Term {
                         None => 0,
                     };
                     for r in 0..positions {
-                        self.history.push_back(self.grid[r].clone());
-                        if self.history.len() > SCROLLBACK {
-                            self.history.pop_front();
-                        }
+                        self.push_history(self.grid[r].clone());
                     }
                 }
                 for r in 0..self.rows {
@@ -726,10 +831,36 @@ impl Term {
                 7 => self.autowrap = set,      // DECAWM
                 25 => self.show_cursor = set,  // DECTCEM
                 47 | 1047 | 1049 => self.swap_alt(set),
+                // Mouse protocols are mutually exclusive (xterm/alacritty): setting one
+                // replaces any other; resetting clears only if it is the active one.
+                1000 => self.mouse_mode = if set { MouseMode::Click } else { self.mouse_off_if(MouseMode::Click) },
+                1002 => self.mouse_mode = if set { MouseMode::Drag } else { self.mouse_off_if(MouseMode::Drag) },
+                1003 => self.mouse_mode = if set { MouseMode::Motion } else { self.mouse_off_if(MouseMode::Motion) },
+                1006 => self.mouse_sgr = set,             // SGR mouse encoding
+                1005 => if set { self.mouse_sgr = false }, // UTF-8 encoding clears SGR
                 _ => {}
             }
         }
     }
+    /// `Off` if `active` is the current mouse mode, else leave it unchanged — matches
+    /// alacritty removing only the specific mode bit on DECRST.
+    fn mouse_off_if(&self, active: MouseMode) -> MouseMode {
+        if self.mouse_mode == active {
+            MouseMode::Off
+        } else {
+            self.mouse_mode
+        }
+    }
+
+    /// DECSCUSR (`CSI Ps SP q`): 0/1/2 = block, 3/4 = underline, 5/6 = bar. Blink ignored.
+    fn set_cursor_shape(&mut self, ps: u16) {
+        self.cursor_shape = match ps {
+            3 | 4 => CursorShape::Underline,
+            5 | 6 => CursorShape::Beam,
+            _ => CursorShape::Block,
+        };
+    }
+
     fn swap_alt(&mut self, to_alt: bool) {
         if to_alt && !self.alt {
             let saved = std::mem::replace(&mut self.grid, vec![vec![Cell::default(); self.cols]; self.rows]);
@@ -1048,6 +1179,16 @@ impl Perform for Term {
         self.put_char(c);
     }
 
+    /// OSC handler. Only the window title (OSC 0 = icon+title, OSC 2 = title) is applied;
+    /// other OSCs (icon name 1, colours, clipboard, hyperlinks) are parsed but ignored.
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let (Some(&num), Some(&val)) = (params.first(), params.get(1)) {
+            if num == b"0" || num == b"2" {
+                self.title = Some(String::from_utf8_lossy(val).into_owned());
+            }
+        }
+    }
+
     fn execute(&mut self, byte: u8) {
         match byte {
             0x0A | 0x0B | 0x0C => self.line_feed(), // LF / VT / FF
@@ -1072,12 +1213,12 @@ impl Perform for Term {
         // the `?`-private DECSET/DECRST (h/l); every other intermediate+action pair —
         // e.g. `?…H` — is ignored, exactly as alacritty leaves it unhandled.
         if !intermediates.is_empty() {
-            if intermediates.first() == Some(&b'?') {
-                match action {
-                    'h' => self.set_mode(&p, true),
-                    'l' => self.set_mode(&p, false),
-                    _ => {}
-                }
+            match (intermediates.first(), action) {
+                (Some(&b'?'), 'h') => self.set_mode(&p, true),
+                (Some(&b'?'), 'l') => self.set_mode(&p, false),
+                // DECSCUSR: CSI Ps SP q (intermediate = space).
+                (Some(&b' '), 'q') => self.set_cursor_shape(p.first().copied().unwrap_or(0)),
+                _ => {}
             }
             return;
         }
