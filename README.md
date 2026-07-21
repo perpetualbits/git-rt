@@ -23,12 +23,16 @@ engine written from scratch instead of leaning on a black box:
   framing, which stresses sequence- and UTF-8-resumption), a spec suite, and real-world
   captures. Where alacritty has a quirk, the engine matches the quirk — it is the
   reference, not the abstract spec.
-- **Faster than what it replaces.** Six measured optimisation passes — occupied-length
-  clearing, a packed 16-byte cell, batched printing, stack-allocated CSI params, an ASCII
-  width fast-path, and a malloc-free recycling scroll — put the Term ahead of the vendored
-  alacritty engine on throughput: **geomean ~1.2× on x86-64 and ~1.05× on riscv-64**
-  (plain text ~1.9×), across representative workloads. Correctness stayed pinned at 0
-  divergences through every pass.
+- **Faster than what it replaces, on big *and* small hardware.** Six measured optimisation
+  passes — occupied-length clearing, a packed 16-byte cell, batched printing,
+  stack-allocated CSI params, an ASCII width fast-path, and a malloc-free recycling scroll —
+  put the Term ahead of the vendored alacritty engine on throughput: **geomean ~1.2× on
+  x86-64 and ~1.05× on riscv-64** (plain text ~1.9×), across representative workloads. Every
+  pass was benchmarked on **both** a fast x86-64 machine and a humble **MilkV Mars** riscv-64
+  board — the slow, in-order RISC-V core is a *co-equal* optimisation target, not an
+  afterthought. Profiling *on the Mars itself* is what surfaced the biggest win: the
+  per-line scroll allocation that a fast x86 allocator had hidden. Correctness stayed pinned
+  at 0 divergences through every pass.
 - **The parser, too.** `vt-parser` is a complete VT500/Williams state machine that beats
   the `vte` parser it replaces (~1.1×), including synchronized updates (DECSET 2026) — a
   gap the differential harness caught that fuzzing never would.
