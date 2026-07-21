@@ -89,6 +89,71 @@ impl Default for Cell {
     }
 }
 
+/// One grid row: its cells plus `occ`, the number of cells written since the last reset.
+/// Cells at or beyond `occ` are guaranteed to equal the last reset template, so a clear
+/// only has to touch the `[0, occ)` prefix — alacritty's `Row` trick, the dominant cost on
+/// clear-heavy TUIs. Because `occ` lives *in* the row, it travels through scrolls and
+/// scrollback for free. `occ` is never observed (the grid is compared cell-by-cell); it is
+/// purely a clear-cost optimisation, so a too-large `occ` is merely slower, and the only
+/// invariant that matters is `occ >= (highest written column + 1)`.
+#[derive(Clone)]
+struct Line {
+    cells: Vec<Cell>,
+    occ: usize,
+}
+
+impl Line {
+    /// A fresh blank row (nothing written yet).
+    fn blank(cols: usize) -> Line {
+        Line { cells: vec![Cell::default(); cols], occ: 0 }
+    }
+    /// Wrap an existing cell vector, treating all of it as occupied — used at the reflow /
+    /// alt-restore boundary where the precise write history is unknown (a safe upper bound).
+    fn from_cells(cells: Vec<Cell>) -> Line {
+        let occ = cells.len();
+        Line { cells, occ }
+    }
+    #[inline]
+    fn iter(&self) -> std::slice::Iter<'_, Cell> {
+        self.cells.iter()
+    }
+    /// Reset the row to `template`, touching only the occupied prefix. If the trailing
+    /// (beyond-`occ`) cells' background differs from the template they are stale, so the
+    /// whole row is reset (alacritty's discriminant check; the blank template only ever
+    /// varies in `bg`, so comparing `bg` identifies the last template exactly).
+    #[inline]
+    fn reset(&mut self, template: Cell) {
+        if self.cells.last().map_or(false, |c| c.bg != template.bg) {
+            self.occ = self.cells.len();
+        }
+        for cell in &mut self.cells[..self.occ] {
+            *cell = template;
+        }
+        self.occ = 0;
+    }
+    /// Grow/shrink to `cols`, keeping content (new cells are default).
+    fn resize(&mut self, cols: usize) {
+        self.cells.resize(cols, Cell::default());
+        self.occ = self.occ.min(cols);
+    }
+}
+
+impl std::ops::Index<usize> for Line {
+    type Output = Cell;
+    #[inline]
+    fn index(&self, i: usize) -> &Cell {
+        &self.cells[i]
+    }
+}
+impl std::ops::IndexMut<usize> for Line {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut Cell {
+        // Any mutable access is treated as a write, extending the occupied prefix.
+        self.occ = self.occ.max(i + 1);
+        &mut self.cells[i]
+    }
+}
+
 /// Cursor shape requested via DECSCUSR (`CSI Ps SP q`); blink is not distinguished.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CursorShape {
@@ -111,9 +176,9 @@ pub enum MouseMode {
 pub struct Term {
     cols: usize,
     rows: usize,
-    grid: Vec<Vec<Cell>>,
+    grid: Vec<Line>,
     // Primary-screen state saved while the alternate screen is active.
-    saved_screen: Option<(Vec<Vec<Cell>>, usize, usize, Cell, bool, [Charset; 4])>, // + designations
+    saved_screen: Option<(Vec<Line>, usize, usize, Cell, bool, [Charset; 4])>, // + designations
     row: usize,
     col: usize,
     /// Template for printed/erased cells (fg/bg/attrs); its `c` is unused.
@@ -136,7 +201,7 @@ pub struct Term {
     /// Lines scrolled off the top of the primary screen (oldest at the front), capped
     /// at SCROLLBACK. Only its length is observed today (display_offset stays 0); it
     /// exists so `history_size` tracks the oracle and future scrolling can read it.
-    history: VecDeque<Vec<Cell>>,
+    history: VecDeque<Line>,
     /// How many lines the view is scrolled up into scrollback (0 = at the bottom). The
     /// snapshot reads viewport row `r` from absolute line `r - display_offset`.
     display_offset: usize,
@@ -161,7 +226,7 @@ impl Term {
         Term {
             cols,
             rows,
-            grid: vec![vec![Cell::default(); cols]; rows],
+            grid: (0..rows).map(|_| Line::blank(cols)).collect(),
             saved_screen: None,
             row: 0,
             col: 0,
@@ -235,7 +300,7 @@ impl Term {
     /// no reflow (matching alacritty's `grow/shrink_columns` with `reflow = false`).
     fn resize_columns_flat(&mut self, new_cols: usize) {
         for row in &mut self.grid {
-            row.resize(new_cols, Cell::default());
+            row.resize(new_cols);
         }
         self.cols = new_cols;
         self.col = self.col.min(new_cols - 1);
@@ -260,7 +325,7 @@ impl Term {
         self.row -= scroll;
         self.grid.truncate(target);
         while self.grid.len() < target {
-            self.grid.push(vec![Cell::default(); self.cols]);
+            self.grid.push(Line::blank(self.cols));
         }
         self.rows = target;
         self.scroll_top = 0;
@@ -280,7 +345,7 @@ impl Term {
         }
         self.row += from_history;
         for _ in 0..(added - from_history) {
-            self.grid.push(vec![Cell::default(); self.cols]);
+            self.grid.push(Line::blank(self.cols));
         }
         self.rows = target;
         self.scroll_top = 0;
@@ -300,8 +365,13 @@ impl Term {
     fn reflow_columns(&mut self, new_cols: usize) {
         let old_cols = self.cols;
         let lines = self.rows;
-        let rows: Vec<Vec<Cell>> =
-            self.grid.iter().rev().chain(self.history.iter().rev()).cloned().collect();
+        let rows: Vec<Vec<Cell>> = self
+            .grid
+            .iter()
+            .rev()
+            .map(|l| l.cells.clone())
+            .chain(self.history.iter().rev().map(|l| l.cells.clone()))
+            .collect();
         let mut cur = RCursor { line: self.row as i32, col: self.col, wrap: self.pending_wrap };
 
         let nb = if new_cols > old_cols {
@@ -337,8 +407,8 @@ impl Term {
             self.pending_wrap = cur.wrap;
         }
 
-        self.history = history;
-        self.grid = grid;
+        self.history = history.into_iter().map(Line::from_cells).collect();
+        self.grid = grid.into_iter().map(Line::from_cells).collect();
         self.cols = new_cols;
         self.rows = lines;
         self.scroll_top = 0;
@@ -442,7 +512,7 @@ impl Term {
         } else {
             return Cell::default();
         };
-        row.get(col).copied().unwrap_or_default()
+        row.cells.get(col).copied().unwrap_or_default()
     }
     /// Number of lines held in scrollback (matches the oracle's `history_size`). The
     /// alternate screen has no scrollback, so it reports 0 while active — the primary's
@@ -466,16 +536,14 @@ impl Term {
     /// time; reusing the buffer is what alacritty's ring-buffer reset does.
     #[inline]
     fn fill_row(&mut self, r: usize, blank: Cell) {
-        for cell in &mut self.grid[r] {
-            *cell = blank;
-        }
+        self.grid[r].reset(blank); // occ-bounded: only touches written cells
     }
 
     /// Scroll the scroll region up by `n` lines (content moves up; blanks fill in at
     /// the bottom of the region).
     /// Push a line into scrollback (capped), and if the view is scrolled up, bump the
     /// offset so it stays anchored on the same content (alacritty's `increase_scroll_limit`).
-    fn push_history(&mut self, line: Vec<Cell>) {
+    fn push_history(&mut self, line: Line) {
         self.history.push_back(line);
         if self.history.len() > SCROLLBACK {
             self.history.pop_front();
@@ -896,7 +964,7 @@ impl Term {
 
     fn swap_alt(&mut self, to_alt: bool) {
         if to_alt && !self.alt {
-            let saved = std::mem::replace(&mut self.grid, vec![vec![Cell::default(); self.cols]; self.rows]);
+            let saved = std::mem::replace(&mut self.grid, (0..self.rows).map(|_| Line::blank(self.cols)).collect());
             // Designations (G0–G3) are part of the cursor → saved and restored across the
             // alt screen. The active charset `gl` is Term-global and is NOT.
             self.saved_screen = Some((saved, self.row, self.col, self.pen, self.pending_wrap, self.charsets));

@@ -87,17 +87,22 @@ slower on others. Note the parser *beats* vte; the gap is the **grid layer**.
 Where the time goes, and the optimisation path (mirrors how the parser went from 0.65× to
 1.17× vs vte):
 
-1. **No `occ` (occupied-length) tracking — the dominant lever.** A `\x1b[2J`-heavy TUI
-   workload runs at only ~0.22×: we reset all 80 cols × 24 rows every clear, while
-   alacritty's `Row::reset` only touches the *written* cells (a near-empty screen → ~40×
-   less work). Tracking a per-row `occ` and clearing/scrolling only up to it is the single
-   biggest win. It wants a `Row { cells, occ }` type (occ travels with the row on rotate).
-2. **Grid layout.** `Vec<Vec<Cell>>` is a double indirection with a heap allocation per
-   row and poor locality; alacritty uses one contiguous buffer. A general ~1.3× penalty.
+1. **`occ` (occupied-length) tracking — LANDED (2026-07-21).** A `\x1b[2J`-heavy TUI
+   workload ran at only ~0.22×: we reset all 80 cols × 24 rows every clear, while
+   alacritty's `Row::reset` only touches the *written* cells. Now each row is a `Line
+   { cells, occ }`: writes extend `occ` (via `IndexMut`), and clears/scrolls reset only the
+   `[0, occ)` prefix (with alacritty's bg-discriminant check for a changed erase colour).
+   Because `occ` lives in the row, it travels through scroll rotations and scrollback for
+   free. **Result: the clear-heavy workload went 0.22× → ~0.85×, geomean ~0.73× → ~0.85×,
+   real spiral ~0.79× → ~0.87×** — with a small (~5%) regression on write-heavy plain text
+   from the per-write `occ` bump. Correctness pinned: non-resize fuzz still 0/10000,
+   chunk-invariance 0/2000, reflow unchanged (`occ` is never observed).
+2. **Grid layout — next.** `Vec<Line>` is still a heap allocation per row and poor
+   locality; alacritty uses one contiguous buffer. A general ~1.3× penalty, and the likely
+   source of the remaining gap (and the plain-text regression).
 3. **`Cell` size.** Seven separate `bool`s for attributes; packing them into bitflags
-   shrinks the per-cell memcpy on fills/scrolls.
+   shrinks the per-cell memcpy on fills/scrolls, and pairs well with a contiguous grid.
 
-Already landed: scroll/erase **blank rows in place** (reuse the row's allocation instead
-of allocating a fresh `Vec`), which lifted the scroll-heavy workloads. The `occ` + `Row`
-refactor is the next focused pass; correctness stays pinned by the 0/10000 differential.
-Not yet benchmarked on riscv64.
+Also landed earlier: scroll/erase **blank rows in place** (reuse the row's allocation).
+The next focused pass is the contiguous grid + packed `Cell`; correctness stays pinned by
+the 0/10000 differential.
