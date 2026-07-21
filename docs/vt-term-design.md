@@ -48,11 +48,13 @@ quirk, we match the quirk (it is the reference, not the abstract spec).
   scrolling to read the ring is future work.
 - **Reflow on resize.** Resize does lines first (a pure row move that scrolls to keep the
   cursor placed — into scrollback on the primary, discarded on the alt), then columns.
-  Column reflow rejoins soft-wrapped rows (the `WRAPLINE` flag, set on autowrap) into
-  logical lines, re-splits them at the new width — leading spacers for wide glyphs at the
-  boundary — and re-lays-out bottom-anchored, tracking the cursor. The alt screen doesn't
-  reflow (truncate/extend + clamp), matching alacritty. Common cases match the oracle
-  exactly (~92% of random resizes); the deepest edges remain — see the ledger.
+  Column reflow is a **faithful port of alacritty's `grow_columns`/`shrink_columns`**: a
+  row-by-row rewrap over the whole buffer (history + visible, height-indexed from the
+  bottom), carrying the cursor through the exact split arithmetic. `occ` is never read by
+  that logic (physical `len()` + content-based `is_clear` suffice), so no row refactor was
+  needed. The alt screen doesn't reflow (truncate/extend + clamp), matching alacritty.
+  ~95% of random resizes match the oracle exactly; the deepest wide-glyph edges remain —
+  see the ledger.
 
 ## Verification
 

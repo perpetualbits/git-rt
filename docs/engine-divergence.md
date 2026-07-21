@@ -75,19 +75,28 @@ primary screen, or discarding them on the alt screen), **then columns** (rejoin
 leading spacers for wide glyphs at the boundary, re-lay-out bottom-anchored, track the
 cursor). The alt screen does not reflow columns (truncate/extend + clamp).
 
-Result: **0 divergence on the non-resize fuzz is unchanged (0/10000)**; a random-resize
-sweep matches the oracle on **~92%** (≈240/3000 diverge), guarded by
-`tests/vtterm_reflow.rs` (curated exact cases + a fuzz-rate ceiling). Down from ~65%
-divergence (pure truncate/extend). Remaining divergences, to drive to zero:
+Update (2026-07-21): `reflow_columns` is now a **faithful port** of alacritty's
+`grow_columns`/`shrink_columns` (`grid/resize.rs`) — a row-by-row rewrap over the whole
+buffer (history + visible, height-indexed from the bottom like `take_all()`), carrying the
+cursor through the exact split arithmetic (`Point::sub`/`grid_clamp`). Investigation showed
+`occ` is **never read** by that logic (it uses physical `len()` + content-based
+`is_clear`), so no `occ`/`Line` refactor was needed — plain `Vec<Cell>` rows suffice.
+Line-count changes (`grow_lines`/`shrink_lines`) keep the earlier empirically-derived
+implementation.
 
-- **Exact cursor position through reflow.** When the cursor's reflowed offset lands on a
-  column boundary, alacritty's `Boundary::Cursor` math places it differently than our
-  offset→(row,col) mapping (~2% of cases; grid is otherwise identical).
-- **Wide-glyph reflow boundaries in reflowed history.** A one-column shift can appear
-  around a wide glyph sitting at an old/new wrap boundary within reflowed scrollback.
-- **Root cause for several:** alacritty tracks each row's *written* occupied length
-  (`occ`); our fixed-width rows approximate it from content (trim trailing blanks), which
-  differs for printed-then-cleared cells. Closing this likely needs real `occ` tracking.
+Result: **non-resize fuzz unchanged (0/10000)**; the random-resize sweep matches the oracle
+on **~95%** (≈156/3000 diverge, down from ~242 with the logical-line reimplementation and
+~1050 with truncate/extend). Cursor-only divergences dropped 58→20 (the port's inline
+cursor arithmetic). Guarded by `tests/vtterm_reflow.rs`. Remaining divergences, to drive to
+zero:
+
+- **Wide-glyph reflow edges (~136).** A one-column shift around a wide glyph at a wrap
+  boundary, concentrated where a `CUF` gap / overwrite produced spacers whose exact
+  `WIDE_CHAR_SPACER` vs `LEADING_WIDE_CHAR_SPACER` distinction our single `spacer` flag
+  infers by position rather than stores — the inference occasionally disagrees with
+  alacritty's stored flag. History content itself matches (rows-only resize is exact).
+- **Residual cursor edges (~20).** A few cursor positions still off, in the deepest
+  split/overflow interactions.
 
 ### Synchronized updates (DECSET/DECRST 2026) — implemented (2026-07-21)
 
