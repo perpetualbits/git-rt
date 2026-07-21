@@ -956,12 +956,17 @@ impl Drop for AlacPane {
     }
 }
 
-/// A terminal pane, backed by either the vendored `alacritty_terminal` engine (the
-/// default, [`AlacPane`]) or the in-house `vt_parser` + `vt_term` engine
-/// ([`vtpane::VtPane`], selected with `RT_ENGINE=vtterm`). Every method dispatches on the
-/// variant, so callers (rt's GUI) use one type regardless of backend — the seam is
-/// invisible above this line. The vt-term backend is opt-in dogfooding and has degraded
-/// features (see `vtpane`); the default path is unchanged.
+/// A terminal pane, backed by either the vendored `alacritty_terminal` engine
+/// ([`AlacPane`]) or the in-house `vt_parser` + `vt_term` engine ([`vtpane::VtPane`]).
+/// Every method dispatches on the variant, so callers (rt's GUI) use one type regardless
+/// of backend — the seam is invisible above this line.
+///
+/// Selection (see [`spawn_env`](Self::spawn_env)): the `RT_ENGINE` env var wins if set
+/// (`vtterm`/`own` → in-house, `alacritty`/`vendored` → vendored); otherwise the default is
+/// the build-time `vtterm-default` feature (off → alacritty). Installing with
+/// `--features vtterm-default` makes an installed binary run the in-house engine with no
+/// env var — the reliable way to dogfood, since a GUI-launched rt never sources a shell
+/// rc. The active engine is announced once on stderr at startup.
 pub enum TermPane {
     Alac(AlacPane),
     Vt(vtpane::VtPane),
@@ -988,8 +993,28 @@ impl TermPane {
         env: &[(String, String)],
         scrollback: usize,
     ) -> std::io::Result<Self> {
-        if std::env::var("RT_ENGINE").as_deref() == Ok("vtterm") {
-            eprintln!("rt: RT_ENGINE=vtterm — using the in-house engine (degraded features)");
+        // Engine selection: `RT_ENGINE` wins if set (`vtterm` / `alacritty`); otherwise the
+        // default is baked in at build time — the `vtterm-default` feature makes the
+        // in-house engine the default so an *installed* binary uses it without any env var
+        // (a GUI-launched rt never sources ~/.bashrc). The active engine is announced once
+        // per process so it is always clear which is running.
+        let use_vtterm = match std::env::var("RT_ENGINE").ok().as_deref() {
+            Some("vtterm") | Some("vt-term") | Some("own") => true,
+            Some("alacritty") | Some("alac") | Some("vendored") => false,
+            _ => cfg!(feature = "vtterm-default"),
+        };
+        static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+        ANNOUNCE.call_once(|| {
+            eprintln!(
+                "rt: terminal engine = {}",
+                if use_vtterm {
+                    "vt-term (in-house vt-parser + vt-term)"
+                } else {
+                    "alacritty (vendored)"
+                }
+            );
+        });
+        if use_vtterm {
             Ok(TermPane::Vt(vtpane::VtPane::spawn_env(
                 shell, working_directory, cols, rows, env, scrollback,
             )?))

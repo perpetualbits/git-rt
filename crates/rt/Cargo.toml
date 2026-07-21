@@ -18,6 +18,7 @@ name = "rt"
 path = "src/main.rs"
 
 [features]
+vtterm-default = ["rt-engine/vtterm-default"]  # install with this to default to the in-house engine
 # Universal by default: ship a single binary that runs on Wayland AND X11 (winit
 # picks the backend at runtime, preferring native Wayland — see build_event_loop).
 # Build a lean Wayland-only binary with --no-default-features if you want zero
