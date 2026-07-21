@@ -247,6 +247,11 @@ pub struct Term {
     /// at SCROLLBACK. Only its length is observed today (display_offset stays 0); it
     /// exists so `history_size` tracks the oracle and future scrolling can read it.
     history: VecDeque<Line>,
+    /// Recycled blank rows (all-default, `occ` 0), fed by scrollback eviction and drained
+    /// by scrolling — so a top-anchored scroll MOVES the scrolled-off row into history
+    /// (no clone) and takes a ready blank from here instead of allocating one. This kills
+    /// the per-line malloc+copy that dominated scroll-heavy workloads on in-order cores.
+    blank_pool: Vec<Line>,
     /// How many lines the view is scrolled up into scrollback (0 = at the bottom). The
     /// snapshot reads viewport row `r` from absolute line `r - display_offset`.
     display_offset: usize,
@@ -288,6 +293,7 @@ impl Term {
             charsets: [Charset::Ascii; 4],
             gl: 0,
             history: VecDeque::new(),
+            blank_pool: Vec::new(),
             display_offset: 0,
             cursor_shape: CursorShape::Block,
             mouse_mode: MouseMode::Off,
@@ -315,6 +321,7 @@ impl Term {
             return;
         }
         self.reflow(cols, rows);
+        self.blank_pool.clear(); // pooled blanks are the old width
         // Reflow rebuilds scrollback; snap the view to the bottom rather than track a
         // now-ambiguous scroll position (matching most terminals' resize behaviour).
         self.display_offset = 0;
@@ -591,9 +598,28 @@ impl Term {
     fn push_history(&mut self, line: Line) {
         self.history.push_back(line);
         if self.history.len() > SCROLLBACK {
-            self.history.pop_front();
+            if let Some(popped) = self.history.pop_front() {
+                self.recycle_blank(popped); // reuse the evicted row's allocation
+            }
         } else if self.display_offset > 0 {
             self.display_offset = (self.display_offset + 1).min(self.history.len());
+        }
+    }
+
+    /// A ready blank row (`occ` 0, all-default) from the recycle pool, or a fresh one.
+    fn take_blank(&mut self) -> Line {
+        match self.blank_pool.pop() {
+            Some(row) if row.cells.len() == self.cols => row,
+            _ => Line::blank(self.cols),
+        }
+    }
+
+    /// Return a no-longer-needed row to the recycle pool, cleared to a clean default blank
+    /// (occ-bounded, so cheap). Dropped if it is the wrong width or the pool is full.
+    fn recycle_blank(&mut self, mut row: Line) {
+        if row.cells.len() == self.cols && self.blank_pool.len() < self.rows + 2 {
+            row.reset(Cell::default());
+            self.blank_pool.push(row);
         }
     }
 
@@ -603,7 +629,20 @@ impl Term {
         // History grows only for a top-anchored scroll on the primary screen (matching
         // alacritty's `scroll_up`: history increases iff `region.start == 0`; the alt
         // screen has no scrollback).
+        if t == 0 && !self.alt && self.pen.bg == Color::Default {
+            // Fast path: default erase colour → the scrolled-in blanks are plain defaults,
+            // so MOVE each scrolled-off row into history (no clone) and swap in a pooled
+            // blank. After the rotate, those blanks land at the bottom. No per-line malloc.
+            for r in 0..n {
+                let blank = self.take_blank();
+                let row = std::mem::replace(&mut self.grid[r], blank);
+                self.push_history(row);
+            }
+            self.grid[t..=b].rotate_left(n);
+            return;
+        }
         if t == 0 && !self.alt {
+            // Coloured erase background: the blanks carry `pen.bg`, so keep the clone path.
             for r in 0..n {
                 self.push_history(self.grid[r].clone());
             }
