@@ -1175,6 +1175,30 @@ impl TermPane {
 mod vtpane_tests {
     use super::*;
 
+    /// The shell's exit must be detected even when a backgrounded grandchild keeps the PTY
+    /// slave open (so master EOF never arrives) — regression test for SIGCHLD-based reaping.
+    #[test]
+    fn vtpane_exit_detected_despite_grandchild() {
+        let pane = vtpane::VtPane::spawn_env(
+            Some(("/bin/sh".into(), vec!["-c".into(), "sleep 3 & exit".into()])),
+            None,
+            40,
+            10,
+            &[],
+            1000,
+        )
+        .expect("spawn");
+        let mut saw_exit = false;
+        for _ in 0..300 {
+            if pane.drain_events().iter().any(|e| matches!(e, PaneEvent::Exited)) {
+                saw_exit = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_exit, "shell exit not detected while a backgrounded child held the PTY open");
+    }
+
     /// The in-house backend drives a real PTY: spawn a shell that prints many lines (so
     /// scrollback builds), poll until the marker appears, confirm the child-exit event,
     /// then exercise scroll / search / selection / title / resize.

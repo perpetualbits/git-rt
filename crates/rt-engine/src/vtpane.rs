@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::tty::{self, EventedReadWrite, Options as PtyOptions, Shell};
+use alacritty_terminal::tty::{self, EventedPty, EventedReadWrite, Options as PtyOptions, Shell};
 
 use crate::palette::{self, Palette};
 use crate::{
@@ -37,12 +37,18 @@ use crate::{
 pub struct VtPane {
     /// The grid + parser, shared with the reader thread.
     term: Arc<Mutex<vt_term::Term>>,
-    /// Raw PTY master fd, used for write/resize (owned by `_pty`, valid while it lives).
+    /// Raw PTY master fd, used for write/resize (owned by `pty`, valid while it lives).
     pty_fd: RawFd,
-    /// The forked PTY; kept alive so its `Drop` SIGHUPs and reaps the child shell.
-    _pty: tty::Pty,
-    /// GUI-facing event FIFO (Wakeup on new output, Exited on child EOF).
+    /// The forked PTY. Kept alive so its `Drop` SIGHUPs and reaps the child; also polled
+    /// each frame via `next_child_event` so the child is reaped promptly and its exit is
+    /// detected by SIGCHLD (not just master EOF, which a backgrounded grandchild can hold
+    /// open). Behind a `Mutex` because `next_child_event` needs `&mut`.
+    pty: Mutex<tty::Pty>,
+    /// GUI-facing event FIFO (Wakeup on new output, Exited on child exit).
     events: Arc<Mutex<VecDeque<PaneEvent>>>,
+    /// Set once the child's exit has been reported, so the EOF reader and the SIGCHLD poll
+    /// don't each emit a duplicate `Exited`.
+    exited: Arc<AtomicBool>,
     /// Set by the reader thread when new bytes have been applied (drives redraw).
     dirty: Arc<AtomicBool>,
     /// The grid as of the last `render_snapshot`, diffed against the next to compute
@@ -92,6 +98,7 @@ impl VtPane {
         let term = Arc::new(Mutex::new(vt_term::Term::new(cols, rows)));
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let dirty = Arc::new(AtomicBool::new(true));
+        let exited = Arc::new(AtomicBool::new(false));
 
         // Reader thread owns its own dup of the master fd so it stays valid until the
         // thread ends (independent of `_pty`'s fd lifetime).
@@ -109,7 +116,14 @@ impl VtPane {
                 libc::fcntl(read_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
             }
         }
-        let (term_r, events_r, dirty_r) = (term.clone(), events.clone(), dirty.clone());
+        let (term_r, events_r, dirty_r, exited_r) =
+            (term.clone(), events.clone(), dirty.clone(), exited.clone());
+        // Emit `Exited` at most once across the EOF reader and the SIGCHLD poll.
+        let post_exit = move |q: &Mutex<VecDeque<PaneEvent>>, flag: &AtomicBool| {
+            if !flag.swap(true, Ordering::AcqRel) {
+                q.lock().unwrap().push_back(PaneEvent::Exited);
+            }
+        };
         let reader = std::thread::spawn(move || {
             // SAFETY: `read_fd` is a fresh dup we exclusively own here.
             let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
@@ -117,7 +131,7 @@ impl VtPane {
             loop {
                 match file.read(&mut buf) {
                     Ok(0) => {
-                        events_r.lock().unwrap().push_back(PaneEvent::Exited);
+                        post_exit(&events_r, &exited_r);
                         dirty_r.store(true, Ordering::Release);
                         break;
                     }
@@ -135,14 +149,13 @@ impl VtPane {
                         drop(q);
                         dirty_r.store(true, Ordering::Release);
                     }
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::Interrupted =>
-                    {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(4));
                     }
+                    // `File::read` already retries EINTR internally; any other error means
+                    // the master is gone.
                     Err(_) => {
-                        events_r.lock().unwrap().push_back(PaneEvent::Exited);
+                        post_exit(&events_r, &exited_r);
                         dirty_r.store(true, Ordering::Release);
                         break;
                     }
@@ -153,8 +166,9 @@ impl VtPane {
         Ok(VtPane {
             term,
             pty_fd,
-            _pty: pty,
+            pty: Mutex::new(pty),
             events,
+            exited,
             dirty,
             last_render: Mutex::new(Vec::new()),
             _reader: reader,
@@ -174,10 +188,34 @@ impl VtPane {
     }
 
     pub fn write(&self, bytes: &[u8]) {
-        // SAFETY: `pty_fd` is a valid master fd owned by `_pty` for our lifetime; a
-        // concurrent read on the dup'd fd in the reader thread is fine on a PTY master.
-        unsafe {
-            libc::write(self.pty_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+        // Retry loop: a PTY-master write can return a short count (signal mid-write) or
+        // fail with EINTR/EAGAIN. A single unchecked `write` would silently drop the tail
+        // of a paste or fast typing — a terminal must never lose input. Loop until every
+        // byte is written, or the peer is gone. `pty_fd` is a valid master fd owned by
+        // `pty` for our lifetime.
+        let mut off = 0;
+        while off < bytes.len() {
+            let ret = unsafe {
+                libc::write(
+                    self.pty_fd,
+                    bytes[off..].as_ptr() as *const libc::c_void,
+                    bytes.len() - off,
+                )
+            };
+            if ret > 0 {
+                off += ret as usize;
+                continue;
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => {
+                    // The master should be blocking; be defensive and wait for writability.
+                    let mut pfd =
+                        libc::pollfd { fd: self.pty_fd, events: libc::POLLOUT, revents: 0 };
+                    unsafe { libc::poll(&mut pfd, 1, 100) };
+                }
+                _ => break, // EIO / peer gone, or write==0 — nothing more we can do
+            }
         }
     }
 
@@ -466,6 +504,17 @@ impl VtPane {
     }
 
     pub fn drain_events(&self) -> Vec<PaneEvent> {
+        // Reap the child and detect its exit via SIGCHLD — reliable even when a
+        // backgrounded grandchild holds the PTY slave open (so master EOF never comes).
+        // `next_child_event` does a non-blocking read of the signal pipe and `try_wait()`s
+        // the child, so this also clears zombies promptly rather than only at drop.
+        if let Ok(mut pty) = self.pty.lock() {
+            if let Some(tty::ChildEvent::Exited(_)) = pty.next_child_event() {
+                if !self.exited.swap(true, Ordering::AcqRel) {
+                    self.events.lock().unwrap().push_back(PaneEvent::Exited);
+                }
+            }
+        }
         self.events.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
     }
 }
