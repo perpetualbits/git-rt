@@ -35,19 +35,19 @@ impl Backend for MockBackend {
 
 /// A spawner that hands out mock backends and stashes each one's log in a shared
 /// vector, so the test can examine all panes created during a run.
-fn spawner(logs: Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>) -> impl FnMut(rt_core::PaneId, usize, usize) -> MockBackend {
+fn spawner(logs: Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>) -> impl FnMut(rt_core::PaneId, usize, usize) -> Option<MockBackend> {
     move |_id: rt_core::PaneId, cols, rows| {
         // Create this pane's log, pre-seeded with its initial size.
         let log = Rc::new(RefCell::new(PaneLog { writes: Vec::new(), size: (cols, rows) }));
         logs.borrow_mut().push(log.clone()); // remember it for the test
-        MockBackend { log } // the backend the session will own
+        Some(MockBackend { log }) // the backend the session will own
     }
 }
 
 /// Build a session over a 1000x800 window with 10x20 cells and return it plus
 /// the shared list of per-pane logs.
 fn make() -> (
-    Session<MockBackend, impl FnMut(rt_core::PaneId, usize, usize) -> MockBackend>,
+    Session<MockBackend, impl FnMut(rt_core::PaneId, usize, usize) -> Option<MockBackend>>,
     Rc<RefCell<Vec<Rc<RefCell<PaneLog>>>>>,
 ) {
     let logs = Rc::new(RefCell::new(Vec::new())); // collects each pane's log
@@ -283,4 +283,40 @@ fn soak_split_and_close_returns_to_baseline() {
     }
     // After thousands of cycles the tree is exactly where it started.
     assert_eq!(session.tree().all_panes().len(), 1);
+}
+
+/// A pane-spawn failure (out of ptys/fds) must refuse the split *gracefully* —
+/// keep the existing pane, leave the tree exactly as it was, and never panic —
+/// rather than aborting the whole process. This is the fix for the greybeard
+/// review's "spawn failure in a split kills every pane" (panic = "abort") flag.
+#[test]
+fn spawn_failure_refuses_split_without_losing_panes() {
+    // A spawner that yields the initial pane, then fails for every later one.
+    let calls = Rc::new(std::cell::Cell::new(0usize));
+    let calls_f = calls.clone();
+    let spawn = move |_id: rt_core::PaneId, cols, rows| {
+        let n = calls_f.get();
+        calls_f.set(n + 1);
+        if n == 0 {
+            let log = Rc::new(RefCell::new(PaneLog { writes: Vec::new(), size: (cols, rows) }));
+            Some(MockBackend { log })
+        } else {
+            None // simulate PTY/fd exhaustion for the split's pane
+        }
+    };
+    let mut session = Session::new(Rect::new(0.0, 0.0, 1000.0, 800.0), (10.0, 20.0), spawn);
+    assert_eq!(session.tree().all_panes().len(), 1); // one pane to start
+
+    // The split is requested but its pane can't spawn: the session must refuse
+    // it and stay at one pane (no dangling backend-less tree node, no panic).
+    session.apply(Action::SplitVert);
+    assert_eq!(session.tree().all_panes().len(), 1, "failed split must not add a pane");
+    assert_eq!(calls.get(), 2, "the split did attempt exactly one more spawn");
+
+    // The surviving pane still works — input reaches it.
+    session.feed_input(b"ok");
+
+    // A new tab under the same failure is refused the same way.
+    session.apply(Action::NewTab);
+    assert_eq!(session.tree().all_panes().len(), 1, "failed new-tab must not add a pane");
 }

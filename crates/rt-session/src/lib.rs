@@ -117,7 +117,7 @@ pub enum SessionEvent {
 /// Generic over `B: Backend` and a factory `F` that spawns a new backend given
 /// a size. The factory indirection is what lets tests inject mock panes while
 /// production injects real PTYs.
-pub struct Session<B: Backend, F: FnMut(PaneId, usize, usize) -> B> {
+pub struct Session<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> {
     tree: Tree,                        // the split/tab layout
     panes: HashMap<PaneId, B>,         // one backend per live leaf
     groups: HashMap<PaneId, u32>,      // pane -> group id (for Broadcast::Group)
@@ -150,7 +150,7 @@ pub fn pane_chrome(cell: (f32, f32), show_titlebar: bool) -> (f32, f32) {
     (2.0 * PANE_PAD, 2.0 * PANE_PAD + titlebar)
 }
 
-impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
+impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
     /// Create a session with a single initial pane filling `bounds`.
     ///
     /// `cell` is the pixel size of one character cell, used to convert pane
@@ -161,7 +161,11 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
         // Size the first backend to fill the window.
         let (cols, rows) = cells_in(bounds, cell); // full-window cell dimensions
         let mut panes = HashMap::new(); // the pane->backend table
-        panes.insert(first, spawn(first, cols, rows)); // spawn and register pane 0
+        // The first pane is required for the app to run at all; a failure here is a
+        // clean startup error, not a mid-session crash of other panes.
+        let first_backend = spawn(first, cols, rows)
+            .expect("failed to spawn the initial pane's PTY/shell — out of ptys or file descriptors?");
+        panes.insert(first, first_backend); // register pane 0
         Session {
             tree,
             panes,
@@ -638,10 +642,19 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
         if let Some(new_id) = self.tree.split(self.focus, orient) {
             // Size the new pane from its freshly computed rectangle.
             let (cols, rows) = self.pane_cells(new_id); // its cell dimensions
-            let backend = (self.spawn)(new_id, cols, rows); // create its PTY
-            self.panes.insert(new_id, backend); // register it
-            self.focus = new_id; // focus follows the split
-            self.relayout(self.bounds); // the sibling shrank; resize everyone
+            match (self.spawn)(new_id, cols, rows) {
+                // Spawn succeeded: register the pane, focus it, reflow.
+                Some(backend) => {
+                    self.panes.insert(new_id, backend);
+                    self.focus = new_id; // focus follows the split
+                    self.relayout(self.bounds); // the sibling shrank; resize everyone
+                }
+                // Spawn failed (out of ptys/fds): undo the split so we never leave a
+                // backend-less node, and keep the existing panes intact — do NOT crash.
+                None => {
+                    self.tree.close(new_id);
+                }
+            }
         }
     }
 
@@ -694,10 +707,16 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> B> Session<B, F> {
     fn new_tab(&mut self) {
         if let Some(new_id) = self.tree.new_tab(self.focus) {
             let (cols, rows) = self.pane_cells(new_id); // new tab's size
-            let backend = (self.spawn)(new_id, cols, rows); // spawn its PTY
-            self.panes.insert(new_id, backend); // register
-            self.focus = new_id; // focus the new tab
-            self.relayout(self.bounds); // reflow
+            match (self.spawn)(new_id, cols, rows) {
+                Some(backend) => {
+                    self.panes.insert(new_id, backend);
+                    self.focus = new_id; // focus the new tab
+                    self.relayout(self.bounds); // reflow
+                }
+                None => {
+                    self.tree.close(new_id); // undo; keep existing panes
+                }
+            }
         }
     }
 

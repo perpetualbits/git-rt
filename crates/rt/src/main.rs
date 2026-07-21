@@ -61,7 +61,7 @@ use rt_session::{Broadcast, Session, SessionEvent};
 
 /// The concrete session type used by the app: real PTY panes, spawned by a
 /// boxed closure (boxed so the `Session`'s factory type is nameable in a field).
-type AppSession = Session<TermPane, Box<dyn FnMut(rt_core::PaneId, usize, usize) -> TermPane>>;
+type AppSession = Session<TermPane, Box<dyn FnMut(rt_core::PaneId, usize, usize) -> Option<TermPane>>>;
 
 /// The shared map of per-pane patch-bay jacks. Shared (`Rc<RefCell<…>>`) between
 /// the spawn closure (which creates a pane's jacks) and [`Active`] (which pumps
@@ -845,10 +845,13 @@ impl ApplicationHandler for App {
         // Preferences takes effect for the next terminal without a restart.
         let scrollback = Rc::new(std::cell::Cell::new(settings.scrollback));
         let scrollback_spawn = scrollback.clone();
-        // The factory spawns a shell-backed pane at the requested cell size. A
-        // spawn failure here is fatal (no PTY available) — we surface it by
-        // panicking with a clear message rather than rendering a broken pane.
-        let spawn: Box<dyn FnMut(rt_core::PaneId, usize, usize) -> TermPane> = Box::new(move |id, cols, rows| {
+        // The factory spawns a shell-backed pane at the requested cell size.
+        // Returning `None` on failure lets the session refuse the split/tab
+        // gracefully (the initial pane's failure is startup-fatal, handled in
+        // Session::new) instead of aborting the whole process under fd/pty
+        // exhaustion — panic = "abort" means an .expect() here would kill every
+        // other pane too.
+        let spawn: Box<dyn FnMut(rt_core::PaneId, usize, usize) -> Option<TermPane>> = Box::new(move |id, cols, rows| {
             // If RT_EXEC is set, run it then keep an interactive shell open.
             let shell = exec.as_ref().map(|cmd| {
                 ("/bin/sh".to_string(), vec!["-c".to_string(), format!("{cmd}; exec /bin/sh -i")])
@@ -862,12 +865,21 @@ impl ApplicationHandler for App {
                 }
                 Err(_) => Vec::new(), // no jacks: the pane still runs, just unwireable
             };
-            let mut pane = TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get())
-                .expect("failed to spawn a PTY/shell for a pane");
+            let mut pane = match TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get()) {
+                Ok(pane) => pane,
+                Err(e) => {
+                    // Out of ptys/fds: report it and let the session refuse the pane
+                    // rather than crash. Undo this pane's jacks so we don't leak a
+                    // half-registered patch-bay entry.
+                    eprintln!("rt: could not spawn a pane's PTY/shell: {e}");
+                    jacks_spawn.borrow_mut().remove(&id);
+                    return None;
+                }
+            };
             if let Ok(p) = palette_spawn.lock() {
                 pane.set_palette(p.clone()); // apply the current colours
             }
-            pane
+            Some(pane)
         });
         let mut session = Session::new(bounds, cell, spawn);
         // Reserve a per-pane titlebar strip if the settings ask for it, then
