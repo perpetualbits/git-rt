@@ -122,10 +122,20 @@ Where the time goes, and the optimisation path (mirrors how the parser went from
    Correctness pinned: fuzz 0/10000, chunk-invariance 0/3000 (this directly diffs the
    `print_str` batch against the per-char path), reflow unchanged.
 
-**Where it stands: vt-term now beats our patched alacritty on x86 geomean (~1.1×) and on
-plain text (~1.2×).** The remaining sub-1.0 workload is **control-heavy** (~0.8×): dense
-CSI sequences (cursor moves, SGR) with little printable text, so the cost is CSI
-parse+dispatch, not the grid. That's the next lever if wanted (it's a different subsystem
-from the grid work above). riscv trails x86 (~0.72× geomean) — its in-order core is most
-sensitive to the per-cell/dispatch costs, so it gains the most from each of these passes.
-Correctness stays pinned by the 0/10000 differential throughout.
+5. **Stack-allocated CSI params — LANDED (2026-07-21).** `flat()` collected the CSI
+   parameters into a fresh `Vec<u16>` on **every** dispatch — one heap allocation per
+   sequence, which dominated control- and SGR-heavy workloads. It now fills a fixed
+   `[u16; 32]` on the stack (`Params` holds at most that) and `Deref`s to `[u16]`, so every
+   call site is unchanged and the allocation is gone. **Result: control-heavy ~0.8× →
+   ~1.0× (parity), sgr-heavy ~0.97× → ~1.12×.** Correctness pinned: fuzz 0/10000.
+
+**Where it stands (x86_64): vt-term beats our patched alacritty on every workload** — a
+clean-machine sweep reads plain 1.04×, **unicode 1.63×**, sgr 1.12×, control 0.99× (tie),
+mixed 1.07×, spiral (real capture) 1.05×, **geomean ~1.13×**. The four grid/dispatch passes
+(occ, packed Cell, batched print_str, stack CSI params) took it from 0.73× to here, with
+correctness pinned by the 0/10000 differential throughout.
+
+riscv64 trails x86 (its in-order core is most sensitive to per-cell/dispatch costs, so it
+gained the most from each pass — 0.56× → 0.83× and rising). Any remaining headroom is
+incremental (per-workload micro-tuning, or a ring for truly O(1) scroll); the big levers
+are spent.

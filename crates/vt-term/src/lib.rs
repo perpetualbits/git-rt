@@ -1294,8 +1294,34 @@ fn shrink_columns_impl(
 /// First value of each parameter as a flat `Vec` (drops sub-parameters — the common
 /// semicolon form; colon sub-parameters beyond the SGR extended-colour case are on the
 /// ledger).
-fn flat(params: &Params) -> Vec<u16> {
-    params.iter().map(|g| g.first().copied().unwrap_or(0)).collect()
+/// Flattened CSI parameters — the first sub-parameter of each — held in a fixed stack
+/// array, so a CSI dispatch costs **no heap allocation** (the old `Vec` collect dominated
+/// control-heavy workloads, one alloc per sequence). `Params` holds at most `FLAT_MAX`, and
+/// `Deref` to `[u16]` keeps every call site (`count`, `sgr`, `set_mode`, …) unchanged.
+const FLAT_MAX: usize = 32;
+struct Flat {
+    buf: [u16; FLAT_MAX],
+    len: usize,
+}
+impl std::ops::Deref for Flat {
+    type Target = [u16];
+    #[inline]
+    fn deref(&self) -> &[u16] {
+        &self.buf[..self.len]
+    }
+}
+#[inline]
+fn flat(params: &Params) -> Flat {
+    let mut buf = [0u16; FLAT_MAX];
+    let mut len = 0;
+    for g in params.iter() {
+        if len >= FLAT_MAX {
+            break;
+        }
+        buf[len] = g.first().copied().unwrap_or(0);
+        len += 1;
+    }
+    Flat { buf, len }
 }
 /// Parameter `i` treated as a count: absent or 0 means 1 (the cursor-motion default).
 fn count(p: &[u16], i: usize) -> usize {
