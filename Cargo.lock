@@ -1645,6 +1645,8 @@ name = "rt-engine"
 version = "0.2.8"
 dependencies = [
  "alacritty_terminal",
+ "libc",
+ "vt-term",
 ]
 
 [[package]]
@@ -2158,6 +2160,7 @@ name = "vt-conformance"
 version = "0.2.8"
 dependencies = [
  "alacritty_terminal",
+ "unicode-width",
  "vt-parser",
  "vt-term",
  "vte",
@@ -2174,6 +2177,7 @@ dependencies = [
 name = "vt-term"
 version = "0.2.8"
 dependencies = [
+ "unicode-width",
  "vt-parser",
 ]
 
