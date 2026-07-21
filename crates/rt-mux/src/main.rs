@@ -206,10 +206,45 @@ fn mkfifo(path: &Path) -> io::Result<()> {
     // SAFETY: `c` is a valid NUL-terminated C string for the duration of the call.
     let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
     if rc != 0 {
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::AlreadyExists {
-            return Err(err); // a real failure (permissions, missing dir, …)
-        }
+        // `EEXIST` is NOT swallowed: mkfifo only succeeds when it created the
+        // node, so this is O_EXCL — a path already there was planted by someone
+        // else (a fifo/symlink in a shared tmp dir), and wiring a pane's stdio
+        // into it would leak or inject that pane's bytes. Refuse it.
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Securely (re)create the patch-bay directory with mode 0700, refusing a
+/// pre-existing path we don't own. See rt's `ensure_jacks_dir` for the rationale
+/// (guessable pid + world-writable `$TMPDIR` fallback → stdio-hijack vector).
+fn ensure_mux_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let c = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mux dir path has a NUL byte"))?;
+    // SAFETY: `c` is a valid NUL-terminated C string for the duration of the call.
+    let mkdir = || unsafe { libc::mkdir(c.as_ptr(), 0o700) };
+    if mkdir() == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() != io::ErrorKind::AlreadyExists {
+        return Err(err);
+    }
+    let meta = std::fs::symlink_metadata(dir)?; // lstat: does not follow a symlink
+    if !meta.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "patch-bay path is not a directory"));
+    }
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "patch-bay directory is not owned by us"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "patch-bay directory is group/other accessible"));
+    }
+    // Our own stale dir (crashed prior run, reused pid): wipe and recreate clean.
+    std::fs::remove_dir_all(dir)?;
+    if mkdir() != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -302,7 +337,7 @@ impl Mux {
         // A per-session directory holds every pane's fifos (under $XDG_RUNTIME_DIR
         // when set, so it's per-user tmpfs and auto-removed on logout).
         let dir = mux_base().join(format!("rt-mux-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        ensure_mux_dir(&dir)?; // 0700, owned, no planted nodes — or refuse to start
         let mut mux = Mux {
             tree: Tree::new(Node::Tile(1)), // start with one leaf, id 1
             panes: HashMap::new(),

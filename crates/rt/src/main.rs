@@ -144,17 +144,66 @@ impl Drop for Jacks {
     }
 }
 
-/// Create a fifo at `path` (mode 0600); an existing fifo is fine.
+/// Create a fifo at `path` (mode 0600). An *existing* path is treated as an
+/// error, not swallowed: `mkfifo(2)` fails with `EEXIST` unless it created the
+/// node itself, so this gives us `O_EXCL` semantics — if the path is already
+/// there, someone else made it (a planted fifo/symlink in a shared tmp dir, or a
+/// stale node), and wiring a pane's stdio to a node we didn't create would let
+/// them read or inject that pane's bytes. Refuse it; the caller drops the jack.
 fn mkfifo(path: &Path) -> std::io::Result<()> {
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "fifo path has a NUL"))?;
     // SAFETY: `c` is a valid NUL-terminated C string for the call's duration.
     let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
     if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(err);
-        }
+        return Err(std::io::Error::last_os_error()); // incl. EEXIST — refuse a path we didn't create
+    }
+    Ok(())
+}
+
+/// Securely (re)create this session's patch-bay directory with mode 0700. The
+/// fallback base (`$TMPDIR`) is world-writable, and our pid is guessable, so we
+/// must not blindly `create_dir_all` and trust whatever is there: an attacker
+/// could plant `rt-<pid>` (or make it a symlink, or pre-create the fifos inside)
+/// to hijack a pane's stdio. We `mkdir(0700)` fresh; if the path already exists
+/// we accept it only when an `lstat` proves it is a real directory we own with
+/// no group/other access, then wipe it clean so no planted node survives. Any
+/// doubt fails closed — the caller then runs with the patch-bay disabled.
+fn ensure_jacks_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let c = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "jacks dir path has a NUL"))?;
+    // SAFETY: `c` is a valid NUL-terminated C string for the call's duration.
+    let mkdir = || unsafe { libc::mkdir(c.as_ptr(), 0o700) };
+    if mkdir() == 0 {
+        return Ok(()); // created fresh and private — the common case
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() != std::io::ErrorKind::AlreadyExists {
+        return Err(err); // e.g. base dir missing or unwritable
+    }
+    // The path exists. `lstat` (does not follow a symlink) must show a plain
+    // directory, owned by us, with no access for group or other.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists,
+            "patch-bay path exists and is not a directory"));
+    }
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "patch-bay directory is not owned by us"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "patch-bay directory is accessible by group or other"));
+    }
+    // It is our own stale dir (a crashed prior run that reused this pid). Wipe
+    // it so no leftover fifo is silently reused, then recreate it private. If an
+    // attacker races to plant the path in the gap, the second mkdir fails
+    // EEXIST and we bail — fail closed.
+    std::fs::remove_dir_all(dir)?;
+    if mkdir() != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -838,7 +887,16 @@ impl ApplicationHandler for App {
         // Patch-bay: a per-session temp dir holds the pipe fifos, and a shared map
         // holds each pane's jacks — filled by the spawn closure, read by Active.
         let jacks_dir = jacks_dir_for(std::process::id());
-        let _ = std::fs::create_dir_all(&jacks_dir);
+        // Create the patch-bay dir securely (0700, owned, no planted nodes). If
+        // that can't be guaranteed, run WITHOUT the patch-bay rather than wire a
+        // pane's stdio into an untrusted fifo — panes still work, just unwireable.
+        let patchbay_ok = match ensure_jacks_dir(&jacks_dir) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("rt: patch-bay disabled — could not create {} securely: {e}", jacks_dir.display());
+                false
+            }
+        };
         let jacks: SharedJacks = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let jacks_spawn = jacks.clone();
         // Live scrollback size shared with the spawn factory, so changing it in
@@ -856,14 +914,15 @@ impl ApplicationHandler for App {
             let shell = exec.as_ref().map(|cmd| {
                 ("/bin/sh".to_string(), vec!["-c".to_string(), format!("{cmd}; exec /bin/sh -i")])
             });
-            // Create this pane's patch-bay jacks and advertise them to the shell.
-            let env = match Jacks::new(&jacks_dir, id) {
-                Ok(j) => {
+            // Create this pane's patch-bay jacks and advertise them to the shell
+            // (only when the session dir was created securely above).
+            let env = match patchbay_ok.then(|| Jacks::new(&jacks_dir, id)) {
+                Some(Ok(j)) => {
                     let e = j.env();
                     jacks_spawn.borrow_mut().insert(id, j);
                     e
                 }
-                Err(_) => Vec::new(), // no jacks: the pane still runs, just unwireable
+                _ => Vec::new(), // no jacks: the pane still runs, just unwireable
             };
             let mut pane = match TermPane::spawn_env(shell, None, cols.max(1), rows.max(1), &env, scrollback_spawn.get()) {
                 Ok(pane) => pane,
