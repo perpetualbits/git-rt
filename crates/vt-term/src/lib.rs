@@ -1307,6 +1307,71 @@ impl Perform for Term {
         self.put_char(c);
     }
 
+    /// Batched print of a run of printable characters — the hot path for plain text. It
+    /// produces cell-for-cell the same result as feeding each char through [`put_char`],
+    /// but for the common case (ASCII charset, narrow width-1 glyphs) it writes a whole
+    /// row-segment in a tight loop: no per-char charset map, no per-char `clear_wide_left`
+    /// (it can't fire once we're overwriting our own just-written narrow cells), and one
+    /// `occ` bump per segment instead of per cell. Wide/zero-width glyphs and the last-
+    /// column autowrap boundary defer to `put_char`, so all the delicate edge behaviour
+    /// stays in exactly one place.
+    fn print_str(&mut self, s: &str) {
+        // Only ASCII G0/GL is fast-pathed; a designated special-graphics set needs the
+        // per-char mapping, so fall back wholesale (charsets can't change mid-run).
+        if self.charsets[self.gl] != Charset::Ascii {
+            for c in s.chars() {
+                self.put_char(c);
+            }
+            return;
+        }
+        let cols = self.cols;
+        let (fg, bg, flags) = (self.pen.fg, self.pen.bg, self.pen.flags & ATTR_MASK);
+        let mut it = s.chars().peekable();
+        while let Some(&c) = it.peek() {
+            // Wide (2) or zero-width/combining (0) glyphs take the exact slow path.
+            if c.width() != Some(1) {
+                self.put_char(c);
+                it.next();
+                continue;
+            }
+            // Start of a width-1 segment: resolve a pending wrap and the one place a
+            // wide-char spacer could sit under the cursor, exactly as put_char does.
+            if self.pending_wrap {
+                self.soft_wrap();
+            }
+            self.clear_wide_left();
+            // Fill the row up to (but not including) the last column — none of these hit
+            // the autowrap boundary, and each cell's left neighbour is a narrow glyph we
+            // just wrote, so `clear_wide_left` would be a no-op.
+            let mut col = self.col;
+            {
+                let row = &mut self.grid[self.row];
+                while col < cols - 1 {
+                    match it.peek() {
+                        Some(&c) if c.width() == Some(1) => {
+                            row.cells[col] = Cell { c, fg, bg, flags };
+                            col += 1;
+                            it.next();
+                        }
+                        _ => break,
+                    }
+                }
+                row.occ = row.occ.max(col); // one bump for the whole segment
+            }
+            self.col = col;
+            // At the last column, the next width-1 glyph needs put_char's edge handling
+            // (write here, then set/defer the pending wrap per DECAWM).
+            if self.col == cols - 1 {
+                if let Some(&c) = it.peek() {
+                    if c.width() == Some(1) {
+                        self.put_char(c);
+                        it.next();
+                    }
+                }
+            }
+        }
+    }
+
     /// OSC handler. Only the window title (OSC 0 = icon+title, OSC 2 = title) is applied;
     /// other OSCs (icon name 1, colours, clipboard, hyperlinks) are parsed but ignored.
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {

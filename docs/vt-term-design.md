@@ -111,9 +111,21 @@ Where the time goes, and the optimisation path (mirrors how the parser went from
    Our `Vec<Line>` already rotates pointers on scroll (O(rows), not O(rows·cols)). No win
    here; not pursued.
 
-Remaining gap is the **write-heavy** workloads (plain text ~0.77×, control ~0.79×), where
-the cost is per-char `put_char` dispatch (autowrap/width checks per glyph). The lever there
-is a batched `print_str` fast path for runs of simple narrow ASCII (bump `occ` once, skip
-the per-char wrap machinery until the run hits the edge). That, plus a possible ring for
-truly O(1) scroll, is the next pass. Also landed earlier: scroll/erase blank rows in place.
-Correctness stays pinned by the 0/10000 differential.
+4. **Batched `print_str` — LANDED (2026-07-21).** Plain text was write-bound at ~0.77×
+   because every glyph went through the full per-char `put_char` (charset map, width,
+   `clear_wide_left`'s neighbour-width probe, per-cell `occ` bump). `print_str` now fills a
+   whole row-segment of narrow ASCII in a tight loop — no per-char map, no `clear_wide_left`
+   in the middle (it can't fire once we overwrite our own narrow cells), one `occ` bump per
+   segment — deferring only the wide/zero-width glyphs and the last-column autowrap boundary
+   to `put_char`, so the delicate edge cases stay in one place. **Result: plain ASCII
+   0.77× → ~1.2× (now *faster* than alacritty), geomean consistently >1.0× (~1.07–1.14×).**
+   Correctness pinned: fuzz 0/10000, chunk-invariance 0/3000 (this directly diffs the
+   `print_str` batch against the per-char path), reflow unchanged.
+
+**Where it stands: vt-term now beats our patched alacritty on x86 geomean (~1.1×) and on
+plain text (~1.2×).** The remaining sub-1.0 workload is **control-heavy** (~0.8×): dense
+CSI sequences (cursor moves, SGR) with little printable text, so the cost is CSI
+parse+dispatch, not the grid. That's the next lever if wanted (it's a different subsystem
+from the grid work above). riscv trails x86 (~0.72× geomean) — its in-order core is most
+sensitive to the per-cell/dispatch costs, so it gains the most from each of these passes.
+Correctness stays pinned by the 0/10000 differential throughout.
