@@ -77,11 +77,15 @@ pub struct Cell {
     /// (`c == ' '`) but NOT empty, and overwriting it clears the wide glyph beside it.
     /// Mirrors alacritty's WIDE_CHAR_SPACER / LEADING_WIDE_CHAR_SPACER flags.
     pub spacer: bool,
+    /// Set on the last cell of a row that soft-wrapped (autowrap) into the next — as
+    /// opposed to a hard line break. Reflow joins rows across this flag. Mirrors
+    /// alacritty's WRAPLINE flag; also makes the cell non-empty.
+    pub wrapline: bool,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { c: ' ', fg: Color::Default, bg: Color::Default, attrs: Attrs::default(), spacer: false }
+        Cell { c: ' ', fg: Color::Default, bg: Color::Default, attrs: Attrs::default(), spacer: false, wrapline: false }
     }
 }
 
@@ -154,23 +158,180 @@ impl Term {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        // Simple truncate/extend, no reflow (reflow is a later Phase-3 milestone —
-        // see the divergence ledger). Content anchors at the top-left.
         let (cols, rows) = (cols.max(1), rows.max(1));
-        let mut grid = vec![vec![Cell::default(); cols]; rows];
-        for r in 0..rows.min(self.rows) {
-            for c in 0..cols.min(self.cols) {
-                grid[r][c] = self.grid[r][c];
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+        self.reflow(cols, rows);
+    }
+
+    /// Resize the grid. alacritty always adjusts the line count first (a pure row move
+    /// that scrolls to keep the cursor in view), then the columns. On the primary screen
+    /// scrolled-off lines enter scrollback and columns reflow wrapped content; the
+    /// alternate screen has no scrollback (scrolled lines are discarded) and does not
+    /// reflow (it just truncates/extends columns).
+    fn reflow(&mut self, new_cols: usize, new_rows: usize) {
+        let keep = !self.alt; // primary screen keeps scrolled lines + reflows
+        match new_rows.cmp(&self.rows) {
+            std::cmp::Ordering::Less => self.shrink_lines(new_rows, keep),
+            std::cmp::Ordering::Greater => self.grow_lines(new_rows, keep),
+            std::cmp::Ordering::Equal => {}
+        }
+        if new_cols != self.cols {
+            if keep {
+                self.reflow_columns(new_cols);
+            } else {
+                self.resize_columns_flat(new_cols);
             }
         }
-        self.grid = grid;
-        self.cols = cols;
-        self.rows = rows;
-        self.scroll_top = 0;
-        self.scroll_bottom = rows - 1;
-        self.row = self.row.min(rows - 1);
-        self.col = self.col.min(cols - 1);
+    }
+
+    /// Alt-screen column resize: truncate or blank-extend each row, clamp the cursor —
+    /// no reflow (matching alacritty's `grow/shrink_columns` with `reflow = false`).
+    fn resize_columns_flat(&mut self, new_cols: usize) {
+        for row in &mut self.grid {
+            row.resize(new_cols, Cell::default());
+        }
+        self.cols = new_cols;
+        self.col = self.col.min(new_cols - 1);
         self.pending_wrap = false;
+    }
+
+    /// Remove lines from the visible area (rows shrink). The bottom rows are dropped
+    /// outright; only if the cursor would fall outside the shorter viewport is content
+    /// scrolled off the top into history to keep the cursor in view (Terminal.app /
+    /// iTerm / alacritty behaviour).
+    fn shrink_lines(&mut self, target: usize, keep: bool) {
+        let scroll = (self.row + 1).saturating_sub(target);
+        for _ in 0..scroll {
+            let line = self.grid.remove(0);
+            if keep {
+                self.history.push_back(line); // primary: into scrollback; alt: discard
+            }
+        }
+        while self.history.len() > SCROLLBACK {
+            self.history.pop_front();
+        }
+        self.row -= scroll;
+        self.grid.truncate(target);
+        while self.grid.len() < target {
+            self.grid.push(vec![Cell::default(); self.cols]);
+        }
+        self.rows = target;
+        self.scroll_top = 0;
+        self.scroll_bottom = target - 1;
+        self.row = self.row.min(target - 1);
+    }
+
+    /// Add lines to the visible area (rows grow). Lines are pulled back from history at
+    /// the top (moving the cursor down) as long as scrollback lasts; any remaining new
+    /// lines are appended as blanks at the bottom.
+    fn grow_lines(&mut self, target: usize, keep: bool) {
+        let added = target - self.rows;
+        let from_history = if keep { self.history.len().min(added) } else { 0 };
+        for _ in 0..from_history {
+            let line = self.history.pop_back().unwrap();
+            self.grid.insert(0, line);
+        }
+        self.row += from_history;
+        for _ in 0..(added - from_history) {
+            self.grid.push(vec![Cell::default(); self.cols]);
+        }
+        self.rows = target;
+        self.scroll_top = 0;
+        self.scroll_bottom = target - 1;
+    }
+
+    /// Reflow the columns: rejoin soft-wrapped rows into logical lines, re-split them at
+    /// `new_cols`, and re-lay-out bottom-anchored across the (already-correct) row count,
+    /// tracking the cursor. Called after the line count is settled.
+    fn reflow_columns(&mut self, new_cols: usize) {
+        let old_cols = self.cols;
+        let new_rows = self.rows;
+        // Deferred wrap: move the cursor one past the last column so it reflows as content.
+        let eff_col = self.col + usize::from(self.pending_wrap);
+
+        // 1. All physical rows, history (oldest) then visible; note the cursor's row.
+        let mut phys: Vec<Vec<Cell>> = self.history.iter().cloned().collect();
+        let cursor_abs = phys.len() + self.row;
+        phys.extend(self.grid.iter().cloned());
+
+        // 2. Rejoin into logical lines. A row's occupied length is the full width if it
+        //    soft-wrapped, else the trimmed content length.
+        let occ = |row: &[Cell]| -> usize {
+            if row[old_cols - 1].wrapline {
+                old_cols
+            } else {
+                (0..old_cols).rev().find(|&i| !cell_is_empty(&row[i])).map_or(0, |i| i + 1)
+            }
+        };
+        let is_wrapped = |row: &[Cell]| -> bool { row[old_cols - 1].wrapline };
+        let mut logical: Vec<Vec<Cell>> = Vec::new();
+        let mut cur: Vec<Cell> = Vec::new();
+        let (mut cur_line, mut cur_off) = (0usize, 0usize);
+        for (i, row) in phys.iter().enumerate() {
+            if i == cursor_abs {
+                cur_line = logical.len();
+                cur_off = cur.len() + eff_col;
+            }
+            let wrapped = is_wrapped(row);
+            let mut n = occ(row);
+            // A wrapped row whose last cell is a *leading* wide-char spacer (a spacer not
+            // trailing a wide glyph) — inserted only to wrap a wide glyph off the right
+            // edge at the old width — is an artifact of that width, not content. Drop it
+            // so the wide glyph rejoins cleanly (alacritty's resize.rs:136).
+            if wrapped
+                && row[old_cols - 1].spacer
+                && (old_cols < 2 || row[old_cols - 2].c.width() != Some(2))
+            {
+                n -= 1;
+            }
+            cur.extend_from_slice(&row[..n]);
+            if !wrapped {
+                logical.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            logical.push(cur);
+        }
+
+        // 3. Re-split each logical line at new_cols; map the cursor to (row, col).
+        let mut out: Vec<Vec<Cell>> = Vec::new();
+        let (mut c_row, mut c_col, mut c_wrap) = (0usize, 0usize, false);
+        for (li, line) in logical.iter().enumerate() {
+            let base = out.len();
+            let (rows_of, dr, dc, dw) = split_logical(line, new_cols, if li == cur_line { Some(cur_off) } else { None });
+            if li == cur_line {
+                c_row = base + dr;
+                c_col = dc;
+                c_wrap = dw;
+            }
+            out.extend(rows_of);
+        }
+        if out.is_empty() {
+            out.push(vec![Cell::default(); new_cols]);
+        }
+
+        // 4. Bottom-anchor: the last `new_rows` rows are visible; the rest become history.
+        let hist_len = out.len().saturating_sub(new_rows);
+        let mut history: VecDeque<Vec<Cell>> = out.drain(..hist_len).collect();
+        while history.len() > SCROLLBACK {
+            history.pop_front();
+        }
+        let mut grid = out;
+        while grid.len() < new_rows {
+            grid.push(vec![Cell::default(); new_cols]);
+        }
+
+        self.history = history;
+        self.grid = grid;
+        self.cols = new_cols;
+        self.rows = new_rows;
+        self.scroll_top = 0;
+        self.scroll_bottom = new_rows - 1;
+        self.row = c_row.saturating_sub(hist_len).min(new_rows - 1);
+        self.col = c_col.min(new_cols - 1);
+        self.pending_wrap = c_wrap;
     }
 
     // ── Accessors (the observable state) ──────────────────────────────────────
@@ -211,7 +372,7 @@ impl Term {
     fn blank(&self) -> Cell {
         // Erased cells keep the current background (xterm/alacritty behaviour), default
         // foreground, no attributes.
-        Cell { c: ' ', fg: Color::Default, bg: self.pen.bg, attrs: Attrs::default(), spacer: false }
+        Cell { c: ' ', fg: Color::Default, bg: self.pen.bg, attrs: Attrs::default(), spacer: false, wrapline: false }
     }
     fn blank_row(&self) -> Vec<Cell> {
         vec![self.blank(); self.cols]
@@ -273,14 +434,14 @@ impl Term {
     fn write_cell(&mut self, c: char) {
         let c = map_charset(self.charsets[self.gl], c);
         let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
-        self.grid[self.row][self.col] = Cell { c, fg, bg, attrs, spacer: false };
+        self.grid[self.row][self.col] = Cell { c, fg, bg, attrs, spacer: false, wrapline: false };
     }
 
     /// Write a wide-glyph spacer at the cursor: a blank that carries the pen colours/
     /// attrs and the `spacer` flag.
     fn write_spacer(&mut self) {
         let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
-        self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, attrs, spacer: true };
+        self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, attrs, spacer: true, wrapline: false };
     }
 
     /// If the cursor cell is the trailing spacer of a wide glyph to its left, overwriting
@@ -298,6 +459,15 @@ impl Term {
         }
     }
 
+    /// Soft (autowrap) line break: mark the current row's last cell WRAPLINE so reflow
+    /// can rejoin it, then move to column 0 of the next line and clear the pending wrap.
+    fn soft_wrap(&mut self) {
+        self.grid[self.row][self.cols - 1].wrapline = true;
+        self.col = 0;
+        self.line_feed();
+        self.pending_wrap = false;
+    }
+
     fn put_char(&mut self, c: char) {
         // Character display width (unicode-width): 0 = combining/zero-width, 1 = normal,
         // 2 = wide (CJK/emoji). Matches alacritty's `input`.
@@ -308,9 +478,7 @@ impl Term {
             return;
         }
         if self.pending_wrap {
-            self.col = 0;
-            self.line_feed();
-            self.pending_wrap = false;
+            self.soft_wrap();
         }
         self.clear_wide_left(); // preserve wide-char pair integrity at the write position
         if width == 2 {
@@ -319,9 +487,7 @@ impl Term {
             if self.col + 1 >= self.cols {
                 if self.autowrap {
                     self.write_spacer(); // leading spacer
-                    self.col = 0;
-                    self.line_feed();
-                    self.pending_wrap = false;
+                    self.soft_wrap();
                 } else {
                     self.pending_wrap = true;
                     return;
@@ -628,12 +794,80 @@ impl Term {
 fn cell_is_empty(c: &Cell) -> bool {
     (c.c == ' ' || c.c == '\t')
         && !c.spacer
+        && !c.wrapline
         && c.fg == Color::Default
         && c.bg == Color::Default
         // alacritty's is_empty ignores bold/dim/italic; only these mark a blank non-empty.
         && !c.attrs.inverse
         && !c.attrs.underline
         && !c.attrs.strikeout
+}
+
+/// Re-split one logical line (a soft-wrap-joined run of cells, wide glyphs already
+/// carrying their trailing spacer) into physical rows exactly `new_cols` wide. Rows that
+/// continue into the next get WRAPLINE on their last cell; a wide glyph that would land
+/// on the last column is pushed to the next row behind a leading spacer. If `cursor_off`
+/// (a cell index into the logical line, possibly past its end for a cursor sitting in
+/// trailing blanks) is given, returns the cursor's `(row_within_line, col, pending_wrap)`.
+fn split_logical(
+    line: &[Cell],
+    new_cols: usize,
+    cursor_off: Option<usize>,
+) -> (Vec<Vec<Cell>>, usize, usize, bool) {
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut cur: Vec<Cell> = Vec::with_capacity(new_cols);
+    let (mut c_row, mut c_col, mut c_wrap, mut found) = (0usize, 0usize, false, false);
+
+    for (i, &cell) in line.iter().enumerate() {
+        let w = if cell.c.width() == Some(2) { 2 } else { 1 };
+        if cur.len() + w > new_cols {
+            // Overflow: if a wide glyph can't fit the one remaining slot, fill it with a
+            // leading spacer. Then flag the row as wrapped and start a fresh one.
+            if cur.len() < new_cols {
+                let mut sp = Cell::default();
+                sp.spacer = true;
+                cur.push(sp);
+            }
+            if let Some(last) = cur.last_mut() {
+                last.wrapline = true;
+            }
+            rows.push(std::mem::take(&mut cur));
+        }
+        if cursor_off == Some(i) {
+            c_row = rows.len();
+            c_col = cur.len();
+            found = true;
+        }
+        cur.push(cell);
+    }
+
+    // Cursor at or beyond the last content cell: walk the remaining offset through blank
+    // space, wrapping as needed; landing exactly on the width means a pending wrap.
+    if let Some(off) = cursor_off {
+        if !found {
+            let (mut row, mut col) = (rows.len(), cur.len());
+            for _ in 0..off.saturating_sub(line.len()) {
+                if col + 1 > new_cols {
+                    row += 1;
+                    col = 0;
+                }
+                col += 1;
+            }
+            if col >= new_cols {
+                c_wrap = true;
+                col = new_cols - 1;
+            }
+            c_row = row;
+            c_col = col;
+        }
+    }
+
+    // Push the trailing (final, non-wrapped) row, padded to width.
+    while cur.len() < new_cols {
+        cur.push(Cell::default());
+    }
+    rows.push(cur);
+    (rows, c_row, c_col, c_wrap)
 }
 
 /// First value of each parameter as a flat `Vec` (drops sub-parameters — the common
@@ -757,9 +991,7 @@ impl Term {
     /// tab stop (every 8 columns), clamped to the last column.
     fn put_tab(&mut self) {
         if self.pending_wrap {
-            self.col = 0;
-            self.line_feed();
-            self.pending_wrap = false;
+            self.soft_wrap();
             return;
         }
         if self.grid[self.row][self.col].c == ' ' {

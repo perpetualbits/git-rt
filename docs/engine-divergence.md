@@ -66,10 +66,37 @@ The scrollback ring is implemented; the full differential (grid, cursor, modes, 
 wide chars AND charsets) is **0/10000**. `display_offset` is always observed at 0 (bottom of the
 view); reading scrolled-back lines / viewport scrolling are future.
 
+## Reflow on resize — implemented, common cases matched (2026-07-21)
+
+vt-term now reflows (was: truncate/extend). Algorithm mirrors alacritty: **lines first**
+(a pure row move — the cursor is kept in view by scrolling top rows into scrollback on the
+primary screen, or discarding them on the alt screen), **then columns** (rejoin
+`WRAPLINE`-marked soft-wrapped rows into logical lines, re-split at the new width with
+leading spacers for wide glyphs at the boundary, re-lay-out bottom-anchored, track the
+cursor). The alt screen does not reflow columns (truncate/extend + clamp).
+
+Result: **0 divergence on the non-resize fuzz is unchanged (0/10000)**; a random-resize
+sweep matches the oracle on **~92%** (≈240/3000 diverge), guarded by
+`tests/vtterm_reflow.rs` (curated exact cases + a fuzz-rate ceiling). Down from ~65%
+divergence (pure truncate/extend). Remaining divergences, to drive to zero:
+
+- **Exact cursor position through reflow.** When the cursor's reflowed offset lands on a
+  column boundary, alacritty's `Boundary::Cursor` math places it differently than our
+  offset→(row,col) mapping (~2% of cases; grid is otherwise identical).
+- **Wide-glyph reflow boundaries in reflowed history.** A one-column shift can appear
+  around a wide glyph sitting at an old/new wrap boundary within reflowed scrollback.
+- **Root cause for several:** alacritty tracks each row's *written* occupied length
+  (`occ`); our fixed-width rows approximate it from content (trim trailing blanks), which
+  differs for printed-then-cleared cells. Closing this likely needs real `occ` tracking.
+
 ## Known not-yet-implemented (will diverge when exercised)
 
-- **Reflow on resize** — vt-term truncates/extends; the oracle rewraps. THE hard part,
-  isolated to the end by design.
+- **Synchronized updates (DECSET/DECRST 2026).** The vendored `vte` fork buffers all bytes
+  between `\x1b[?2026h` and `\x1b[?2026l`, applying them atomically at the end (or on a
+  150 ms timeout / 2 MiB cap); vt-parser applies them immediately. Only *observable* when a
+  feed ends mid-sync (the oracle holds the buffered bytes unapplied) — which is exactly how
+  a captured stream ends. **Surfaced by the `spiral_stress` replay corpus**, not the fuzz
+  (the generator emits no 2026). Being implemented.
 - **Colon sub-parameter SGR** beyond the extended-colour case.
 - **OSC / DCS semantics** (title, clipboard, hyperlinks): parsed but not applied.
 - **Origin mode** edge interactions, DECSCUSR cursor shape, LNM newline mode.

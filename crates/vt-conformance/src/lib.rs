@@ -159,6 +159,21 @@ pub fn feed_whole<E: VtEngine>(cols: usize, rows: usize, script: &[u8]) -> Scree
     e.observe()
 }
 
+/// Spawn engine `E` at `cols1`×`rows1`, feed the script, resize to `cols2`×`rows2`, and
+/// observe — for testing reflow.
+pub fn feed_resize<E: VtEngine>(
+    cols1: usize,
+    rows1: usize,
+    script: &[u8],
+    cols2: usize,
+    rows2: usize,
+) -> ScreenState {
+    let mut e = E::spawn(cols1, rows1);
+    e.feed(script);
+    e.resize(cols2, rows2);
+    e.observe()
+}
+
 /// Spawn engine `E`, feed the script as the given chunks, and observe. Used to prove
 /// chunk-invariance (identical to [`feed_whole`] for a correct engine).
 pub fn feed_chunks<E: VtEngine>(cols: usize, rows: usize, chunks: &[&[u8]]) -> ScreenState {
