@@ -89,14 +89,20 @@ divergence (pure truncate/extend). Remaining divergences, to drive to zero:
   (`occ`); our fixed-width rows approximate it from content (trim trailing blanks), which
   differs for printed-then-cleared cells. Closing this likely needs real `occ` tracking.
 
+### Synchronized updates (DECSET/DECRST 2026) — implemented (2026-07-21)
+
+The vendored `vte` buffers all bytes between `\x1b[?2026h` and `\x1b[?2026l`, applying
+them atomically at the end (or on a 2 MiB cap); vt-parser now does the same, in a layer
+above the raw state machine (`Parser::feed`; see `docs/vt-parser-design.md` §6a). Only
+*observable* when a feed ends mid-sync (the oracle holds the buffered tail unapplied) —
+exactly how a captured stream ends. **Surfaced by the `spiral_stress` replay corpus**, not
+the fuzz (the generator emits no 2026). All four corpus fixtures now match the oracle
+whole-feed and chunk-split (`tests/replay.rs::replay_corpus_matches_oracle`). The raw
+`Parser::advance` path is unchanged, so the parser-vs-`vte` differential and the throughput
+bench are unaffected.
+
 ## Known not-yet-implemented (will diverge when exercised)
 
-- **Synchronized updates (DECSET/DECRST 2026).** The vendored `vte` fork buffers all bytes
-  between `\x1b[?2026h` and `\x1b[?2026l`, applying them atomically at the end (or on a
-  150 ms timeout / 2 MiB cap); vt-parser applies them immediately. Only *observable* when a
-  feed ends mid-sync (the oracle holds the buffered bytes unapplied) — which is exactly how
-  a captured stream ends. **Surfaced by the `spiral_stress` replay corpus**, not the fuzz
-  (the generator emits no 2026). Being implemented.
 - **Colon sub-parameter SGR** beyond the extended-colour case.
 - **OSC / DCS semantics** (title, clipboard, hyperlinks): parsed but not applied.
 - **Origin mode** edge interactions, DECSCUSR cursor shape, LNM newline mode.

@@ -152,8 +152,9 @@ impl Term {
     /// Feed raw bytes: parse them and apply the resulting actions to the grid.
     pub fn feed(&mut self, bytes: &[u8]) {
         // Move the parser out so it can borrow `self` as the Perform sink, then back.
+        // `feed` (not `advance`) so synchronized updates (DECSET 2026) are honoured.
         let mut parser = std::mem::take(&mut self.parser);
-        parser.advance(self, bytes);
+        parser.feed(self, bytes);
         self.parser = parser;
     }
 

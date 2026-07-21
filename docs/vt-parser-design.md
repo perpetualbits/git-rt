@@ -83,6 +83,27 @@ OSC bytes accumulate in a raw buffer; `;` records parameter boundaries (up to 16
 recording which terminator was used. DCS `hook`s on its final byte, streams data bytes
 via `put`, and `unhook`s on cancel/ST.
 
+## 6a. Synchronized updates (DECSET 2026)
+
+Modern TUIs wrap each frame in `\x1b[?2026h` … `\x1b[?2026l` (BSU/ESU) so the terminal
+applies it atomically, without tearing. The vendored `vte` buffers every byte in between
+and replays it at the ESU (or a 2 MiB cap); `vt-term` must match, or a stream captured
+mid-frame diverges — which is exactly how `spiral_stress.bytes` ends, and how this gap was
+found (the fuzz never emits 2026).
+
+To keep the hot path untouched, this lives in a thin layer *above* the state machine:
+
+- [`advance`](Parser::advance) is the **raw, sync-unaware** machine — the path the bench
+  measures and the parser-vs-`vte` differential tests (`vte`'s low-level parser has no
+  sync either, so they must agree byte-for-byte).
+- [`feed`](Parser::feed) is what a terminal drives: it runs `advance_until_sync` (the same
+  machine, stopping the instant a live BSU is dispatched), then buffers until it finds the
+  ESU — scanning the buffer for the fixed escapes with a 7-byte overlap so a split escape
+  is still caught — and replays the buffer through the machine (`flushing` guards against a
+  buffered BSU re-entering sync). A later BSU *extends* the update: everything before it is
+  applied, its tail stays buffered. A stream ending mid-update leaves the tail unapplied,
+  matching the oracle. This mirrors `vte`'s `Processor`/`advance_sync` structure exactly.
+
 ## 7. Verification & performance
 
 - **Correctness:** `vt-conformance/tests/parser.rs` records both engines' action

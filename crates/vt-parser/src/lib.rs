@@ -189,7 +189,28 @@ pub struct Parser {
     osc_num_params: usize,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
+    /// Synchronized-update (DECSET 2026) state. While `sync_active`, raw bytes are held in
+    /// `sync_buffer` instead of being dispatched, and applied atomically when the update
+    /// ends (ESU `\x1b[?2026l`, or the 2 MiB cap). `flushing` guards the buffer-replay so a
+    /// buffered BSU doesn't re-enter sync. Mirrors the vendored `vte` fork so the action
+    /// streams agree; a stream ending mid-update leaves its tail unapplied, exactly as the
+    /// oracle does. See `docs/vt-parser-design.md`.
+    sync_active: bool,
+    /// True only while the sync-aware [`feed`](Parser::feed) drives the machine, so
+    /// `csi_dispatch` enters sync on a live BSU there but never on the raw [`advance`]
+    /// path (which stays sync-free for the parser-vs-`vte` differential and the bench).
+    sync_driver: bool,
+    flushing: bool,
+    sync_buffer: Vec<u8>,
 }
+
+/// Begin-synchronized-update CSI (`\x1b[?2026h`).
+const BSU_CSI: &[u8] = b"\x1b[?2026h";
+/// End-synchronized-update CSI (`\x1b[?2026l`).
+const ESU_CSI: &[u8] = b"\x1b[?2026l";
+/// Max bytes buffered in one synchronized update before it is force-flushed (2 MiB),
+/// matching the vendored `vte`.
+const SYNC_BUFFER_SIZE: usize = 0x20_0000;
 
 impl Parser {
     /// Minimum printable-run length dispatched via the batched [`Perform::print_str`]
@@ -207,7 +228,10 @@ impl Parser {
         &self.intermediates[..self.intermediate_idx]
     }
 
-    /// Feed `bytes` to the parser, dispatching actions to `performer`.
+    /// Feed `bytes` to the parser, dispatching actions to `performer`. This is the raw
+    /// state machine — **sync-unaware** — so it stays the hot path measured by the bench
+    /// and differentially tested against `vte`'s low-level parser. Drive a terminal
+    /// through [`feed`](Self::feed) instead, which layers on synchronized updates.
     pub fn advance<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
         let mut i = 0;
         // Finish any codepoint split across the previous call first.
@@ -222,6 +246,141 @@ impl Parser {
                     i += 1;
                 }
             }
+        }
+    }
+
+    /// Feed `bytes` with synchronized-update (DECSET 2026) support — the entry point a
+    /// terminal uses. Identical to [`advance`](Self::advance) except that bytes arriving
+    /// while an update is open (`\x1b[?2026h` … `\x1b[?2026l`) are buffered and applied
+    /// atomically at the end, matching the vendored `vte` `Processor`. A stream that ends
+    /// mid-update leaves its tail unapplied — exactly what the oracle does.
+    pub fn feed<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
+        self.sync_driver = true;
+        let mut i = 0;
+        while i != bytes.len() {
+            if self.sync_active {
+                i += self.advance_sync(performer, &bytes[i..]);
+            } else {
+                i += self.advance_until_sync(performer, &bytes[i..]);
+            }
+        }
+    }
+
+    /// Drive the machine like [`advance`](Self::advance) but stop as soon as a live BSU is
+    /// dispatched (which sets `sync_active`), so [`feed`](Self::feed) can begin buffering.
+    fn advance_until_sync<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let mut i = 0;
+        if self.partial_utf8_len != 0 {
+            i += self.advance_partial_utf8(performer, &bytes[i..]);
+        }
+        while i != bytes.len() {
+            match self.state {
+                State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                _ => {
+                    self.change_state(performer, bytes[i]);
+                    i += 1;
+                }
+            }
+            if self.sync_active {
+                break; // a live \x1b[?2026h was just dispatched
+            }
+        }
+        i
+    }
+
+    /// Dispatch `bytes` straight through the state machine with no sync interception —
+    /// the buffer-replay path. `flushing` is set so a buffered BSU can't re-enter sync.
+    fn dispatch_raw<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
+        let mut i = 0;
+        if self.partial_utf8_len != 0 {
+            i += self.advance_partial_utf8(performer, bytes);
+        }
+        while i != bytes.len() {
+            match self.state {
+                State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                _ => {
+                    self.change_state(performer, bytes[i]);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Buffer `bytes` during an open synchronized update, scanning for the terminating or
+    /// extending escape. Returns bytes consumed. On overflow the update is force-flushed
+    /// and the caller reprocesses `bytes` normally.
+    #[cold]
+    fn advance_sync<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        if self.sync_buffer.len() + bytes.len() >= SYNC_BUFFER_SIZE - 1 {
+            self.stop_sync(performer, None); // sync_active := false; caller reprocesses
+            return 0;
+        }
+        self.sync_buffer.extend_from_slice(bytes);
+        self.scan_sync_csi(performer, bytes.len());
+        bytes.len()
+    }
+
+    /// Search the just-added region (plus the 7-byte overlap for split escapes) for the
+    /// BSU/ESU escapes, in reverse. A later BSU extends the update (its tail is kept
+    /// buffered); the first ESU found terminates it, flushing everything before that BSU.
+    fn scan_sync_csi<P: Perform>(&mut self, performer: &mut P, new_bytes: usize) {
+        let len = self.sync_buffer.len();
+        let start = (len - new_bytes).saturating_sub(BSU_CSI.len() - 1);
+        let end = len.saturating_sub(BSU_CSI.len() - 1);
+        let mut bsu_offset = None;
+        let mut off = end;
+        while off > start {
+            off -= 1;
+            if self.sync_buffer[off] != 0x1B {
+                continue;
+            }
+            let escape = &self.sync_buffer[off..off + BSU_CSI.len()];
+            if escape == BSU_CSI {
+                bsu_offset = Some(off);
+            } else if escape == ESU_CSI {
+                self.stop_sync(performer, bsu_offset);
+                break;
+            }
+        }
+    }
+
+    /// End (or trim) the synchronized update: replay the buffered bytes up to `bsu_offset`
+    /// (or the whole buffer on a plain ESU) through the parser, then either exit sync or,
+    /// if a later BSU extended it, keep that BSU's tail buffered and stay in sync.
+    fn stop_sync<P: Perform>(&mut self, performer: &mut P, bsu_offset: Option<usize>) {
+        let buffer = std::mem::take(&mut self.sync_buffer);
+        let offset = bsu_offset.unwrap_or(buffer.len());
+        self.flushing = true;
+        self.dispatch_raw(performer, &buffer[..offset]);
+        self.flushing = false;
+        self.sync_buffer = buffer;
+        match bsu_offset {
+            Some(off) => {
+                let new_len = self.sync_buffer.len() - off;
+                self.sync_buffer.copy_within(off.., 0);
+                self.sync_buffer.truncate(new_len);
+            }
+            None => {
+                self.sync_active = false;
+                self.sync_buffer.clear();
+            }
+        }
+    }
+
+    /// Is the CSI currently being dispatched exactly `\x1b[?2026h`/`l`? Returns `Some(true)`
+    /// for BSU (begin), `Some(false)` for ESU (end), else `None`.
+    fn sync_csi_kind(&self, action: u8) -> Option<bool> {
+        if self.intermediates() != b"?" {
+            return None;
+        }
+        let mut it = self.params.iter();
+        match (it.next(), it.next()) {
+            (Some([2026]), None) => match action {
+                b'h' => Some(true),
+                b'l' => Some(false),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -494,6 +653,13 @@ impl Parser {
             self.params.push(self.param);
         }
         performer.csi_dispatch(&self.params, self.intermediates(), self.ignoring, byte as char);
+        // Enter a synchronized update on a live `\x1b[?2026h` — only on the sync-aware
+        // `feed` path (`sync_driver`), never while replaying a buffered update
+        // (`flushing`) or on the raw `advance` path. The feed loop then buffers the rest.
+        if self.sync_driver && !self.flushing && self.sync_csi_kind(byte) == Some(true) {
+            self.sync_active = true;
+            self.sync_buffer.clear();
+        }
         self.state = State::Ground;
     }
 
