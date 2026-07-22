@@ -1393,4 +1393,69 @@ mod damage_tests {
         let d2 = pane.render_snapshot().damage;
         assert!(!d2.contains_line(4), "unwritten line 4 should be undamaged: {d2:?}");
     }
+
+    /// `write()` must NOT block the caller when the child isn't draining stdin. Writes go
+    /// to a dedicated writer thread precisely so a large paste into a paused/non-reading
+    /// program can't freeze the GUI. Here the child (`sleep`) never reads stdin, so its PTY
+    /// input buffer fills and stays full; a blocking write on the caller (the old design)
+    /// would hang forever. The writer thread must absorb the backpressure and let `write()`
+    /// return immediately.
+    #[test]
+    fn vtpane_write_does_not_block_when_child_ignores_stdin() {
+        use std::time::{Duration, Instant};
+        let pane = vtpane::VtPane::spawn_env(
+            Some(("/bin/sh".into(), vec!["-c".into(), "sleep 10".into()])),
+            None,
+            40,
+            10,
+            &[],
+            1000,
+        )
+        .expect("spawn");
+        std::thread::sleep(Duration::from_millis(100)); // let the child settle
+
+        // Far more than the PTY input buffer (~64 KiB) to a child that never reads it.
+        let payload = vec![b'x'; 512 * 1024];
+        let start = Instant::now();
+        pane.write(&payload);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "write() blocked the caller for {elapsed:?} on a child ignoring stdin — it must \
+             enqueue to the writer thread, not block the GUI"
+        );
+        // (The pane drops here; its writer thread unblocks once the child is reaped.)
+    }
+
+    /// The writer thread must actually deliver input, in order, to the child: type a command
+    /// and confirm it round-trips onto the grid. Guards against the channel/writer path
+    /// dropping or reordering bytes.
+    #[test]
+    fn vtpane_write_round_trips_through_the_shell() {
+        use std::time::{Duration, Instant};
+        let pane = vtpane::VtPane::spawn_env(
+            Some(("/bin/sh".into(), vec![])), // bare shell, reads stdin
+            None,
+            80,
+            24,
+            &[],
+            1000,
+        )
+        .expect("spawn");
+        std::thread::sleep(Duration::from_millis(200)); // let the shell start
+
+        let marker = "vtwriter-roundtrip-5561";
+        pane.write(format!("echo {marker}\n").as_bytes());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            if pane.snapshot().to_text().contains(marker) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(seen, "writer thread never delivered the typed command to the shell");
+    }
 }
