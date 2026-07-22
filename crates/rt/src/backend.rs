@@ -95,6 +95,19 @@ pub trait Backend {
     fn is_gl(&self) -> bool {
         true
     }
+
+    /// Whether this backend can cheaply scroll a rectangle of already-rendered pixels in
+    /// place (a server-side blit) — true only for the XRender backend. When true, the frame
+    /// planner may take the scroll-blit fast path instead of re-rendering a scrolled pane.
+    fn supports_scroll_blit(&self) -> bool {
+        false
+    }
+
+    /// Scroll the pixels of `rect` (in the back buffer) UP by `dy` pixels: move the sub-rect
+    /// `rect` minus its top `dy` rows up to `rect`'s top, leaving the bottom `dy` rows for the
+    /// caller to repaint. A no-op for backends that don't `supports_scroll_blit`. Does NOT
+    /// present — the caller redraws the exposed rows and then presents `rect`.
+    fn scroll_blit(&mut self, _rect: PxRect, _dy: i32) {}
 }
 
 /// Which [`Backend`] implementation to use. `Gl` is the existing local-rendering

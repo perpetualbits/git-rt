@@ -3136,6 +3136,15 @@ impl App {
             }
             snapshots.push((id, (rect, snap)));
         }
+        // Scroll-blit fast path (XRender only): when every changed pane is a clean full-width
+        // scroll and nothing else moved, blit each scrolled pane's content up server-side
+        // (one CopyArea) and repaint only the exposed rows — ~1 request instead of re-shipping
+        // the whole pane over ssh -X. Falls through to the normal damage path otherwise.
+        if Self::redraw_scroll_blit(active, bg, bounds, &snapshots, chrome_moved, overlay_open, cw, ch) {
+            active.force_full = false; // a clean scroll frame; overlay_open was false to get here
+            active.last_focus = active.session.focus();
+            return;
+        }
         // Chrome egui blends every frame (focus outline, border instruments)
         // lives on the pane borders; force those bands into the damage set so the
         // scissored clear+redraw always precedes egui's blend (no double-blend).
@@ -3825,6 +3834,91 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// The scroll-blit fast path. Returns `true` iff it handled (drew + presented) this frame.
+    ///
+    /// Gated hard: only the XRender backend (server-side `CopyArea`), and only a frame where
+    /// nothing but pane *content* moved — no chrome/overlay/wire/bell/broadcast, and every
+    /// changed pane is a clean full-width [`Damage::Scroll`](rt_engine::Damage::Scroll). For
+    /// each scrolled pane it blits the content up in the back buffer (one request) and repaints
+    /// only the dirty spans (the exposed rows plus the cursor's old cell, which the blit
+    /// dragged up), then presents the whole content rect. Any wire could arc over a pane and be
+    /// smeared by the blit, so — like the GL path — the presence of ANY wire disables it.
+    fn redraw_scroll_blit(
+        active: &mut Active,
+        bg: Color,
+        bounds: Rect,
+        snapshots: &[(rt_core::PaneId, PxRectSnap)],
+        chrome_moved: bool,
+        overlay_open: bool,
+        cw: i32,
+        ch: i32,
+    ) -> bool {
+        if !active.backend.supports_scroll_blit()
+            || chrome_moved
+            || overlay_open
+            || !active.bell_flash.is_empty()
+            || !active.wires.is_empty()
+            || !matches!(active.session.broadcast(), Broadcast::Off)
+        {
+            return false;
+        }
+        let union = |acc: &mut Option<crate::damage::PxRect>, r: crate::damage::PxRect| {
+            *acc = Some(match *acc {
+                None => r,
+                Some(a) => {
+                    let (x0, y0) = (a.x.min(r.x), a.y.min(r.y));
+                    let (x1, y1) = ((a.x + a.w).max(r.x + r.w), (a.y + a.h).max(r.y + r.h));
+                    crate::damage::PxRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+                }
+            });
+        };
+        let mut present_bbox: Option<crate::damage::PxRect> = None; // whole content of every scrolled pane
+        let mut draw_bbox: Option<crate::damage::PxRect> = None; // just the dirty spans to repaint
+        let mut any_scroll = false;
+        for (id, (rect, snap)) in snapshots {
+            let Some(snap) = snap else { continue };
+            let idle = matches!(&snap.damage, rt_engine::Damage::Lines(l) if l.is_empty());
+            if active.session.columns_of(*id) > 1 {
+                if idle {
+                    continue;
+                }
+                return false; // a multi-column pane changed: cell↔px mapping is ambiguous
+            }
+            match &snap.damage {
+                _ if idle => {} // unchanged pane: leave its pixels alone
+                rt_engine::Damage::Scroll { lines, spans } => {
+                    any_scroll = true;
+                    let content = active.session.content_rect(*rect);
+                    let cr = crate::damage::PxRect { x: content.x as i32, y: content.y as i32, w: content.w as i32, h: content.h as i32 };
+                    active.backend.scroll_blit(cr, *lines as i32 * ch);
+                    union(&mut present_bbox, cr);
+                    for s in spans {
+                        union(&mut draw_bbox, crate::damage::PxRect {
+                            x: cr.x + s.left as i32 * cw,
+                            y: cr.y + s.line as i32 * ch,
+                            w: (s.right - s.left + 1) as i32 * cw,
+                            h: ch,
+                        });
+                    }
+                }
+                _ => return false, // Full, or a real Lines change: not a pure-scroll frame
+            }
+        }
+        let (Some(draw_bbox), Some(present_bbox)) = (draw_bbox, present_bbox) else { return false };
+        if !any_scroll {
+            return false;
+        }
+        // Repaint only the exposed/dirty rows over the (already blitted) content — the XRender
+        // primitives self-trim to the scissor, so cells outside it issue no requests — then
+        // present the whole scrolled content region.
+        active.backend.begin_frame_scissored(bg, draw_bbox);
+        Self::draw_panes(active, bounds, snapshots);
+        active.backend.end_frame();
+        active.backend.clear_scissor();
+        active.backend.present(&active.window, Some((present_bbox, &[])));
+        true
     }
 
     /// Point the cursor at whatever is under it: Grab over a jack, resize arrows

@@ -948,6 +948,31 @@ impl Backend for XRenderBackend {
     fn is_gl(&self) -> bool {
         false // the XRender backend: instruments live on the persistent layer
     }
+    fn supports_scroll_blit(&self) -> bool {
+        true // a server-side pixmap→pixmap CopyArea is ~1 request, cheap even over ssh -X
+    }
+    fn scroll_blit(&mut self, rect: PxRect, dy: i32) {
+        // Shift `rect` minus its top `dy` rows UP by `dy` within the back pixmap: one
+        // server-side CopyArea (src and dst are the same pixmap; X handles the overlap like
+        // memmove). The exposed bottom `dy` rows are left for the caller to repaint. Clamp to
+        // the pixmap so a stale/oversized rect can't fault the server.
+        if dy <= 0 {
+            return;
+        }
+        let x = rect.x.clamp(0, self.win_w as i32) as i16;
+        let y = rect.y.clamp(0, self.win_h as i32);
+        let w = rect.w.min(self.win_w as i32 - x as i32).max(0) as u16;
+        let h = (rect.h - dy).min(self.win_h as i32 - (y + dy)).max(0) as u16;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let _ = self.conn.copy_area(
+            self.back_pixmap, self.back_pixmap, self.gc,
+            x, (y + dy) as i16, // src: rect top + dy
+            x, y as i16,        // dst: rect top
+            w, h,
+        );
+    }
 }
 
 impl Drop for XRenderBackend {
