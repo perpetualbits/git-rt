@@ -4613,7 +4613,10 @@ fn build_event_loop() -> EventLoop<()> {
 }
 
 fn main() {
-    env_logger::init(); // honour RUST_LOG for diagnostics
+    // Honour RUST_LOG, but default to showing warnings+errors even when it's unset —
+    // otherwise a GL/window-creation failure (logged via log::error!) is silent and the
+    // user just sees a blank window with no clue why. RUST_LOG still overrides for more.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     // Parse the CLI FIRST. `--version`/`--help` exit from here, and must work on
     // a machine with no display and no fonts — scripts and CI ask a binary what
     // it is without wanting a terminal window. Parsing after `build_event_loop`
