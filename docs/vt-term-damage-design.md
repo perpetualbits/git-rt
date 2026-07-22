@@ -1,8 +1,8 @@
 # Native damage tracking for vt-term (RT-PERF-002 follow-up)
 
-Status: design approved 2026-07-22. Goal: eliminate the per-frame O(rows×cols) work in the
-in-house `VtPane` render path by tracking damage where mutations happen, instead of diffing
-whole grids.
+Status: **implemented** 2026-07-22 (design approved same day). Goal: eliminate the per-frame
+O(rows×cols) work in the in-house `VtPane` render path by tracking damage where mutations
+happen, instead of diffing whole grids.
 
 ## Problem
 

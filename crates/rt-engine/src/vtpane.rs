@@ -11,11 +11,10 @@
 //! **Feature parity with the alacritty backend:** scrollback viewport (scroll / scroll-to
 //! / `snapshot_lines`), linewise + block selection (wrap-aware), buffer search, mouse
 //! reporting (DECSET 1000/1002/1003/1006), DECSCUSR cursor shape, OSC 0/2 window title,
-//! and precise per-line damage (computed by diffing successive rendered grids, since
-//! vt-term has no built-in damage tracking).
+//! and precise per-line damage — now driven by vt-term's NATIVE damage tracking, so a
+//! frame refreshes only the cells that changed (no whole-grid rebuild, no whole-grid diff).
 //!
-//! **Still simplified:** damage is diff-derived rather than parser-tracked (correct, one
-//! grid-diff per frame); search is a plain substring scan (no regex); and any vt-term
+//! **Still simplified:** search is a plain substring scan (no regex); and any vt-term
 //! reflow edge (see `docs/engine-divergence.md`) shows through here too.
 
 use std::collections::VecDeque;
@@ -79,8 +78,9 @@ pub struct VtPane {
     _writer: std::thread::JoinHandle<()>,
     /// Set by the reader thread when new bytes have been applied (drives redraw).
     dirty: Arc<AtomicBool>,
-    /// The grid as of the last `render_snapshot`, diffed against the next to compute
-    /// precise per-line damage (vt-term has no built-in damage tracking).
+    /// The persistent resolved grid: `render_snapshot` refreshes only the cells vt-term
+    /// reports as damaged into it, then shares it into the returned snapshot via the `Arc`
+    /// refcount. Kept across frames so an unchanged pane costs O(damaged cells), not O(grid).
     last_render: Mutex<Arc<Vec<Vec<SnapCell>>>>,
     /// Reader thread; detached — it ends on its own when the child closes the PTY.
     _reader: std::thread::JoinHandle<()>,
@@ -338,84 +338,35 @@ impl VtPane {
         self.dirty.store(true, Ordering::Release);
     }
 
-    /// Resolve a vt-term colour to RGB through the palette.
-    fn rgb(&self, c: vt_term::Color, is_fg: bool) -> palette::Rgb {
-        match c {
-            vt_term::Color::Default => {
-                if is_fg {
-                    self.palette.fg
-                } else {
-                    self.palette.bg
-                }
-            }
-            vt_term::Color::Indexed(i) => self.palette.indexed(i),
-            vt_term::Color::Rgb(r, g, b) => [r, g, b],
-        }
-    }
-
     /// Materialise the visible grid into a [`Snapshot`], folding bold/dim/inverse/hidden
     /// into the resolved colours the way alacritty's `capture_locked` does.
     fn capture(&self) -> Snapshot {
         let t = self.lock_term();
-        let (cols, rows) = (t.cols(), t.rows());
-        let offset = t.display_offset() as i32;
-        let blank = SnapCell { c: ' ', fg: self.palette.fg, bg: self.palette.bg, attrs: CellAttrs::default() };
-        let mut grid = vec![vec![blank.clone(); cols]; rows];
-        for r in 0..rows {
-            for col in 0..cols {
-                // Viewport row r shows absolute line `r - offset` (offset>0 = scrolled up).
-                grid[r][col] = self.snapcell(&t, r as i32 - offset, col);
-            }
-        }
-        // Cursor is only drawn when live (not scrolled back into history).
-        let cursor = if t.cursor_visible() && offset == 0 {
-            let (col, line) = t.cursor();
-            let shape = match t.cursor_shape() {
-                vt_term::CursorShape::Block => CursorShape::Block,
-                vt_term::CursorShape::Underline => CursorShape::Underline,
-                vt_term::CursorShape::Beam => CursorShape::Beam,
-            };
-            (line < rows && col < cols).then_some(CursorPos { col, line, shape })
-        } else {
-            None
-        };
-        Snapshot { cols, rows: Arc::new(grid), cursor, damage: Damage::default() }
+        let cols = t.cols();
+        let grid = resolve_full(&t, &self.palette);
+        Snapshot { cols, rows: Arc::new(grid), cursor: capture_cursor(&t), damage: Damage::default() }
     }
 
     pub fn snapshot(&self) -> Snapshot {
         self.capture()
     }
 
-    /// Capture the grid and compute precise per-line damage by diffing it against the
-    /// previously-rendered grid — vt-term has no built-in damage, but a diff of the actual
-    /// output can't miss a change. `Full` on the first frame or a size change; otherwise
-    /// `Lines` with each changed row's `left..=right` span (empty when nothing changed, so
-    /// an idle pane reports no damage). Call once per pane per frame.
+    /// Produce a snapshot, using vt-term's NATIVE per-frame damage to refresh only the cells
+    /// that changed since the last call — no whole-grid rebuild and no whole-grid diff (both
+    /// were O(rows×cols)). `last_render` holds the persistent resolved grid, shared into the
+    /// returned snapshot via the `Arc` refcount; `Arc::make_mut` mutates it in place because
+    /// the previous frame's snapshot is dropped before this runs (it clones only if some
+    /// caller retains a snapshot across frames). Call once per pane per frame.
     pub fn render_snapshot(&self) -> Snapshot {
         self.dirty.store(false, Ordering::Release);
-        let snap = self.capture();
+        let mut t = self.lock_term();
+        let cols = t.cols();
+        let dmg = t.take_damage();
+        let cursor = capture_cursor(&t);
         let mut last = self.last_render.lock().unwrap_or_else(|e| e.into_inner());
-        let same_dims =
-            last.len() == snap.rows.len() && last.first().map_or(false, |r| r.len() == snap.cols);
-        let damage = if !same_dims {
-            Damage::Full
-        } else {
-            let mut lines = Vec::new();
-            for (i, (new, old)) in snap.rows.iter().zip(last.iter()).enumerate() {
-                if new != old {
-                    let left = (0..new.len()).find(|&c| new[c] != old[c]).unwrap_or(0);
-                    let right = (0..new.len()).rev().find(|&c| new[c] != old[c]).unwrap_or(0);
-                    lines.push(CellDamage { line: i, left, right });
-                }
-            }
-            Damage::Lines(lines)
-        };
-        // Share the freshly-captured grid with `last_render` via the refcount, not a full
-        // deep copy — the returned Snapshot and `last_render` reference the same immutable
-        // rows, so next frame diffs against them without having paid O(rows×cols) to clone
-        // them here (material for 4K grids / many panes / fast output).
-        *last = Arc::clone(&snap.rows);
-        Snapshot { cols: snap.cols, rows: snap.rows, cursor: snap.cursor, damage }
+        let grid = Arc::make_mut(&mut last);
+        let damage = apply_damage(&t, &self.palette, dmg, grid);
+        Snapshot { cols, rows: Arc::clone(&last), cursor, damage }
     }
 
     pub fn set_palette(&mut self, palette: Palette) {
@@ -553,29 +504,7 @@ impl VtPane {
 
     /// One resolved cell at absolute line/col, for history snapshots.
     fn snapcell(&self, t: &vt_term::Term, abs: i32, col: usize) -> SnapCell {
-        let cell = t.cell_at(abs, col);
-        let mut fg = self.rgb(cell.fg, true);
-        let mut bg = self.rgb(cell.bg, false);
-        if cell.dim() {
-            fg = palette::dim(fg);
-        }
-        if cell.inverse() {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if cell.hidden() {
-            fg = bg;
-        }
-        SnapCell {
-            c: cell.c,
-            fg,
-            bg,
-            attrs: CellAttrs {
-                bold: cell.bold(),
-                underline: cell.underline(),
-                italic: cell.italic(),
-                strikeout: cell.strikeout(),
-            },
-        }
+        resolve_cell(&self.palette, t.cell_at(abs, col))
     }
 
     /// Whether this pane is frozen after a caught panic (reader parser OR GUI render).
@@ -636,5 +565,186 @@ impl VtPane {
             }
         }
         self.events.lock().map(|mut q| q.drain(..).collect()).unwrap_or_else(|e| e.into_inner().drain(..).collect())
+    }
+}
+
+/// Resolve a vt-term colour to concrete RGB through the palette.
+fn resolve_rgb(palette: &Palette, c: vt_term::Color, is_fg: bool) -> palette::Rgb {
+    match c {
+        vt_term::Color::Default => {
+            if is_fg {
+                palette.fg
+            } else {
+                palette.bg
+            }
+        }
+        vt_term::Color::Indexed(i) => palette.indexed(i),
+        vt_term::Color::Rgb(r, g, b) => [r, g, b],
+    }
+}
+
+/// Resolve one vt-term cell to a drawable [`SnapCell`], folding bold/dim/inverse/hidden into
+/// the colours (matching alacritty's `capture_locked`).
+fn resolve_cell(palette: &Palette, cell: vt_term::Cell) -> SnapCell {
+    let mut fg = resolve_rgb(palette, cell.fg, true);
+    let mut bg = resolve_rgb(palette, cell.bg, false);
+    if cell.dim() {
+        fg = palette::dim(fg);
+    }
+    if cell.inverse() {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if cell.hidden() {
+        fg = bg;
+    }
+    SnapCell {
+        c: cell.c,
+        fg,
+        bg,
+        attrs: CellAttrs {
+            bold: cell.bold(),
+            underline: cell.underline(),
+            italic: cell.italic(),
+            strikeout: cell.strikeout(),
+        },
+    }
+}
+
+/// Resolve the whole visible grid (viewport row `r` shows absolute line `r - display_offset`).
+fn resolve_full(t: &vt_term::Term, palette: &Palette) -> Vec<Vec<SnapCell>> {
+    let (cols, rows) = (t.cols(), t.rows());
+    let offset = t.display_offset() as i32;
+    (0..rows)
+        .map(|r| (0..cols).map(|c| resolve_cell(palette, t.cell_at(r as i32 - offset, c))).collect())
+        .collect()
+}
+
+/// The cursor position for a snapshot: drawn only when visible AND at the live bottom (not
+/// scrolled back into history).
+fn capture_cursor(t: &vt_term::Term) -> Option<CursorPos> {
+    if !(t.cursor_visible() && t.display_offset() == 0) {
+        return None;
+    }
+    let (col, line) = t.cursor();
+    let shape = match t.cursor_shape() {
+        vt_term::CursorShape::Block => CursorShape::Block,
+        vt_term::CursorShape::Underline => CursorShape::Underline,
+        vt_term::CursorShape::Beam => CursorShape::Beam,
+    };
+    (line < t.rows() && col < t.cols()).then_some(CursorPos { col, line, shape })
+}
+
+/// Refresh only the cells vt-term marked damaged into `resolved`, returning the render-side
+/// [`Damage`]. Rebuilds the whole grid on `Full` damage or a dimension change (which vt-term
+/// also reports as `Full`), so `resolved` always ends the call equal to a full resolve.
+fn apply_damage(
+    t: &vt_term::Term,
+    palette: &Palette,
+    dmg: vt_term::Damage,
+    resolved: &mut Vec<Vec<SnapCell>>,
+) -> Damage {
+    let (cols, rows) = (t.cols(), t.rows());
+    let dims_ok = resolved.len() == rows && resolved.first().map_or(false, |r| r.len() == cols);
+    match dmg {
+        vt_term::Damage::Spans(spans) if dims_ok => {
+            let mut lines = Vec::with_capacity(spans.len());
+            for s in &spans {
+                if s.line >= rows || cols == 0 {
+                    continue;
+                }
+                let right = s.right.min(cols - 1);
+                for c in s.left..=right {
+                    // Native damage never marks while scrolled back (it reports Full), so the
+                    // viewport row IS the absolute line: `cell_at(line, c)`.
+                    resolved[s.line][c] = resolve_cell(palette, t.cell_at(s.line as i32, c));
+                }
+                lines.push(CellDamage { line: s.line, left: s.left, right });
+            }
+            Damage::Lines(lines)
+        }
+        // Full damage, first frame, or a resize: rebuild wholesale.
+        _ => {
+            *resolved = resolve_full(t, palette);
+            Damage::Full
+        }
+    }
+}
+
+#[cfg(test)]
+mod damage_incremental_tests {
+    use super::*;
+    use vt_term::Term;
+
+    /// Incrementally refreshing only the damaged cells must yield exactly the same resolved
+    /// grid as re-resolving the whole thing — over a mix of print, SGR, erase, scroll, wide
+    /// glyphs, and insert/delete. This is the SnapCell-level check that vt-term's native
+    /// damage is complete enough to drive `render_snapshot`'s incremental path.
+    #[test]
+    fn incremental_apply_matches_full_resolve() {
+        let palette = Palette::xterm();
+        let mut t = Term::new(24, 8);
+        let _ = t.take_damage(); // drain the initial full frame
+        let mut resolved = resolve_full(&t, &palette);
+        assert_eq!(resolved, resolve_full(&t, &palette));
+
+        let scripts: &[&[u8]] = &[
+            b"hello world",
+            b"\r\n\x1b[1mBOLD\x1b[0m\x1b[3mital",
+            b"\x1b[2J\x1b[H",                      // clear + home
+            b"line1\r\nline2\r\nline3",
+            b"\x1b[5;3H\x1b[31mX\x1b[7mY",         // move + colour + inverse
+            "wide 界 chars 世".as_bytes(),
+            b"\x1b[2K",                            // erase whole line
+            b"\x1b[2;1H\x1b[3P",                   // delete chars
+            b"\x1b[4;1H\x1b[3@zzz",                // insert chars then type
+            b"\x1b[3;1H\x1b[L\x1b[M",              // insert then delete a line
+            b"\x1b[H\x1b[Jend",                    // erase-below
+            b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj", // force scroll
+        ];
+        for s in scripts {
+            t.feed(s);
+            let dmg = t.take_damage();
+            let render_dmg = apply_damage(&t, &palette, dmg, &mut resolved);
+            let full = resolve_full(&t, &palette);
+            assert_eq!(
+                resolved, full,
+                "incremental != full after {:?} (render damage {:?})",
+                String::from_utf8_lossy(s), render_dmg,
+            );
+        }
+    }
+
+    /// The render-side damage contract: a fresh pane's first frame is Full; an idle frame is
+    /// empty `Lines`; a localized write reports just that row's span. (What `render_snapshot`
+    /// exposes to the renderer, checked without a PTY.)
+    #[test]
+    fn apply_damage_reports_full_then_lines() {
+        let palette = Palette::xterm();
+        let mut t = Term::new(10, 4);
+        let mut resolved: Vec<Vec<SnapCell>> = Vec::new(); // empty, like a just-spawned pane
+
+        // First frame: nothing resolved yet → rebuild → Full.
+        let dmg = t.take_damage();
+        let d0 = apply_damage(&t, &palette, dmg, &mut resolved);
+        assert_eq!(d0, Damage::Full);
+        assert_eq!(resolved.len(), 4);
+
+        // Idle frame: no mutations, cursor unmoved → empty Lines.
+        let dmg = t.take_damage();
+        let d1 = apply_damage(&t, &palette, dmg, &mut resolved);
+        assert_eq!(d1, Damage::Lines(vec![]));
+
+        // A localized write on row 0 → Lines covering (only) row 0.
+        t.feed(b"\x1b[1;1Hhi");
+        let dmg = t.take_damage();
+        let d2 = apply_damage(&t, &palette, dmg, &mut resolved);
+        match &d2 {
+            Damage::Lines(l) => {
+                assert!(l.iter().any(|c| c.line == 0), "row 0 must be damaged: {d2:?}");
+                assert!(!l.iter().any(|c| c.line == 3), "untouched row 3 must not be: {d2:?}");
+            }
+            _ => panic!("expected Lines, got {d2:?}"),
+        }
+        assert_eq!(resolved, resolve_full(&t, &palette));
     }
 }

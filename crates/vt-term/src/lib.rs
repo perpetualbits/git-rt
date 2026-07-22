@@ -227,6 +227,115 @@ pub enum MouseMode {
     Motion,
 }
 
+/// A damaged (needs-redraw) span on one visible row: columns `left..=right` inclusive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LineDamage {
+    pub line: usize,
+    pub left: usize,
+    pub right: usize,
+}
+
+/// What changed on the visible grid since the last [`take_damage`](Term::take_damage).
+/// `Full` means "redraw everything" (structural change: scroll, resize, screen clear, alt
+/// switch, reset, or a scrollback-view change); `Spans` lists the dirty column range of each
+/// changed row. It is a conservative *superset* of the cells that actually changed — a cell
+/// rewritten with the same value, or the cells the cursor moved between, are included.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Damage {
+    Full,
+    Spans(Vec<LineDamage>),
+}
+
+/// Accumulates per-frame visible-grid damage: one dirty column span per row plus a `full`
+/// short-circuit. Mutation sites call [`cell`](GridDamage::cell)/[`span`](GridDamage::span)/
+/// [`rows`](GridDamage::rows)/[`mark_full`](GridDamage::mark_full); the render path drains it
+/// once per frame. Out-of-range marks are ignored so callers need not bounds-check.
+#[derive(Clone)]
+struct GridDamage {
+    full: bool,
+    cols: usize,
+    dirty: Vec<Option<(usize, usize)>>, // per visible row: Some(left, right)
+    last_cursor: Option<(usize, usize)>, // (row, col) of the cursor at the previous drain
+}
+impl GridDamage {
+    fn new(cols: usize, rows: usize) -> Self {
+        // A fresh terminal has never been rendered → the first frame is Full.
+        Self { full: true, cols, dirty: vec![None; rows], last_cursor: None }
+    }
+    #[inline]
+    fn cell(&mut self, row: usize, col: usize) {
+        if self.full || row >= self.dirty.len() || col >= self.cols {
+            return;
+        }
+        match &mut self.dirty[row] {
+            Some((l, r)) => {
+                if col < *l {
+                    *l = col;
+                }
+                if col > *r {
+                    *r = col;
+                }
+            }
+            slot @ None => *slot = Some((col, col)),
+        }
+    }
+    #[inline]
+    fn span(&mut self, row: usize, left: usize, right: usize) {
+        if self.full || row >= self.dirty.len() || left > right || self.cols == 0 {
+            return;
+        }
+        let right = right.min(self.cols - 1);
+        match &mut self.dirty[row] {
+            Some((l, r)) => {
+                if left < *l {
+                    *l = left;
+                }
+                if right > *r {
+                    *r = right;
+                }
+            }
+            slot @ None => *slot = Some((left, right)),
+        }
+    }
+    /// Damage the whole width of rows `from..=to`.
+    fn rows(&mut self, from: usize, to: usize) {
+        if self.cols == 0 {
+            return;
+        }
+        let last = self.cols - 1;
+        for r in from..=to {
+            self.span(r, 0, last);
+        }
+    }
+    fn mark_full(&mut self) {
+        self.full = true;
+    }
+    /// A geometry change is always full damage; resize the per-row vector to match.
+    fn reshape(&mut self, cols: usize, rows: usize) {
+        self.cols = cols;
+        self.dirty = vec![None; rows];
+        self.full = true;
+        self.last_cursor = None;
+    }
+    /// Drain and reset, returning the frame's damage.
+    fn drain(&mut self) -> Damage {
+        if self.full {
+            self.full = false;
+            for d in &mut self.dirty {
+                *d = None;
+            }
+            return Damage::Full;
+        }
+        let mut spans = Vec::new();
+        for (line, d) in self.dirty.iter_mut().enumerate() {
+            if let Some((left, right)) = d.take() {
+                spans.push(LineDamage { line, left, right });
+            }
+        }
+        Damage::Spans(spans)
+    }
+}
+
 /// The terminal. Feed bytes with [`feed`](Term::feed); read state via the accessors.
 pub struct Term {
     cols: usize,
@@ -288,6 +397,9 @@ pub struct Term {
     bracketed_paste: bool,
     /// Pending window title set via OSC 0/2, consumed by [`take_title`](Term::take_title).
     title: Option<String>,
+    /// Per-frame visible-grid damage, marked at every mutation and drained by
+    /// [`take_damage`](Term::take_damage) so a renderer redraws only changed cells.
+    damage: GridDamage,
     parser: Parser,
 }
 
@@ -326,6 +438,7 @@ impl Term {
             alt_scroll: false,
             bracketed_paste: false,
             title: None,
+            damage: GridDamage::new(cols, rows),
             parser: Parser::new(),
         }
     }
@@ -349,6 +462,8 @@ impl Term {
         // Reflow rebuilds scrollback; snap the view to the bottom rather than track a
         // now-ambiguous scroll position (matching most terminals' resize behaviour).
         self.display_offset = 0;
+        // A geometry change is full damage; resize the per-row damage vector to match.
+        self.damage.reshape(self.cols, self.rows);
     }
 
     /// Resize the grid. alacritty always adjusts the line count first (a pure row move
@@ -514,6 +629,35 @@ impl Term {
     pub fn cell(&self, row: usize, col: usize) -> Cell {
         self.grid[row][col]
     }
+    /// Drain and reset the accumulated damage since the last call — the visible cells that
+    /// changed and must be redrawn. Call once per rendered frame.
+    pub fn take_damage(&mut self) -> Damage {
+        // Viewing scrollback: the visible grid is history, not the live grid the marks track
+        // (and a scroll while anchored may or may not shift the view), so redraw it wholesale.
+        // Reading scrolled-back output is static and not perf-critical.
+        if self.display_offset != 0 {
+            self.damage.full = false;
+            for d in &mut self.damage.dirty {
+                *d = None;
+            }
+            self.damage.last_cursor = None;
+            return Damage::Full;
+        }
+        // The cursor is a drawn overlay: when it moves, redraw the cell it left AND the cell
+        // it entered, even if neither's content changed. (The brute-force grid diff misses
+        // this; native tracking gets it right.)
+        let cursor = self.show_cursor.then_some((self.row, self.col));
+        if cursor != self.damage.last_cursor {
+            if let Some((r, c)) = self.damage.last_cursor {
+                self.damage.cell(r, c);
+            }
+            if let Some((r, c)) = cursor {
+                self.damage.cell(r, c);
+            }
+        }
+        self.damage.last_cursor = cursor;
+        self.damage.drain()
+    }
     /// Cursor `(col, row)`.
     pub fn cursor(&self) -> (usize, usize) {
         (self.col, self.row)
@@ -580,10 +724,17 @@ impl Term {
     /// scrollable range. The alt screen has no scrollback, so this is a no-op there.
     pub fn scroll_display(&mut self, delta: i32) {
         let max = self.history_size() as i32;
+        let old = self.display_offset;
         self.display_offset = (self.display_offset as i32 + delta).clamp(0, max) as usize;
+        if self.display_offset != old {
+            self.damage.mark_full(); // the whole viewport shows different lines
+        }
     }
     /// Snap the view back to the bottom (live output).
     pub fn scroll_to_bottom_view(&mut self) {
+        if self.display_offset != 0 {
+            self.damage.mark_full();
+        }
         self.display_offset = 0;
     }
     /// The cell at absolute line `abs` (visible lines `0..rows`, history negative down to
@@ -693,6 +844,7 @@ impl Term {
     fn scroll_up(&mut self, n: usize) {
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(b - t + 1);
+        self.damage.rows(t, b); // every row in the region shifts content
         // History grows only for a top-anchored scroll on the primary screen (matching
         // alacritty's `scroll_up`: history increases iff `region.start == 0`; the alt
         // screen has no scrollback).
@@ -724,6 +876,7 @@ impl Term {
     fn scroll_down(&mut self, n: usize) {
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(b - t + 1);
+        self.damage.rows(t, b); // every row in the region shifts content
         self.grid[t..=b].rotate_right(n);
         let blank = self.blank();
         for r in t..(t + n) {
@@ -761,6 +914,7 @@ impl Term {
         let c = map_charset(self.charsets[self.gl], c);
         let (fg, bg, flags) = (self.pen.fg, self.pen.bg, self.pen.flags & ATTR_MASK);
         self.grid[self.row][self.col] = Cell { c, fg, bg, flags };
+        self.damage.cell(self.row, self.col);
     }
 
     /// Write a wide-glyph spacer at the cursor: a blank that carries the pen colours/
@@ -779,6 +933,7 @@ impl Term {
         self.clear_wide_left_impl(leading);
         let (fg, bg, flags) = (self.pen.fg, self.pen.bg, (self.pen.flags & ATTR_MASK) | SPACER);
         self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, flags };
+        self.damage.cell(self.row, self.col);
     }
 
     /// Clear the cells related to a wide glyph before overwriting the cursor cell — a
@@ -801,9 +956,11 @@ impl Term {
         if wide && self.col + 1 < self.cols {
             // Overwriting the wide glyph: drop its trailing spacer to the right.
             self.grid[self.row][self.col + 1].flags &= !SPACER;
+            self.damage.cell(self.row, self.col + 1);
         } else if blank_left && self.col > 0 && cur.spacer() && char_width(self.grid[self.row][self.col - 1].c) == 2 {
             // Overwriting a trailing spacer: blank the wide glyph to its left.
             self.grid[self.row][self.col - 1].c = ' ';
+            self.damage.cell(self.row, self.col - 1);
         }
         // Overwriting a wrapped wide glyph (now at column 0/1): clear the leading spacer it
         // left in the PREVIOUS physical row's last column. That row is the row above in the
@@ -818,18 +975,25 @@ impl Term {
         if self.col <= 1 && (char_width(cur.c) == 2 || cur.spacer()) {
             let cols = self.cols;
             let last = cols - 1;
-            let prev: Option<&mut Line> = if self.row > 0 {
+            let on_visible_prev = self.row > 0;
+            let prev: Option<&mut Line> = if on_visible_prev {
                 Some(&mut self.grid[self.row - 1])
             } else {
                 self.history.back_mut()
             };
+            let mut cleared = false;
             if let Some(prev) = prev {
                 if prev.cells.len() >= cols
                     && prev.cells[last].spacer()
                     && (cols < 2 || char_width(prev.cells[cols - 2].c) != 2)
                 {
                     prev.cells[last].flags &= !SPACER;
+                    cleared = true;
                 }
+            }
+            // Only the visible-grid previous row needs damage; a cleared history cell is off-screen.
+            if cleared && on_visible_prev {
+                self.damage.cell(self.row - 1, last);
             }
         }
     }
@@ -838,6 +1002,7 @@ impl Term {
     /// can rejoin it, then move to column 0 of the next line and clear the pending wrap.
     fn soft_wrap(&mut self) {
         self.grid[self.row][self.cols - 1].flags |= WRAPLINE;
+        self.damage.cell(self.row, self.cols - 1);
         self.col = 0;
         self.line_feed();
         self.pending_wrap = false;
@@ -942,6 +1107,7 @@ impl Term {
         for c in lo..=hi {
             self.grid[self.row][c] = blank;
         }
+        self.damage.span(self.row, lo, hi);
     }
     fn erase_in_display(&mut self, mode: u16) {
         let blank = self.blank();
@@ -954,10 +1120,12 @@ impl Term {
                     for r in 0..self.row {
                         self.fill_row(r, blank);
                     }
+                    self.damage.rows(0, self.row - 1);
                 }
                 for c in 0..=self.col {
                     self.grid[self.row][c] = blank;
                 }
+                self.damage.span(self.row, 0, self.col);
             }
             2 => {
                 // ED-All = alacritty's clear_viewport: on the PRIMARY screen the used
@@ -982,6 +1150,7 @@ impl Term {
                 for r in 0..self.rows {
                     self.fill_row(r, blank);
                 }
+                self.damage.mark_full();
             }
             3 => {
                 // ED-Saved: clear scrollback. Keep the byte accounting and viewport in step
@@ -989,22 +1158,33 @@ impl Term {
                 // pushes get evicted prematurely. [review RT-TERM-002]
                 self.history.clear();
                 self.history_bytes = 0;
+                if self.display_offset != 0 {
+                    self.damage.mark_full(); // the scrolled-back view was history that is gone
+                }
                 self.display_offset = 0;
             }
             _ => {
                 for c in self.col..self.cols {
                     self.grid[self.row][c] = blank;
                 }
+                self.damage.span(self.row, self.col, self.cols - 1);
                 for r in (self.row + 1)..self.rows {
                     self.fill_row(r, blank);
+                }
+                if self.row + 1 < self.rows {
+                    self.damage.rows(self.row + 1, self.rows - 1);
                 }
             }
         }
     }
     fn erase_chars(&mut self, n: usize) {
         let blank = self.blank();
-        for c in self.col..(self.col + n).min(self.cols) {
+        let end = (self.col + n).min(self.cols);
+        for c in self.col..end {
             self.grid[self.row][c] = blank;
+        }
+        if end > self.col {
+            self.damage.span(self.row, self.col, end - 1);
         }
     }
 
@@ -1019,6 +1199,7 @@ impl Term {
         for c in self.col..self.col + n {
             row[c] = blank;
         }
+        self.damage.span(self.row, self.col, self.cols - 1); // cursor..edge all shifted
     }
     fn delete_chars(&mut self, count: usize) {
         // Matches alacritty: the count is clamped to the FULL width (not cols−col), and
@@ -1034,6 +1215,7 @@ impl Term {
         for c in (cols - count)..cols {
             self.grid[self.row][c] = blank;
         }
+        self.damage.span(self.row, start, cols - 1); // cursor..edge all shifted/blanked
     }
     fn insert_lines(&mut self, n: usize) {
         if self.row < self.scroll_top || self.row > self.scroll_bottom {
@@ -1046,6 +1228,7 @@ impl Term {
         for r in top..(top + n) {
             self.fill_row(r, blank);
         }
+        self.damage.rows(top, b); // rows top..=bottom all shifted
     }
     fn delete_lines(&mut self, n: usize) {
         if self.row < self.scroll_top || self.row > self.scroll_bottom {
@@ -1058,6 +1241,7 @@ impl Term {
         for r in (b + 1 - n)..=b {
             self.fill_row(r, blank);
         }
+        self.damage.rows(top, b); // rows top..=bottom all shifted
     }
 
     // ── SGR ───────────────────────────────────────────────────────────────────
@@ -1174,6 +1358,9 @@ impl Term {
     }
 
     fn swap_alt(&mut self, to_alt: bool) {
+        if to_alt != self.alt {
+            self.damage.mark_full(); // the whole screen is replaced
+        }
         if to_alt && !self.alt {
             let saved = std::mem::replace(&mut self.grid, (0..self.rows).map(|_| Line::blank(self.cols)).collect());
             // Designations (G0–G3) are part of the cursor → saved and restored across the
@@ -1563,6 +1750,7 @@ impl Perform for Term {
             // exact position (clearing the trailing spacer to the right and the leading
             // spacer on the previous row). Missing this left a stray spacer that reflow
             // misclassified — the wide-glyph column-shift divergence in the fast path.
+            let seg_start = self.col;
             let mut col = self.col;
             let mut hit_wide = false;
             {
@@ -1583,6 +1771,9 @@ impl Perform for Term {
                     }
                 }
                 row.occ = row.occ.max(col); // one bump for the whole segment
+            }
+            if col > seg_start {
+                self.damage.span(self.row, seg_start, col - 1); // the bulk-written cells
             }
             self.col = col;
             // A width-1 glyph that lands on the last column, or on a wide-structured cell,
