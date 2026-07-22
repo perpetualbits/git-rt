@@ -308,15 +308,35 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // Make sure the PTY is terminated properly.
+        let pid = self.child.id() as i32;
+        // Ask the child to hang up.
         unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGHUP);
+            libc::kill(pid, libc::SIGHUP);
         }
 
         // Clear signal-hook handler.
         unregister_signal(self.sig_id);
 
-        let _ = self.child.wait();
+        // rt: do NOT block the GUI thread forever on a child that ignores SIGHUP (a trap
+        // handler, a nohup'd process). Poll for a short grace period, then SIGKILL and
+        // reap — closing a pane must never hang the whole app. A child already reaped
+        // elsewhere (our SIGCHLD/try_wait path) makes try_wait return Ok(Some)/Err here.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return, // reaped, or already gone / not ours
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                        let _ = self.child.wait(); // dies promptly now
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
     }
 }
 
