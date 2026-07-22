@@ -55,6 +55,11 @@ pub struct VtPane {
     /// Set once the child's exit has been reported, so the EOF reader and the SIGCHLD poll
     /// don't each emit a duplicate `Exited`.
     exited: Arc<AtomicBool>,
+    /// The child's exit status (`$?`-style: code, or `128 + signal`), learned when
+    /// `next_child_event` reaps it. The EOF reader can't know the status, so it emits
+    /// `Exited(None)`; once this is known, `drain_events` upgrades that queued event with
+    /// the real code — so a pane that died on master-EOF still surfaces its status.
+    exit_code: Mutex<Option<i32>>,
     /// Set by the reader thread when new bytes have been applied (drives redraw).
     dirty: Arc<AtomicBool>,
     /// The grid as of the last `render_snapshot`, diffed against the next to compute
@@ -133,7 +138,9 @@ impl VtPane {
         // Emit `Exited` at most once across the EOF reader and the SIGCHLD poll.
         let post_exit = move |q: &Mutex<VecDeque<PaneEvent>>, flag: &AtomicBool| {
             if !flag.swap(true, Ordering::AcqRel) {
-                q.lock().unwrap().push_back(PaneEvent::Exited);
+                // The reader only sees master EOF, not the child's status; emit an
+                // unknown-status exit that `drain_events` upgrades once it reaps the code.
+                q.lock().unwrap().push_back(PaneEvent::Exited(None));
             }
         };
         let reader = std::thread::spawn(move || {
@@ -181,6 +188,7 @@ impl VtPane {
             pty: Mutex::new(pty),
             events,
             exited,
+            exit_code: Mutex::new(None),
             dirty,
             last_render: Mutex::new(Vec::new()),
             _reader: reader,
@@ -521,12 +529,29 @@ impl VtPane {
         // `next_child_event` does a non-blocking read of the signal pipe and `try_wait()`s
         // the child, so this also clears zombies promptly rather than only at drop.
         if let Ok(mut pty) = self.pty.lock() {
-            if let Some(tty::ChildEvent::Exited(_)) = pty.next_child_event() {
+            if let Some(tty::ChildEvent::Exited(status)) = pty.next_child_event() {
+                let code = status.and_then(crate::exit_code); // authoritative $?-style status
+                if code.is_some() {
+                    *self.exit_code.lock().unwrap() = code; // remember for the EOF-race upgrade
+                }
                 if !self.exited.swap(true, Ordering::AcqRel) {
-                    self.events.lock().unwrap().push_back(PaneEvent::Exited);
+                    self.events.lock().unwrap().push_back(PaneEvent::Exited(code));
                 }
             }
         }
-        self.events.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+        let mut out: Vec<PaneEvent> =
+            self.events.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
+        // If the EOF reader queued an unknown-status exit but we've since reaped the code,
+        // fill it in so the pane surfaces the real status.
+        if let Some(code) = *self.exit_code.lock().unwrap() {
+            for e in &mut out {
+                if let PaneEvent::Exited(c) = e {
+                    if c.is_none() {
+                        *c = Some(code);
+                    }
+                }
+            }
+        }
+        out
     }
 }

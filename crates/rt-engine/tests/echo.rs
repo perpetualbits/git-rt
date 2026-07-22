@@ -68,7 +68,7 @@ fn input_round_trips_through_the_shell() {
 }
 
 /// When the child shell exits on its own (Ctrl-D / `exit`), the engine must
-/// surface a `PaneEvent::Exited` so the GUI can close the pane. This is the
+/// surface a `PaneEvent::Exited(_)` so the GUI can close the pane. This is the
 /// engine half of the "pane stays open after bash exits" fix.
 #[test]
 fn child_exit_emits_exited_event() {
@@ -86,11 +86,11 @@ fn child_exit_emits_exited_event() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got_exit = false;
     while Instant::now() < deadline {
-        if pane.drain_events().iter().any(|e| matches!(e, PaneEvent::Exited)) {
+        if pane.drain_events().iter().any(|e| matches!(e, PaneEvent::Exited(_))) {
             got_exit = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(got_exit, "engine did not emit PaneEvent::Exited after the shell exited");
+    assert!(got_exit, "engine did not emit PaneEvent::Exited(_) after the shell exited");
 }

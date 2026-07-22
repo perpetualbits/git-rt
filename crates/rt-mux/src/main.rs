@@ -797,7 +797,7 @@ impl Mux {
                         PaneEvent::Title(t) => {
                             self.titles.insert(id, t); // update the titlebar text
                         }
-                        PaneEvent::Exited => exited.push(id), // shell exited: close later
+                        PaneEvent::Exited(_) => exited.push(id), // shell exited: close later
                         PaneEvent::Wakeup => {
                             // New output was parsed → one unit of activity for the
                             // border flow (the honest, zero-cost throughput proxy).

@@ -2078,13 +2078,23 @@ impl ApplicationHandler for App {
         // pane whose shell exited is collected for closing after the loop (we
         // can't mutate the session while iterating its panes).
         let mut dirty = false; // did anything change this tick?
-        let mut exited: Vec<rt_core::PaneId> = Vec::new(); // panes whose shell died
+        let mut exited: Vec<rt_core::PaneId> = Vec::new(); // panes whose shell died cleanly (reap)
+        let mut nonzero_exits: Vec<(rt_core::PaneId, i32)> = Vec::new(); // died abnormally (keep + badge)
         let mut titles: Vec<(rt_core::PaneId, String)> = Vec::new(); // pending title updates
         for id in active.session.tree().all_panes() {
             if let Some(pane) = active.session.pane(id) {
                 for ev in pane.drain_events() {
                     match ev {
-                        rt_engine::PaneEvent::Exited => exited.push(id), // reap this pane
+                        rt_engine::PaneEvent::Exited(code) => match code {
+                            // Abnormal exit (non-zero code / signal): keep the pane so its
+                            // final output stays visible, and badge its header with the
+                            // status. A clean exit (0) or unknown status auto-closes below.
+                            Some(n) if n != 0 => {
+                                nonzero_exits.push((id, n));
+                                dirty = true;
+                            }
+                            _ => exited.push(id), // reap this pane
+                        },
                         rt_engine::PaneEvent::Title(t) => {
                             titles.push((id, t)); // apply after the loop (needs &mut session)
                             dirty = true;
@@ -2117,6 +2127,20 @@ impl ApplicationHandler for App {
                 .map(|t| format!("{t} — rt")) // suffix so it's identifiable
                 .unwrap_or_else(|| "rt".to_string());
             active.window.set_title(&win_title);
+        }
+        // Badge the header of every pane that died abnormally, so a crashed shell (or a
+        // non-zero build) is visible at a glance instead of the pane silently vanishing.
+        // Applied after the title updates above so it wins for this tick.
+        for (id, code) in nonzero_exits {
+            let base = active.session.title_of(id).unwrap_or("").to_string();
+            let badged = if base.contains("[exited") {
+                base // already tagged (shouldn't happen: Exited fires once)
+            } else if base.is_empty() {
+                format!("[exited {code}]")
+            } else {
+                format!("{base} [exited {code}]")
+            };
+            active.session.set_title(id, badged);
         }
         // Close every pane whose child exited. If that empties the window, quit.
         for id in exited {

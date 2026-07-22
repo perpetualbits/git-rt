@@ -40,6 +40,14 @@ pub const DEFAULT_SCROLLBACK: usize = 10_000;
 /// can't hold. Computed from the real type so it tracks upstream changes.
 pub const CELL_BYTES: usize = std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
 
+/// Map a child `ExitStatus` to the status a shell reports in `$?`: the exit code, or
+/// `128 + signal` for a signal death (so a segfault reads as 139, like bash). `None` only
+/// when neither is available.
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().or_else(|| status.signal().map(|s| 128 + s))
+}
+
 /// High-level events a pane can surface to the GUI, distilled from
 /// `alacritty_terminal`'s richer event enum down to what rt's UI actually acts
 /// on. Draining these (via [`AlacPane::drain_events`]) replaces Terminator's
@@ -51,8 +59,11 @@ pub enum PaneEvent {
     /// The terminal bell rang (we render a visible-bell flash, never a
     /// fire-later GTK timeout — see TERMINATOR_BUGS.md #2).
     Bell,
-    /// The child process exited; the GUI should close this pane.
-    Exited,
+    /// The child process exited. The payload is its status as a shell would report it
+    /// (`$?`): the exit code, or `128 + signal` for a signal death, or `None` when the
+    /// status is unknown (the pty closed but the child wasn't reaped by us). A clean exit
+    /// (`Some(0)` / `None`) closes the pane; a non-zero status keeps it open with a notice.
+    Exited(Option<i32>),
     /// New grid content is available; the GUI should schedule a redraw.
     Wakeup,
 }
@@ -267,7 +278,7 @@ impl EventListener for Proxy {
             AlacEvent::Wakeup => self.push(PaneEvent::Wakeup),
             // The child process exited (shell `exit`/`quit`/Ctrl-D). Tell the
             // GUI so it closes this pane — otherwise a dead shell lingers.
-            AlacEvent::ChildExit(_status) => self.push(PaneEvent::Exited),
+            AlacEvent::ChildExit(status) => self.push(PaneEvent::Exited(exit_code(status))),
             // The terminal wants to send bytes back to the program (query
             // replies, bracketed-paste acks, etc.). Forward to the PTY.
             AlacEvent::PtyWrite(text) => {
@@ -1190,7 +1201,7 @@ mod vtpane_tests {
         .expect("spawn");
         let mut saw_exit = false;
         for _ in 0..300 {
-            if pane.drain_events().iter().any(|e| matches!(e, PaneEvent::Exited)) {
+            if pane.drain_events().iter().any(|e| matches!(e, PaneEvent::Exited(_))) {
                 saw_exit = true;
                 break;
             }
@@ -1232,7 +1243,7 @@ mod vtpane_tests {
             }
             for e in pane.drain_events() {
                 match e {
-                    PaneEvent::Exited => saw_exit = true,
+                    PaneEvent::Exited(_) => saw_exit = true,
                     PaneEvent::Title(t) if t == "VT TITLE" => saw_title = true,
                     _ => {}
                 }
