@@ -5,15 +5,18 @@ oracle. The Phase-3 process (see `docs/own-engine-plan.md`) is to drive this lis
 empty (or to *intentional*, documented differences) under the `vt-conformance` harness.
 Each entry: what diverges, the measured impact, and the plan.
 
-Status snapshot (2026-07-21):
+Status snapshot (2026-07-22):
 - Spec cases (`spec.rs`, 32 cases): **PASS** against vt-term.
 - Curated differential (`vtterm_diff.rs`, 16 scripts): **PASS**.
 - Random-fuzz FULL differential (`vtterm_fuzz.rs`, 8000 scripts) — grid, cursor, modes,
   AND scrollback history: **0 divergences** (verified 0/10000 in a wider sweep). Locked
   in as a test, green on x86_64 and riscv64.
+- Random-**resize** differential (`vtterm_reflow.rs`, 3000 scripts) — reflow on grow/shrink
+  of both dims incl. wide glyphs and scrollback: **0 divergences** (verified 0/20000 in a
+  wider sweep). Ceiling locked at 0.
 
-**vt-term now matches the vendored oracle exactly on every fuzzed input.** The open
-items below are not-yet-exercised features (nothing in the fuzz reaches them yet).
+**vt-term now matches the vendored oracle exactly on every fuzzed input, resize included.**
+The open items below are not-yet-exercised features (nothing in the fuzz reaches them yet).
 
 ### Fixed under the harness (2026-07-21)
 Four alacritty behaviours the differential fuzz surfaced, each traced to a minimal
@@ -84,32 +87,43 @@ cursor through the exact split arithmetic (`Point::sub`/`grid_clamp`). Investiga
 Line-count changes (`grow_lines`/`shrink_lines`) keep the earlier empirically-derived
 implementation.
 
-Result: **non-resize fuzz unchanged (0/10000)**; the random-resize sweep matches the oracle
-on **~95%** (≈156/3000 diverge, down from ~242 with the logical-line reimplementation and
-~1050 with truncate/extend). Cursor-only divergences dropped 58→20 (the port's inline
-cursor arithmetic). Guarded by `tests/vtterm_reflow.rs`. Remaining divergences, to drive to
-zero:
+Result: **reflow now matches the oracle exactly — 0/3000 (verified 0/20000 in a wider
+sweep), non-resize fuzz still 0/10000** (down from ≈156/3000, ~242 with the logical-line
+reimplementation, ~1050 with truncate/extend). The reflow ceiling in `tests/vtterm_reflow.rs`
+is **0** — a strict regression guard.
 
-- **Wide-glyph reflow edges — root-caused and largely fixed (156/3000 → 28/3000,
-  2026-07-22).** The one-column shift around a wide glyph at a wrap boundary was NOT in the
-  reflow code at all (the earlier "leading-spacer inference" diagnosis was wrong — the
-  inference is provably always correct). It was in the **cell-overwrite path**:
-  `clear_wide_left` ported only part of alacritty's `write_at_cursor` cleanup and skipped
-  the *"remove leading spacers"* step. When a narrow glyph overwrites a wide glyph that had
-  autowrapped to the start of a continuation row, alacritty clears the leading spacer in the
-  *previous* row's last column; vt-term left it, so column reflow later misclassified the
-  stray spacer (repro `"VXEKSWNANACVKWRm\x1b[5C界世\rX"` 24×8→21×18: oracle `界··X`, vt-term
-  `界·X`). Fixed by porting that case, guarded so our single `SPACER` bit only clears a
-  *leading* spacer (predecessor at `cols-2` not wide) and never orphans a trailing one.
-  Then the sibling *trailing* `WIDE_CHAR_SPACER` clear (alacritty `term/mod.rs:998`) and
-  CHT/CBT (`ESC[I`/`ESC[Z`, which were unimplemented — a real cursor gap) were added:
-  **156/3000 → 24/3000 (0.8%)**, non-resize fuzz still 0. **Residual ~24** (20 pure-cell +
-  2 cursor + 2 history): a *distinct, deeper* set — a one-cell wide-glyph shift in the
-  **grow-columns** path (repro reduces to a wide glyph near the right edge on a 24→25 grow),
-  plus the deepest cursor/overflow arithmetic and two history-count edges. Each is its own
-  investigation; the overwrite-clear family is now closed.
-- **Residual cursor edges (~20).** A few cursor positions still off, in the deepest
-  split/overflow interactions.
+- **Wide-glyph overwrite cleanup — closed (156/3000 → 24 → 0, 2026-07-22).** The residual
+  wide-glyph shifts were never in the reflow code (the earlier "leading-spacer inference"
+  diagnosis was wrong — the inference is provably correct). They were all in the
+  **cell-overwrite path**, `clear_wide_left`, which is vt-term's port of alacritty's
+  `write_at_cursor` cleanup. Three root causes, each found by delta-debugging real fuzz
+  seeds and instrumenting BOTH engines' `grow_columns` + `write_at_cursor` side by side:
+  1. **Cleanup ran at the wrong position.** vt-term called `clear_wide_left` ONCE up front
+     in `put_char`, at the pre-wrap cursor. Alacritty runs `write_at_cursor` at EACH actual
+     write. When a wide glyph autowraps to column 0 of the next row and overwrites a wide
+     glyph there, alacritty's *"remove leading spacers"* step fires at the *post-wrap*
+     position and clears the leading spacer on the previous row; vt-term never reached that
+     position. **Fix:** fold the cleanup into `write_cell`/`write_spacer` so it runs
+     per-write, exactly like `write_at_cursor`; drop the up-front call.
+  2. **The batched-print fast path skipped mid-segment cleanup.** `print_str`'s bulk loop
+     wrote a run of narrow cells with only one `clear_wide_left` at the segment start, so a
+     narrow char landing on a wrapped wide glyph mid-segment (e.g. `C` over `글` at col 1)
+     missed the leading-spacer clear. **Fix:** the loop now defers any cell that still
+     carries wide-glyph structure (a spacer, or a wide glyph) to `put_char`.
+  3. **The leading spacer can live in scrollback.** When the wrapped wide glyph is at the
+     *top* visible row, its leading spacer is on the previous physical row — which is the
+     newest *history* line (alacritty indexes history as negative grid lines, so its
+     `grid[line-1]` reaches into scrollback; vt-term separates `grid` from `history`).
+     `clear_wide_left` bailed at `row == 0`. **Fix:** when on the top row, target
+     `history.back()`.
+  A fourth issue was a *regression* these fixes introduced and then closed: running the
+  cleanup on the trailing-spacer write blanked our own just-written glyph whenever a stale
+  spacer sat under it (alacritty's identical `clear_wide` is safe only because its grid is
+  never stale). **Fix:** the trailing-spacer write skips the "blank the glyph to the left"
+  case (`write_spacer(leading=false)`); the leading-spacer write keeps it (it legitimately
+  cuts a glyph off at the wrap). The 2 cursor and 2 history residuals resolved with the same
+  fixes (they were downstream of the mislaid spacer). The sibling trailing `WIDE_CHAR_SPACER`
+  clear and CHT/CBT (`ESC[I`/`ESC[Z`) added earlier remain.
 
 ### Synchronized updates (DECSET/DECRST 2026) — implemented (2026-07-21)
 

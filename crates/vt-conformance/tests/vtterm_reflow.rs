@@ -42,11 +42,12 @@ fn curated_reflow_matches_oracle() {
 #[test]
 fn reflow_fuzz_rate_within_ceiling() {
     const N: u64 = 3000;
-    // Current rate ~0.8% (24/3000) after porting alacritty's wide-glyph overwrite cleanup
-    // (leading + trailing spacer clears) and adding CHT/CBT (was 5.2%). Guard a little above
-    // it so noise doesn't flake, but tight enough to catch a real regression. Drive this
-    // DOWN as edges are fixed; never raise it.
-    const CEILING: usize = 30; // ~1.0% of N; residual is grow-path wide-glyph + cursor edges (ledger)
+    // Now 0/3000 (verified 0/20000 in a wider sweep) after making the wide-glyph overwrite
+    // cleanup run at the ACTUAL write position — per-write inside `write_cell`/`write_spacer`
+    // like alacritty's `write_at_cursor` — with the leading-spacer clear reaching into
+    // scrollback and the fast path deferring wide overwrites (was 24/3000). The ceiling is a
+    // strict regression guard: any divergence now fails. Never raise it.
+    const CEILING: usize = 0;
     let mut div = 0;
     for seed in 0..N {
         let s = gen_script(seed, 100);

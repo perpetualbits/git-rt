@@ -12,8 +12,8 @@
 > | RT-CONF-001 unvalidated settings | **Fixed** — `Settings::normalize()` clamps opacity/font/scrollback + rejects non-finite after load; `save()` is now atomic (temp+rename). Test added. |
 > | RT-TERM-001 RIS resets policy | **Fixed** — scrollback line/byte caps preserved across RIS. Test added. |
 > | RT-TERM-002 ED 3 stale accounting | **Fixed** — `history_bytes`/`display_offset` reset with the history. Test added. |
-> | RT-PERF-001 reflow amplification | **Open** — real; needs a move-not-clone reflow refactor + peak-RSS benchmarking. |
-> | RT-PERF-002 snapshot copies | **Open** — documented tradeoff (vt-term has no native damage tracking yet). |
+> | RT-PERF-001 reflow amplification | **Fixed** — `reflow_columns` now MOVES rows in/out instead of cloning them 3× (input clone + both output clones eliminated). Benched with a 60k-line×200-col history: transient spike 611→186 MiB, peak RSS 807→382 MiB, resize latency 232→75 ms (x86_64); on milkv (riscv, slow allocator) 1056→304 ms and 407→124 MiB — a full 1-second Mutex-holding stall removed. History line/byte budget still enforced during rebuild. |
+> | RT-PERF-002 snapshot copies | **Fixed** — `VtPane::render_snapshot` shares the captured grid with `last_render` via `Arc` instead of a second deep clone every frame (`Snapshot::rows` is now `Arc<Vec<Vec<SnapCell>>>`; all readers unaffected via `Deref`). Eliminated per-pane-per-frame deep clone measured at 3.1 µs @ 80×24 (negligible) but 130 µs @ 4K 384×108 (~1 ms/frame across 8 panes) → a ~10 ns refcount bump. The damage *diff* stays O(rows×cols); native damage tracking (bigger change) left as a follow-up. |
 > | RT-PRIV-001 full URLs logged | **Fixed** — logs redacted scheme+host only. |
 >
 > Thanks to the reviewer — an unusually accurate static review.

@@ -172,10 +172,10 @@ pub struct CellDamage {
 /// for headless assertions in tests. Row-major: `rows[y]` is one screen line.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
-    pub cols: usize,              // number of columns captured
-    pub rows: Vec<Vec<SnapCell>>, // one inner Vec per visible screen line
-    pub cursor: Option<CursorPos>, // cursor location, if visible
-    pub damage: Damage,           // cells changed since the previous rendered frame
+    pub cols: usize,                    // number of columns captured
+    pub rows: Arc<Vec<Vec<SnapCell>>>,  // one inner Vec per visible screen line
+    pub cursor: Option<CursorPos>,      // cursor location, if visible
+    pub damage: Damage,                 // cells changed since the previous rendered frame
 }
 
 impl Snapshot {
@@ -184,7 +184,7 @@ impl Snapshot {
     /// engine actually parsed.
     pub fn to_text(&self) -> String {
         let mut out = String::new(); // accumulates the whole screen as text
-        for row in &self.rows {
+        for row in self.rows.iter() {
             // Build the row string, then trim trailing spaces so blank padding
             // at the end of a line does not defeat `contains` checks in tests.
             let line: String = row.iter().map(|cell| cell.c).collect();
@@ -583,7 +583,7 @@ impl AlacPane {
         } else {
             None // hidden or scrolled back
         };
-        Snapshot { cols, rows: grid, cursor, damage: Damage::default() }
+        Snapshot { cols, rows: Arc::new(grid), cursor, damage: Damage::default() }
     }
 
     /// Like [`snapshot`](Self::snapshot) but also captures the terminal's damage
@@ -901,7 +901,7 @@ impl AlacPane {
             }
             out.push(line); // append this (possibly blank) line
         }
-        Snapshot { cols, rows: out, cursor: None, damage: Damage::default() }
+        Snapshot { cols, rows: Arc::new(out), cursor: None, damage: Damage::default() }
     }
 
     /// Search the whole grid (scrollback history + visible screen) for `needle`,

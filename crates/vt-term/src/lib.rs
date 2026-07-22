@@ -441,30 +441,39 @@ impl Term {
     fn reflow_columns(&mut self, new_cols: usize) {
         let old_cols = self.cols;
         let lines = self.rows;
-        let rows: Vec<Vec<Cell>> = self
-            .grid
-            .iter()
+        // MOVE each row's cells out of grid+history (bottom-indexed, like alacritty's
+        // `take_all`) rather than cloning them — the buffer is reconstructed in place, so a
+        // clone here only doubled the transient footprint (multi-GB with a large history)
+        // and the term Mutex is held the whole time. `std::mem::take` empties the fields;
+        // they are rebuilt below.
+        let rows: Vec<Vec<Cell>> = std::mem::take(&mut self.grid)
+            .into_iter()
             .rev()
-            .map(|l| l.cells.clone())
-            .chain(self.history.iter().rev().map(|l| l.cells.clone()))
+            .map(|l| l.cells)
+            .chain(std::mem::take(&mut self.history).into_iter().rev().map(|l| l.cells))
             .collect();
         let mut cur = RCursor { line: self.row as i32, col: self.col, wrap: self.pending_wrap };
 
-        let nb = if new_cols > old_cols {
+        let mut nb = if new_cols > old_cols {
             grow_columns_impl(rows, new_cols, lines, &mut cur)
         } else {
             shrink_columns_impl(rows, new_cols, lines, self.scrollback_lines, &mut cur)
         };
 
         // `nb` is height-indexed from the bottom: visible = bottom `lines` rows, the rest is
-        // history (newest just above the viewport). Convert back to top-to-bottom.
-        let mut grid: Vec<Vec<Cell>> = nb[..lines].iter().rev().cloned().collect();
+        // history (newest just above the viewport). Split and MOVE (no clone), then convert
+        // each half back to top-to-bottom.
+        let hist_rows = nb.split_off(lines); // nb now = the visible rows (bottom-indexed)
+        let mut grid = nb;
+        grid.reverse();
         for row in &mut grid {
             if row.len() < new_cols {
                 row.resize(new_cols, Cell::default());
             }
         }
-        let mut history: VecDeque<Vec<Cell>> = nb[lines..].iter().rev().cloned().collect();
+        let mut hist_rows = hist_rows; // newest-first; reverse to oldest-first for the deque
+        hist_rows.reverse();
+        let mut history: VecDeque<Vec<Cell>> = hist_rows.into();
         while history.len() > self.scrollback_lines {
             history.pop_front();
         }
@@ -744,15 +753,30 @@ impl Term {
 
     // ── Printing ──────────────────────────────────────────────────────────────
     /// Write `cell` at the cursor with the current pen colours/attrs but the given char.
+    /// Runs `clear_wide_left` at the write position first, mirroring alacritty's
+    /// `write_at_cursor` (which cleans up the cell it is about to overwrite — including the
+    /// leading spacer on the previous row when a wide glyph wraps onto this cell).
     fn write_cell(&mut self, c: char) {
+        self.clear_wide_left();
         let c = map_charset(self.charsets[self.gl], c);
         let (fg, bg, flags) = (self.pen.fg, self.pen.bg, self.pen.flags & ATTR_MASK);
         self.grid[self.row][self.col] = Cell { c, fg, bg, flags };
     }
 
     /// Write a wide-glyph spacer at the cursor: a blank that carries the pen colours/
-    /// attrs and the `spacer` flag.
-    fn write_spacer(&mut self) {
+    /// attrs and the `spacer` flag. Like `write_cell`, it cleans up the overwritten cell
+    /// first (the at-position half of alacritty's `write_at_cursor`).
+    ///
+    /// `leading` distinguishes the two spacer kinds. A *leading* spacer (placed at the last
+    /// column before a wide glyph wraps) may legitimately cut off a wide glyph to its left,
+    /// so it runs the full cleanup — matching alacritty, which `clear_wide`s the cell to the
+    /// left. A *trailing* spacer, however, is written immediately to the right of the wide
+    /// glyph we just placed this same call: the cell to its left is our OWN glyph and must
+    /// never be blanked. (Alacritty avoids this only because its grid is never left in an
+    /// inconsistent state; vt-term's single SPACER bit can leave a stale spacer that would
+    /// otherwise make the trailing-spacer cleanup blank our just-written glyph.)
+    fn write_spacer(&mut self, leading: bool) {
+        self.clear_wide_left_impl(leading);
         let (fg, bg, flags) = (self.pen.fg, self.pen.bg, (self.pen.flags & ATTR_MASK) | SPACER);
         self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, flags };
     }
@@ -766,29 +790,47 @@ impl Term {
     /// column. Missing the last case left a stray spacer that reflow misclassified — the
     /// wide-glyph column-shift divergence.
     fn clear_wide_left(&mut self) {
+        self.clear_wide_left_impl(true);
+    }
+    /// `blank_left`: whether overwriting a trailing spacer may blank the wide glyph to the
+    /// left (case C). True for glyph writes and leading-spacer writes; false when writing a
+    /// wide glyph's own trailing spacer (the left cell is that glyph — see [`write_spacer`]).
+    fn clear_wide_left_impl(&mut self, blank_left: bool) {
         let cur = self.grid[self.row][self.col];
         let wide = char_width(cur.c) == 2;
         if wide && self.col + 1 < self.cols {
             // Overwriting the wide glyph: drop its trailing spacer to the right.
             self.grid[self.row][self.col + 1].flags &= !SPACER;
-        } else if self.col > 0 && cur.spacer() && char_width(self.grid[self.row][self.col - 1].c) == 2 {
+        } else if blank_left && self.col > 0 && cur.spacer() && char_width(self.grid[self.row][self.col - 1].c) == 2 {
             // Overwriting a trailing spacer: blank the wide glyph to its left.
             self.grid[self.row][self.col - 1].c = ' ';
         }
         // Overwriting a wrapped wide glyph (now at column 0/1): clear the leading spacer it
-        // left in the previous row's last column. Missing this left a stray spacer that
-        // column reflow misclassified — the wide-glyph one-column-shift divergence. Our one
-        // SPACER bit can't distinguish a leading spacer from a trailing one (alacritty has
-        // two flags), so only clear it when it is a *leading* spacer: its predecessor is
-        // never a wide glyph (a trailing spacer's is), so `cols-2` not being wide identifies
-        // it — else we would orphan a legitimate wide glyph at `cols-2`.
-        if self.col <= 1
-            && self.row > 0
-            && (char_width(self.grid[self.row][self.col].c) == 2 || self.grid[self.row][self.col].spacer())
-            && self.grid[self.row - 1][self.cols - 1].spacer()
-            && (self.cols < 2 || char_width(self.grid[self.row - 1][self.cols - 2].c) != 2)
-        {
-            self.grid[self.row - 1][self.cols - 1].flags &= !SPACER;
+        // left in the PREVIOUS physical row's last column. That row is the row above in the
+        // visible grid, or — when we're on the top visible row — the newest scrollback line
+        // (alacritty indexes history as negative grid lines, so its `grid[line-1]` reaches
+        // into history there; we index `history.back()` explicitly). Missing this left a
+        // stray spacer that column reflow misclassified — the wide-glyph one-column-shift
+        // divergence. Our one SPACER bit can't distinguish a leading spacer from a trailing
+        // one (alacritty has two flags), so only clear it when it is a *leading* spacer: its
+        // predecessor is never a wide glyph (a trailing spacer's is), so `cols-2` not being
+        // wide identifies it — else we would orphan a legitimate wide glyph at `cols-2`.
+        if self.col <= 1 && (char_width(cur.c) == 2 || cur.spacer()) {
+            let cols = self.cols;
+            let last = cols - 1;
+            let prev: Option<&mut Line> = if self.row > 0 {
+                Some(&mut self.grid[self.row - 1])
+            } else {
+                self.history.back_mut()
+            };
+            if let Some(prev) = prev {
+                if prev.cells.len() >= cols
+                    && prev.cells[last].spacer()
+                    && (cols < 2 || char_width(prev.cells[cols - 2].c) != 2)
+                {
+                    prev.cells[last].flags &= !SPACER;
+                }
+            }
         }
     }
 
@@ -813,13 +855,16 @@ impl Term {
         if self.pending_wrap {
             self.soft_wrap();
         }
-        self.clear_wide_left(); // preserve wide-char pair integrity at the write position
+        // Cleanup of the cell(s) being overwritten is done per-write inside `write_cell`/
+        // `write_spacer` (mirroring alacritty's `write_at_cursor`), so it runs at the ACTUAL
+        // write position — crucially, after a wide glyph autowraps to the next row, where it
+        // must clear the leading spacer it displaced on the previous row.
         if width == 2 {
             // A wide glyph needs two columns. If it would run off the last column, place
             // a blank leading spacer and wrap first (autowrap on), else defer the wrap.
             if self.col + 1 >= self.cols {
                 if self.autowrap {
-                    self.write_spacer(); // leading spacer
+                    self.write_spacer(true); // leading spacer
                     self.soft_wrap();
                 } else {
                     self.pending_wrap = true;
@@ -829,7 +874,7 @@ impl Term {
             self.write_cell(c); // the wide glyph
             if self.col + 1 < self.cols {
                 self.col += 1;
-                self.write_spacer(); // trailing spacer occupying the second cell
+                self.write_spacer(false); // trailing spacer occupying the second cell
             }
         } else {
             self.write_cell(c);
@@ -1510,15 +1555,26 @@ impl Perform for Term {
                 self.soft_wrap();
             }
             self.clear_wide_left();
-            // Fill the row up to (but not including) the last column — none of these hit
-            // the autowrap boundary, and each cell's left neighbour is a narrow glyph we
-            // just wrote, so `clear_wide_left` would be a no-op.
+            // Fill the row up to (but not including) the last column. We may overwrite our
+            // own just-written narrow cells (no cleanup needed), but if a target cell still
+            // carries wide-glyph structure (a spacer, or a wide glyph itself — e.g. a
+            // wrapped wide glyph now at column 0/1, or a half-overwritten pair), defer THAT
+            // char to `put_char` so its `write_at_cursor`-equivalent cleanup runs at the
+            // exact position (clearing the trailing spacer to the right and the leading
+            // spacer on the previous row). Missing this left a stray spacer that reflow
+            // misclassified — the wide-glyph column-shift divergence in the fast path.
             let mut col = self.col;
+            let mut hit_wide = false;
             {
                 let row = &mut self.grid[self.row];
                 while col < cols - 1 {
                     match it.peek() {
                         Some(&c) if char_width(c) == 1 => {
+                            let ex = &row.cells[col];
+                            if ex.flags & SPACER != 0 || char_width(ex.c) == 2 {
+                                hit_wide = true;
+                                break;
+                            }
                             row.cells[col] = Cell { c, fg, bg, flags };
                             col += 1;
                             it.next();
@@ -1529,9 +1585,9 @@ impl Perform for Term {
                 row.occ = row.occ.max(col); // one bump for the whole segment
             }
             self.col = col;
-            // At the last column, the next width-1 glyph needs put_char's edge handling
-            // (write here, then set/defer the pending wrap per DECAWM).
-            if self.col == cols - 1 {
+            // A width-1 glyph that lands on the last column, or on a wide-structured cell,
+            // needs put_char's exact edge/cleanup handling.
+            if hit_wide || self.col == cols - 1 {
                 if let Some(&c) = it.peek() {
                     if char_width(c) == 1 {
                         self.put_char(c);

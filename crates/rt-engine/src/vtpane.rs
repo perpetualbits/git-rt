@@ -81,7 +81,7 @@ pub struct VtPane {
     dirty: Arc<AtomicBool>,
     /// The grid as of the last `render_snapshot`, diffed against the next to compute
     /// precise per-line damage (vt-term has no built-in damage tracking).
-    last_render: Mutex<Vec<Vec<SnapCell>>>,
+    last_render: Mutex<Arc<Vec<Vec<SnapCell>>>>,
     /// Reader thread; detached — it ends on its own when the child closes the PTY.
     _reader: std::thread::JoinHandle<()>,
     cols: usize,
@@ -263,7 +263,7 @@ impl VtPane {
             queued_bytes,
             _writer: writer,
             dirty,
-            last_render: Mutex::new(Vec::new()),
+            last_render: Mutex::new(Arc::new(Vec::new())),
             _reader: reader,
             cols,
             rows,
@@ -379,7 +379,7 @@ impl VtPane {
         } else {
             None
         };
-        Snapshot { cols, rows: grid, cursor, damage: Damage::default() }
+        Snapshot { cols, rows: Arc::new(grid), cursor, damage: Damage::default() }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -410,7 +410,11 @@ impl VtPane {
             }
             Damage::Lines(lines)
         };
-        *last = snap.rows.clone();
+        // Share the freshly-captured grid with `last_render` via the refcount, not a full
+        // deep copy — the returned Snapshot and `last_render` reference the same immutable
+        // rows, so next frame diffs against them without having paid O(rows×cols) to clone
+        // them here (material for 4K grids / many panes / fast output).
+        *last = Arc::clone(&snap.rows);
         Snapshot { cols: snap.cols, rows: snap.rows, cursor: snap.cursor, damage }
     }
 
@@ -469,7 +473,7 @@ impl VtPane {
             }
             out.push(line);
         }
-        Snapshot { cols, rows: out, cursor: None, damage: Damage::default() }
+        Snapshot { cols, rows: Arc::new(out), cursor: None, damage: Damage::default() }
     }
 
     // ── Selection ──────────────────────────────────────────────────────────────
