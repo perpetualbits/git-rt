@@ -49,7 +49,7 @@ edges still being driven to zero.
 
 - **Panes & tabs** — split any way, keyboard- or mouse-driven, Terminator keybindings.
 - **Newspaper columns** — flow one pane's output into side-by-side columns so a wide screen shows *more rows at once*, newspaper-style (`Ctrl+.` / `Ctrl+,`). See below.
-- **Scrollback search** — `Ctrl+Shift+F`; configurable buffer up to 20M lines, with a live memory meter.
+- **Scrollback search** — `Ctrl+Shift+F`; configurable buffer up to 5M lines, held to a per-pane memory budget (oldest-first eviction) with a live memory meter.
 - **Broadcast** — type once, reach a pane group or every pane.
 - **Border instruments** — live gauges on each pane's edge: output flow, CPU heat (blackbody), render latency. Idle-throttled, so they cost nothing when nothing's happening.
 - **Patch-bay** — wire panes' stdin/stdout/stderr to each other via `$RT_OUT` / `$RT_ERR` / `$RT_IN` (real named pipes). The animated wires *are* the bytes.
