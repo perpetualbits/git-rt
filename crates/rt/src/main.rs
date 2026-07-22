@@ -2902,13 +2902,36 @@ impl App {
         }
     }
 
+    /// Redact a URL for logging: keep the scheme and host, elide the path/query/fragment
+    /// (which may carry tokens, signed-URL credentials, or private paths). [review RT-PRIV-001]
+    fn redact_url(url: &str) -> String {
+        if let Some(sep) = url.find("://") {
+            let host_start = sep + 3;
+            let rest = &url[host_start..];
+            let host_end = rest.find(['/', '?', '#']).map_or(url.len(), |i| host_start + i);
+            let more = host_end < url.len();
+            format!("{}{}", &url[..host_end], if more { "/…" } else { "" })
+        } else {
+            // Schemes without `//` (mailto:, tel:, file:/path): show only the scheme.
+            match url.split_once(':') {
+                Some((scheme, rest)) if !rest.is_empty() => format!("{scheme}:…"),
+                _ => "…".to_string(),
+            }
+        }
+    }
+
     /// Open a URL with the desktop's default handler via `xdg-open`, detached so
     /// it never blocks rt. Failures are logged, not fatal (rt's no-crash policy).
     fn open_url(url: &str) {
+        // Log a REDACTED form — a URL from terminal text can carry password-reset tokens,
+        // signed-object credentials, or private paths that must not leak into logs. The full
+        // URL is still passed to xdg-open as a single argv (no shell), which is safe.
+        // [review RT-PRIV-001]
+        let redacted = Self::redact_url(url);
         // Spawn xdg-open without waiting; ignore the handle so it runs detached.
         match std::process::Command::new("xdg-open").arg(url).spawn() {
-            Ok(_) => log::info!("opened URL: {url}"),
-            Err(e) => log::warn!("xdg-open failed for {url}: {e}"),
+            Ok(_) => log::info!("opened URL: {redacted}"),
+            Err(e) => log::warn!("xdg-open failed for {redacted}: {e}"),
         }
     }
 
@@ -3981,14 +4004,27 @@ impl App {
     /// always (even unwired) so a program writing `$RT_OUT` never blocks. Returns
     /// whether any bytes moved (to keep the wire flow animating).
     fn pump_wires(active: &mut Active) -> bool {
+        // Per-tick byte budget across ALL jacks. Without it, a pane writing to `$RT_OUT`
+        // faster than we drain keeps its fd readable forever, so the inner loop never ends
+        // and starves input/rendering/every other pane. When the budget is spent we stop and
+        // return `moved` so the run loop schedules another pump next frame — fair progress
+        // instead of a monopolised event thread. [review RT-SEC-002]
+        const PUMP_BUDGET: usize = 512 * 1024;
         let jacks = active.jacks.clone(); // Rc clone; independent of `active`'s fields
         let src_ids: Vec<rt_core::PaneId> = jacks.borrow().keys().copied().collect();
         let mut moved = false;
         let mut buf = [0u8; 8192];
-        for src in src_ids {
+        let mut budget = PUMP_BUDGET;
+        'pump: for src in src_ids {
             for stream in [Stream::Stdout, Stream::Stderr] {
                 loop {
-                    // Read one chunk from this pane's chosen jack (non-blocking).
+                    if budget == 0 {
+                        moved = true; // more may be waiting; come back next frame
+                        break 'pump;
+                    }
+                    // Read one chunk from this pane's chosen jack (non-blocking), bounded by
+                    // the remaining budget.
+                    let cap = buf.len().min(budget);
                     let n = {
                         let mut jm = jacks.borrow_mut();
                         let Some(j) = jm.get_mut(&src) else { break };
@@ -3996,7 +4032,7 @@ impl App {
                             Stream::Stdout => &mut j.out_read,
                             Stream::Stderr => &mut j.err_read,
                         };
-                        match fd.read(&mut buf) {
+                        match fd.read(&mut buf[..cap]) {
                             Ok(0) => break,
                             Ok(n) => n,
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -4004,13 +4040,21 @@ impl App {
                         }
                     };
                     moved = true;
+                    budget -= n;
                     let chunk = buf[..n].to_vec();
-                    // Fan out to every wire leaving this pane on this stream.
+                    // Fan out to every wire leaving this pane on this stream. The destination
+                    // FIFO is non-blocking, so a slow reader means a short write; use `write`
+                    // (not `write_all`, which would return WouldBlock after a partial write
+                    // and silently drop the rest) and count only bytes actually delivered so
+                    // the flow meter can't over-report. Excess is dropped — the patch-bay is
+                    // explicit best-effort byte wiring, not a guaranteed lossless pipe.
+                    // [review RT-IO-001]
                     for w in active.wires.iter_mut().filter(|w| w.src == src && w.stream == stream) {
                         let mut jm = jacks.borrow_mut();
                         if let Some(dj) = jm.get_mut(&w.dst) {
-                            let _ = dj.in_write.write_all(&chunk); // best-effort
-                            w.moved = w.moved.saturating_add(n as u32);
+                            if let Ok(written) = dj.in_write.write(&chunk) {
+                                w.moved = w.moved.saturating_add(written as u32);
+                            }
                         }
                     }
                 }

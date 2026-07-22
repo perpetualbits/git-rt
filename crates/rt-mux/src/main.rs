@@ -824,29 +824,42 @@ impl Mux {
     /// Reading always happens (even unwired) so a program writing to `$RT_OUT`
     /// never blocks. Returns whether any bytes moved (to keep the loop lively).
     fn pump(&mut self) -> bool {
+        // Per-tick byte budget across all jacks so a pane spewing to `$RT_OUT` can't keep
+        // its fd readable forever and starve the event loop. Spent → stop; the run loop
+        // pumps again next tick. [review RT-SEC-002]
+        const PUMP_BUDGET: usize = 512 * 1024;
         let mut moved = false;
+        let mut budget = PUMP_BUDGET;
         let srcs: Vec<TileId> = self.jacks.keys().copied().collect();
         // Drain both output streams of every pane, tagging which stream.
         for src in srcs {
-            moved |= self.pump_stream(src, Stream::Stdout);
-            moved |= self.pump_stream(src, Stream::Stderr);
+            if budget == 0 {
+                break;
+            }
+            moved |= self.pump_stream(src, Stream::Stdout, &mut budget);
+            moved |= self.pump_stream(src, Stream::Stderr, &mut budget);
         }
         moved
     }
 
-    /// Drain one pane's given output stream jack and fan it to matching wires.
-    fn pump_stream(&mut self, src: TileId, stream: Stream) -> bool {
+    /// Drain one pane's given output stream jack and fan it to matching wires, spending from
+    /// the shared per-tick `budget`.
+    fn pump_stream(&mut self, src: TileId, stream: Stream, budget: &mut usize) -> bool {
         let mut moved = false;
         let mut buf = [0u8; 8192];
         loop {
-            // Read one chunk from the chosen jack (non-blocking).
+            if *budget == 0 {
+                break;
+            }
+            let cap = buf.len().min(*budget);
+            // Read one chunk from the chosen jack (non-blocking), bounded by the budget.
             let n = match self.jacks.get_mut(&src) {
                 Some(j) => {
                     let fd = match stream {
                         Stream::Stdout => &mut j.out_read,
                         Stream::Stderr => &mut j.err_read,
                     };
-                    match fd.read(&mut buf) {
+                    match fd.read(&mut buf[..cap]) {
                         Ok(0) => break, // (O_RDWR means no EOF; treat as "nothing")
                         Ok(n) => n,
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -856,13 +869,17 @@ impl Mux {
                 None => break,
             };
             moved = true;
-            // Fan the chunk to every wire leaving this pane on this stream. (Own
-            // the bytes so the src-jack borrow is released before touching dsts.)
+            *budget -= n;
+            // Fan the chunk to every wire leaving this pane on this stream. (Own the bytes so
+            // the src-jack borrow is released before touching dsts.) Non-blocking `write`
+            // (not `write_all`, which silently drops the suffix after a partial write) and
+            // count only bytes delivered so the meter can't over-report. [review RT-IO-001]
             let chunk = buf[..n].to_vec();
             for w in self.wires.iter_mut().filter(|w| w.src == src && w.stream == stream) {
                 if let Some(dj) = self.jacks.get_mut(&w.dst) {
-                    let _ = dj.in_write.write_all(&chunk); // best-effort; drops if the reader is behind
-                    w.moved = w.moved.saturating_add(n as u32);
+                    if let Ok(written) = dj.in_write.write(&chunk) {
+                        w.moved = w.moved.saturating_add(written as u32);
+                    }
                 }
             }
         }

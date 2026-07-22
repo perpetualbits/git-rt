@@ -21,7 +21,7 @@
 use std::collections::VecDeque;
 use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::WindowSize;
@@ -38,6 +38,14 @@ use crate::{
 /// this, so cranking the line slider to its ceiling can't turn one runaway pane into a
 /// multi-GB allocation. 1 GiB is generous for real scrollback yet bounds the worst case.
 const SCROLLBACK_MEMORY_BUDGET: usize = 1 << 30;
+
+/// Cap on bytes queued to the writer thread but not yet written to the PTY. The channel is
+/// otherwise unbounded, so a child that stops reading stdin while input keeps arriving (a
+/// huge paste, or broadcast, into a stalled program) would grow it without limit — a
+/// memory-exhaustion path. Past this, new input is dropped rather than queued: keystrokes
+/// are tiny and never approach it, so only a pathological paste into a wedged child is
+/// affected, and bounded memory beats OOM. [review RT-SEC-003]
+const WRITE_QUEUE_MAX: usize = 8 << 20; // 8 MiB
 
 /// A pane driven by the in-house `vt_term::Term`.
 pub struct VtPane {
@@ -64,6 +72,9 @@ pub struct VtPane {
     /// writes must NOT run on the GUI thread — they'd freeze the whole app. Sending here is
     /// non-blocking and never drops input (unbounded channel, FIFO order).
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Bytes queued to the writer thread but not yet written, so `write` can enforce
+    /// `WRITE_QUEUE_MAX` and refuse to grow the channel without bound.
+    queued_bytes: Arc<AtomicUsize>,
     /// Writer thread; detached — ends when `input_tx` drops (channel closes).
     _writer: std::thread::JoinHandle<()>,
     /// Set by the reader thread when new bytes have been applied (drives redraw).
@@ -150,6 +161,8 @@ impl VtPane {
             return Err(err);
         }
         let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let queued_w = queued_bytes.clone();
         let writer = std::thread::spawn(move || {
             while let Ok(bytes) = input_rx.recv() {
                 let mut off = 0;
@@ -171,6 +184,7 @@ impl VtPane {
                         _ => break, // EIO / peer gone: drop the rest of this chunk
                     }
                 }
+                queued_w.fetch_sub(bytes.len(), Ordering::AcqRel); // this chunk left the queue
             }
             unsafe { libc::close(write_fd) }; // channel closed (pane dropped): release the dup
         });
@@ -246,6 +260,7 @@ impl VtPane {
             exited,
             crashed,
             input_tx,
+            queued_bytes,
             _writer: writer,
             dirty,
             last_render: Mutex::new(Vec::new()),
@@ -283,12 +298,22 @@ impl VtPane {
         if self.crashed.load(Ordering::Acquire) {
             return;
         }
+        // Refuse to queue past WRITE_QUEUE_MAX: if the child has stalled and the writer
+        // thread can't drain, growing the channel without bound is an OOM path. Dropping
+        // here (rather than blocking, which would re-freeze the GUI) bounds memory; only a
+        // pathological paste into a wedged child ever reaches the cap. (Single writer of
+        // `queued_bytes` — the GUI thread — so the check-then-add needs no CAS.)
+        if self.queued_bytes.load(Ordering::Acquire) + bytes.len() > WRITE_QUEUE_MAX {
+            return;
+        }
+        self.queued_bytes.fetch_add(bytes.len(), Ordering::AcqRel);
         // Hand the bytes to the writer thread and return immediately. The actual
         // (potentially blocking) PTY-master write happens there, never on the GUI thread —
         // a big paste into a child that isn't reading stdin must not freeze the app. The
-        // unbounded FIFO channel preserves order and never drops input (a terminal must
-        // never lose keystrokes). A send error means the writer is gone (pane dropped).
-        let _ = self.input_tx.send(bytes.to_vec());
+        // channel preserves order; a send error means the writer is gone (pane dropped).
+        if self.input_tx.send(bytes.to_vec()).is_err() {
+            self.queued_bytes.fetch_sub(bytes.len(), Ordering::AcqRel); // writer gone; undo
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {

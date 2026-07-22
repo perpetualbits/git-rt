@@ -239,6 +239,33 @@ impl Settings {
         self.background_opacity = (self.background_opacity + delta).clamp(Self::MIN_OPACITY, 1.0);
         self.background_opacity
     }
+
+    /// Clamp deserialized values into their supported ranges. `toml::from_str` bypasses the
+    /// bounds the Preferences UI enforces, so a hand-edited or corrupt file could otherwise
+    /// inject a non-finite/absurd float or an out-of-policy scrollback that later drives
+    /// pathological allocation or invalid rendering state. Each correction is reported.
+    /// [review RT-CONF-001]
+    pub fn normalize(&mut self) {
+        fn clamp_f32(v: &mut f32, lo: f32, hi: f32, default: f32, name: &str) {
+            if !v.is_finite() {
+                eprintln!("rt: config {name} was not finite; using {default}");
+                *v = default;
+            } else if *v < lo || *v > hi {
+                let c = v.clamp(lo, hi);
+                eprintln!("rt: config {name} {v} out of range [{lo}, {hi}]; clamped to {c}");
+                *v = c;
+            }
+        }
+        clamp_f32(&mut self.background_opacity, Self::MIN_OPACITY, 1.0, 1.0, "background_opacity");
+        clamp_f32(&mut self.font_size, 4.0, 200.0, 18.0, "font_size");
+        if self.scrollback > Self::MAX_SCROLLBACK {
+            eprintln!(
+                "rt: config scrollback {} exceeds max {}; clamped",
+                self.scrollback, Self::MAX_SCROLLBACK
+            );
+            self.scrollback = Self::MAX_SCROLLBACK;
+        }
+    }
 }
 
 /// A named colour scheme (foreground + background + 16 ANSI palette), for the
@@ -320,8 +347,11 @@ impl Config {
     pub fn load() -> Self {
         let Some(path) = Self::path() else { return Self::default() };
         match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(cfg) => cfg, // parsed a real config
+            Ok(text) => match toml::from_str::<Config>(&text) {
+                Ok(mut cfg) => {
+                    cfg.settings.normalize(); // clamp hand-edited/corrupt values into range
+                    cfg
+                }
                 Err(e) => {
                     // Malformed file: warn and use defaults rather than crash.
                     eprintln!("rt: ignoring malformed {}: {e}", path.display());
@@ -345,7 +375,12 @@ impl Config {
         // Serialise to TOML; map a serialisation error to an I/O error kind.
         let text = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, text) // atomic enough for a tiny config
+        // Atomic write: a crash mid-`write` would otherwise leave a truncated TOML that
+        // fails to parse next launch and resets every preference. Write a sibling temp file,
+        // then rename over the target (atomic on the same filesystem). [review, hardening #8]
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &path)
     }
 }
 
@@ -448,5 +483,30 @@ impl Keymap {
             .iter()
             .find(|(_, a)| *a == action) // first binding for this action
             .map(|(chord, _)| chord.to_string()) // via the Chord Display impl
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_clamps_out_of_range_and_non_finite() {
+        let mut s = Settings {
+            background_opacity: f32::NAN,          // non-finite -> default 1.0
+            font_size: 100_000.0,                  // absurd -> clamped to 200
+            scrollback: Settings::MAX_SCROLLBACK + 1, // over policy -> clamped
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.background_opacity, 1.0, "non-finite opacity replaced with default");
+        assert_eq!(s.font_size, 200.0, "huge font size clamped to the max");
+        assert_eq!(s.scrollback, Settings::MAX_SCROLLBACK, "scrollback clamped to policy max");
+
+        // A negative opacity clamps up to the minimum; valid values pass through untouched.
+        let mut s2 = Settings { background_opacity: -5.0, font_size: 14.0, ..Settings::default() };
+        s2.normalize();
+        assert_eq!(s2.background_opacity, Settings::MIN_OPACITY);
+        assert_eq!(s2.font_size, 14.0, "an in-range value is left alone");
     }
 }
