@@ -90,11 +90,20 @@ on **~95%** (≈156/3000 diverge, down from ~242 with the logical-line reimpleme
 cursor arithmetic). Guarded by `tests/vtterm_reflow.rs`. Remaining divergences, to drive to
 zero:
 
-- **Wide-glyph reflow edges (~136).** A one-column shift around a wide glyph at a wrap
-  boundary, concentrated where a `CUF` gap / overwrite produced spacers whose exact
-  `WIDE_CHAR_SPACER` vs `LEADING_WIDE_CHAR_SPACER` distinction our single `spacer` flag
-  infers by position rather than stores — the inference occasionally disagrees with
-  alacritty's stored flag. History content itself matches (rows-only resize is exact).
+- **Wide-glyph reflow edges (~128 pure one-cell shifts + ~24 history-count, 2026-07-22).**
+  A one-column shift around a wide glyph at a wrap boundary. **Corrected diagnosis:** the
+  earlier note blamed our single `spacer` flag *inferring* `LEADING_WIDE_CHAR_SPACER` by
+  position (`char_width(prev) != 2`) rather than storing it. This is **wrong** — storing a
+  distinct `LEADING_SPACER` flag was tried and produced *byte-identical* output (still
+  156/3000), because the cell immediately before a leading spacer is *provably never* a
+  wide glyph (a wide glyph there would claim the leading-spacer's own column for its
+  trailing spacer), so the inference is always correct. The real cause is a genuine
+  one-cell divergence in the column-reflow rejoin: minimised to a 28-byte repro
+  `"VXEKSWNANACVKWRm\x1b[5C界世\rX"` resized 24×8→21×18, where the oracle yields `界··X` and
+  vt-term `界·X` (one blank the oracle keeps around the rewrapped wide glyph). `shrink_columns`'s
+  tail is a faithful port and the resize order (lines-then-columns) matches, so the missing
+  cell is upstream — still unidentified; needs instrumenting both engines' `shrink_columns`
+  on the repro. History content itself matches on a rows-only resize.
 - **Residual cursor edges (~20).** A few cursor positions still off, in the deepest
   split/overflow interactions.
 
