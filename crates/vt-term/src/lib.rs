@@ -757,18 +757,36 @@ impl Term {
         self.grid[self.row][self.col] = Cell { c: ' ', fg, bg, flags };
     }
 
-    /// If the cursor cell is the trailing spacer of a wide glyph to its left, overwriting
-    /// it would orphan that glyph — so blank the glyph half (alacritty's `clear_wide`).
+    /// Clear the cells related to a wide glyph before overwriting the cursor cell — a
+    /// faithful port of alacritty's `write_at_cursor` cleanup (`term/mod.rs`), which only
+    /// runs when the cell being overwritten is a wide glyph or one of its spacers. Three
+    /// cases: overwriting the glyph drops its trailing spacer to the right; overwriting a
+    /// trailing spacer blanks the glyph to the left; and overwriting a wrapped wide glyph
+    /// (now at column 0/1) clears the leading spacer it left in the previous row's last
+    /// column. Missing the last case left a stray spacer that reflow misclassified — the
+    /// wide-glyph column-shift divergence.
     fn clear_wide_left(&mut self) {
-        // Only when the cursor cell is a real trailing spacer whose glyph is to its
-        // left (not, e.g., a blank an erase left behind) — matching alacritty, which
-        // keys this off the WIDE_CHAR_SPACER flag. clear_wide only sets c=' ' (the WIDE
-        // flag, here derived from width, then clears); fg/bg/attrs are kept.
+        // Overwriting a trailing spacer: blank the wide glyph to its left.
         if self.col > 0
             && self.grid[self.row][self.col].spacer()
             && char_width(self.grid[self.row][self.col - 1].c) == 2
         {
             self.grid[self.row][self.col - 1].c = ' ';
+        }
+        // Overwriting a wrapped wide glyph (now at column 0/1): clear the leading spacer it
+        // left in the previous row's last column. Missing this left a stray spacer that
+        // column reflow misclassified — the wide-glyph one-column-shift divergence. Our one
+        // SPACER bit can't distinguish a leading spacer from a trailing one (alacritty has
+        // two flags), so only clear it when it is a *leading* spacer: its predecessor is
+        // never a wide glyph (a trailing spacer's is), so `cols-2` not being wide identifies
+        // it — else we would orphan a legitimate wide glyph at `cols-2`.
+        if self.col <= 1
+            && self.row > 0
+            && (char_width(self.grid[self.row][self.col].c) == 2 || self.grid[self.row][self.col].spacer())
+            && self.grid[self.row - 1][self.cols - 1].spacer()
+            && (self.cols < 2 || char_width(self.grid[self.row - 1][self.cols - 2].c) != 2)
+        {
+            self.grid[self.row - 1][self.cols - 1].flags &= !SPACER;
         }
     }
 
