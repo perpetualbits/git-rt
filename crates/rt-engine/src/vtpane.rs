@@ -33,6 +33,12 @@ use crate::{
     SnapCell, Snapshot,
 };
 
+/// Per-pane scrollback memory budget (bytes). The scrollback also honors the user's
+/// configured line count, but evicts oldest-first once a pane's history estimate exceeds
+/// this, so cranking the line slider to its ceiling can't turn one runaway pane into a
+/// multi-GB allocation. 1 GiB is generous for real scrollback yet bounds the worst case.
+const SCROLLBACK_MEMORY_BUDGET: usize = 1 << 30;
+
 /// A pane driven by the in-house `vt_term::Term`.
 pub struct VtPane {
     /// The grid + parser, shared with the reader thread.
@@ -95,7 +101,13 @@ impl VtPane {
         let pid = Some(pty.child().id());
         let pty_fd = pty.reader().as_raw_fd(); // master fd; owned by `pty` for our lifetime
 
-        let term = Arc::new(Mutex::new(vt_term::Term::new(cols, rows)));
+        // Honor the configured scrollback (the vendored backend already did) with a
+        // per-pane memory budget so a large line setting degrades oldest-first rather than
+        // exhausting RAM: with a maxed slider a single pane is capped near
+        // SCROLLBACK_MEMORY_BUDGET, not the multi-GB the raw line count would imply.
+        let mut term = vt_term::Term::new(cols, rows);
+        term.set_scrollback(scrollback, SCROLLBACK_MEMORY_BUDGET);
+        let term = Arc::new(Mutex::new(term));
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let dirty = Arc::new(AtomicBool::new(true));
         let exited = Arc::new(AtomicBool::new(false));

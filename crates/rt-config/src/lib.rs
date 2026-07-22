@@ -223,11 +223,14 @@ impl Default for Settings {
 impl Settings {
     /// The smallest opacity we allow, so the window never vanishes entirely.
     pub const MIN_OPACITY: f32 = 0.05;
-    /// Upper bound for the scrollback slider. 20M lines suits listing/searching a
-    /// whole filesystem, but a *full* buffer is heavy — very roughly ~1.5 GB per
-    /// million 80-column lines — so the titlebar shows a used/max meter to watch
-    /// it. The grid only allocates as it fills, so an unused ceiling is cheap.
-    pub const MAX_SCROLLBACK: usize = 20_000_000;
+    /// Upper bound for the scrollback slider. 5M lines still suits listing/searching a
+    /// large tree, but a *full* buffer is heavy — very roughly ~1.5 GB per million
+    /// 80-column lines — so the titlebar shows a used/max meter to watch it. On the
+    /// in-house engine a per-pane memory budget (rt_engine's SCROLLBACK_MEMORY_BUDGET)
+    /// evicts oldest-first before a maxed slider can exhaust RAM; the grid only allocates
+    /// as it fills, so an unused ceiling is cheap. Was 20M — lowered so even the vendored
+    /// backend (line-capped only, no byte budget) can't be driven to an OOM.
+    pub const MAX_SCROLLBACK: usize = 5_000_000;
 
     /// Nudge the opacity by `delta`, clamped to `[MIN_OPACITY, 1.0]`. Returns
     /// the new value. Used by the `OpacityUp`/`OpacityDown` actions.

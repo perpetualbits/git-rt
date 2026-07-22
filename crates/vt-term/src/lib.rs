@@ -16,7 +16,11 @@ use unicode_width::UnicodeWidthChar;
 use vt_parser::{Params, Parser, Perform};
 
 /// Maximum scrollback lines, matching the vendored oracle's `scrolling_history`.
-const SCROLLBACK: usize = 10_000;
+/// Default scrollback cap (lines), matching the vendored oracle's `scrolling_history`.
+/// A live `Term` raises this (and adds a memory budget) via [`Term::set_scrollback`];
+/// the differential harness uses `Term::new`, so it keeps this default and tracks the
+/// oracle exactly.
+const DEFAULT_SCROLLBACK: usize = 10_000;
 
 /// A cell colour: the terminal default, a 0–255 palette index (named colours 0–15
 /// included), or a direct RGB triple.
@@ -162,6 +166,12 @@ impl Line {
     fn iter(&self) -> std::slice::Iter<'_, Cell> {
         self.cells.iter()
     }
+    /// Estimated bytes this row occupies (heap cells + inline struct), for the scrollback
+    /// memory budget. Uses `capacity` so the estimate reflects what is actually held.
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.cells.capacity() * std::mem::size_of::<Cell>() + std::mem::size_of::<Line>()
+    }
     /// Reset the row to `template`, touching only the occupied prefix. If the trailing
     /// (beyond-`occ`) cells' background differs from the template they are stale, so the
     /// whole row is reset (alacritty's discriminant check; the blank template only ever
@@ -243,10 +253,21 @@ pub struct Term {
     /// GL (`gl`). `ESC ( 0` designates G0 = Special; SI/SO invoke G0/G1.
     charsets: [Charset; 4],
     gl: usize,
-    /// Lines scrolled off the top of the primary screen (oldest at the front), capped
-    /// at SCROLLBACK. Only its length is observed today (display_offset stays 0); it
-    /// exists so `history_size` tracks the oracle and future scrolling can read it.
+    /// Lines scrolled off the top of the primary screen (oldest at the front), capped by
+    /// `scrollback_lines` and `scrollback_bytes`. Only its length is observed by the
+    /// differential harness; it exists so `history_size` tracks the oracle and scrolling
+    /// can read it.
     history: VecDeque<Line>,
+    /// Scrollback caps: evict the oldest history when EITHER the line count exceeds
+    /// `scrollback_lines` OR the running byte estimate exceeds `scrollback_bytes`. The
+    /// defaults (`DEFAULT_SCROLLBACK` lines, `usize::MAX` bytes) cap purely by line count
+    /// like the oracle, so the harness is unaffected; a host raises both via
+    /// [`set_scrollback`](Term::set_scrollback) so a huge line setting can't exhaust RAM.
+    scrollback_lines: usize,
+    scrollback_bytes: usize,
+    /// Running estimate of `history`'s memory, kept in step with every push/pop so the
+    /// byte budget is O(1) to enforce (recomputed wholesale after a reflow rebuilds it).
+    history_bytes: usize,
     /// Recycled blank rows (all-default, `occ` 0), fed by scrollback eviction and drained
     /// by scrolling — so a top-anchored scroll MOVES the scrolled-off row into history
     /// (no clone) and takes a ready blank from here instead of allocating one. This kills
@@ -293,6 +314,9 @@ impl Term {
             charsets: [Charset::Ascii; 4],
             gl: 0,
             history: VecDeque::new(),
+            scrollback_lines: DEFAULT_SCROLLBACK,
+            scrollback_bytes: usize::MAX,
+            history_bytes: 0,
             blank_pool: Vec::new(),
             display_offset: 0,
             cursor_shape: CursorShape::Block,
@@ -368,12 +392,11 @@ impl Term {
         for _ in 0..scroll {
             let line = self.grid.remove(0);
             if keep {
+                self.history_bytes += line.byte_size();
                 self.history.push_back(line); // primary: into scrollback; alt: discard
             }
         }
-        while self.history.len() > SCROLLBACK {
-            self.history.pop_front();
-        }
+        self.trim_history(); // enforce both caps, recycling evicted rows
         self.row -= scroll;
         self.grid.truncate(target);
         while self.grid.len() < target {
@@ -393,6 +416,7 @@ impl Term {
         let from_history = if keep { self.history.len().min(added) } else { 0 };
         for _ in 0..from_history {
             let line = self.history.pop_back().unwrap();
+            self.history_bytes = self.history_bytes.saturating_sub(line.byte_size());
             self.grid.insert(0, line);
         }
         self.row += from_history;
@@ -429,7 +453,7 @@ impl Term {
         let nb = if new_cols > old_cols {
             grow_columns_impl(rows, new_cols, lines, &mut cur)
         } else {
-            shrink_columns_impl(rows, new_cols, lines, &mut cur)
+            shrink_columns_impl(rows, new_cols, lines, self.scrollback_lines, &mut cur)
         };
 
         // `nb` is height-indexed from the bottom: visible = bottom `lines` rows, the rest is
@@ -441,7 +465,7 @@ impl Term {
             }
         }
         let mut history: VecDeque<Vec<Cell>> = nb[lines..].iter().rev().cloned().collect();
-        while history.len() > SCROLLBACK {
+        while history.len() > self.scrollback_lines {
             history.pop_front();
         }
 
@@ -460,6 +484,10 @@ impl Term {
         }
 
         self.history = history.into_iter().map(Line::from_cells).collect();
+        // The rebuilt history was capped by line count above; recompute its byte estimate
+        // and enforce the memory budget too (a host may have a tighter one).
+        self.history_bytes = self.history.iter().map(Line::byte_size).sum();
+        self.trim_history();
         self.grid = grid.into_iter().map(Line::from_cells).collect();
         self.cols = new_cols;
         self.rows = lines;
@@ -596,13 +624,43 @@ impl Term {
     /// Push a line into scrollback (capped), and if the view is scrolled up, bump the
     /// offset so it stays anchored on the same content (alacritty's `increase_scroll_limit`).
     fn push_history(&mut self, line: Line) {
+        self.history_bytes += line.byte_size();
         self.history.push_back(line);
-        if self.history.len() > SCROLLBACK {
-            if let Some(popped) = self.history.pop_front() {
-                self.recycle_blank(popped); // reuse the evicted row's allocation
+        let before = self.history.len();
+        self.trim_history(); // evict oldest until within both caps (recycling rows)
+        let evicted = before - self.history.len();
+        // Keep a scrolled-up view anchored on the same content: the new bottom line pushes
+        // the view up by one, each front eviction pulls it back down (steady state: +1-1=0).
+        if self.display_offset > 0 {
+            self.display_offset = (self.display_offset + 1).saturating_sub(evicted).min(self.history.len());
+        }
+    }
+
+    /// Configure this pane's scrollback caps: keep at most `lines` history lines and at
+    /// most `bytes` estimated bytes, whichever is tighter. A host calls this with the
+    /// user's configured limit and a memory budget, so a large line setting degrades
+    /// (oldest-first eviction) instead of exhausting RAM. Trims immediately if over.
+    pub fn set_scrollback(&mut self, lines: usize, bytes: usize) {
+        self.scrollback_lines = lines;
+        self.scrollback_bytes = bytes;
+        self.trim_history();
+        self.display_offset = self.display_offset.min(self.history.len());
+    }
+
+    /// Evict the oldest history until within BOTH caps, recycling each evicted row's
+    /// allocation and keeping `history_bytes` in step. The byte cap never empties a
+    /// non-empty history below its last line (a single oversized row is still kept).
+    fn trim_history(&mut self) {
+        while self.history.len() > self.scrollback_lines
+            || (self.history.len() > 1 && self.history_bytes > self.scrollback_bytes)
+        {
+            match self.history.pop_front() {
+                Some(popped) => {
+                    self.history_bytes = self.history_bytes.saturating_sub(popped.byte_size());
+                    self.recycle_blank(popped); // reuse the evicted row's allocation
+                }
+                None => break,
             }
-        } else if self.display_offset > 0 {
-            self.display_offset = (self.display_offset + 1).min(self.history.len());
         }
     }
 
@@ -1257,6 +1315,7 @@ fn shrink_columns_impl(
     rows: Vec<Vec<Cell>>,
     columns: usize,
     lines: usize,
+    max_history: usize,
     cur: &mut RCursor,
 ) -> Vec<Vec<Cell>> {
     if cur.wrap {
@@ -1338,7 +1397,7 @@ fn shrink_columns_impl(
     }
 
     let mut reversed: Vec<Vec<Cell>> = new_raw.into_iter().rev().collect();
-    reversed.truncate(SCROLLBACK + lines);
+    reversed.truncate(max_history + lines);
     reversed
 }
 
@@ -1573,5 +1632,46 @@ impl Term {
         if self.col + 1 < self.cols {
             self.col = (((self.col / 8) + 1) * 8).min(self.cols - 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod scrollback_tests {
+    use super::*;
+
+    fn feed_lines(t: &mut Term, n: usize) {
+        for _ in 0..n {
+            t.feed(b"line of text\r\n"); // each LF past the bottom scrolls one row into history
+        }
+    }
+
+    #[test]
+    fn line_cap_bounds_history() {
+        let mut t = Term::new(80, 24);
+        t.set_scrollback(50, usize::MAX); // no byte budget: pure line cap
+        feed_lines(&mut t, 500);
+        assert_eq!(t.history_size(), 50, "history is capped at the configured line count");
+    }
+
+    #[test]
+    fn default_cap_matches_oracle_default() {
+        // No set_scrollback: the differential-harness path. Must stay at the oracle default.
+        let mut t = Term::new(80, 24);
+        feed_lines(&mut t, DEFAULT_SCROLLBACK + 24 + 100);
+        assert_eq!(t.history_size(), DEFAULT_SCROLLBACK);
+    }
+
+    #[test]
+    fn byte_budget_evicts_before_line_cap() {
+        let mut t = Term::new(80, 24);
+        let budget = 64 * 1024; // 64 KiB: a tiny memory budget under a huge line cap
+        t.set_scrollback(1_000_000, budget);
+        feed_lines(&mut t, 5_000);
+        assert!(t.history_size() < 1_000_000, "the memory budget bounds history below the line cap");
+        assert!(
+            t.history_bytes <= budget || t.history_size() <= 1,
+            "history memory ({}) stays within the {}-byte budget",
+            t.history_bytes, budget
+        );
     }
 }
