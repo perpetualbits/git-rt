@@ -23,7 +23,9 @@ members = [
 opt-level = 3                        # maximum optimisation for the hot parser/render paths
 lto = "thin"                         # cross-crate inlining without full-LTO's link-time cost
 codegen-units = 1                    # let the optimiser see whole crates (slower build, faster binary)
-panic = "abort"                      # smaller binary; a terminal has no useful unwind recovery
+panic = "unwind"                     # per-pane crash isolation: a panic in one pane's parser/render
+                                     # unwinds its thread (caught, pane marked crashed) instead of
+                                     # aborting the whole app and every other pane with it
 strip = true                         # drop symbols from release artifacts shipped in packages
 
 # Vendored throughput fork: the vendored alacritty_terminal (path dep in

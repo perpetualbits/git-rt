@@ -2080,6 +2080,7 @@ impl ApplicationHandler for App {
         let mut dirty = false; // did anything change this tick?
         let mut exited: Vec<rt_core::PaneId> = Vec::new(); // panes whose shell died cleanly (reap)
         let mut nonzero_exits: Vec<(rt_core::PaneId, i32)> = Vec::new(); // died abnormally (keep + badge)
+        let mut crashed: Vec<rt_core::PaneId> = Vec::new(); // parser thread panicked (keep + badge)
         let mut titles: Vec<(rt_core::PaneId, String)> = Vec::new(); // pending title updates
         for id in active.session.tree().all_panes() {
             if let Some(pane) = active.session.pane(id) {
@@ -2095,6 +2096,12 @@ impl ApplicationHandler for App {
                             }
                             _ => exited.push(id), // reap this pane
                         },
+                        rt_engine::PaneEvent::Crashed => {
+                            // The pane's parser thread panicked and was caught (isolated):
+                            // keep it frozen at its last grid with a badge, don't reap.
+                            crashed.push(id);
+                            dirty = true;
+                        }
                         rt_engine::PaneEvent::Title(t) => {
                             titles.push((id, t)); // apply after the loop (needs &mut session)
                             dirty = true;
@@ -2141,6 +2148,16 @@ impl ApplicationHandler for App {
                 format!("{base} [exited {code}]")
             };
             active.session.set_title(id, badged);
+        }
+        // Badge every pane whose parser thread crashed (isolated by catch_unwind): it stays
+        // open, frozen at its last output, so the crash is visible rather than a silent freeze.
+        for id in crashed {
+            let base = active.session.title_of(id).unwrap_or("").to_string();
+            if !base.contains("[crashed]") {
+                let badged =
+                    if base.is_empty() { "[crashed]".to_string() } else { format!("{base} [crashed]") };
+                active.session.set_title(id, badged);
+            }
         }
         // Close every pane whose child exited. If that empties the window, quit.
         for id in exited {
@@ -3069,7 +3086,12 @@ impl App {
         }
         for (id, rect) in active.session.visible_rects(bounds) {
             let content = active.session.content_rect(rect);
-            let snap = active.session.pane(id).map(|p| p.render_snapshot()); // ONCE per pane
+            // ONCE per pane. Wrapped in catch_unwind so a panic building ONE pane's snapshot
+            // (a render/grid bug) is isolated to that pane — it renders stale this frame
+            // instead of aborting the whole window. panic = "unwind" makes this catchable.
+            let snap = active.session.pane(id).and_then(|p| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.render_snapshot())).ok()
+            });
             if let Some(snap) = &snap {
                 if active.session.columns_of(id) > 1 {
                     active.damage.mark_full(); // newspaper columns: cell→px mapping ambiguous

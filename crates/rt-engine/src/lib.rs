@@ -66,6 +66,10 @@ pub enum PaneEvent {
     Exited(Option<i32>),
     /// New grid content is available; the GUI should schedule a redraw.
     Wakeup,
+    /// The pane's parser/grid thread panicked on some input and was caught (panic =
+    /// "unwind"): the pane is isolated — frozen at its last state — rather than taking the
+    /// whole process down. The GUI keeps it open with a "[crashed]" badge.
+    Crashed,
 }
 
 /// The text-attribute flags a cell can carry that affect *how* the glyph is

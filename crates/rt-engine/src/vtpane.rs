@@ -135,50 +135,65 @@ impl VtPane {
         }
         let (term_r, events_r, dirty_r, exited_r) =
             (term.clone(), events.clone(), dirty.clone(), exited.clone());
+        // A second set of handles for the crash handler below (the loop moves the `*_r` set).
+        let (events_c, dirty_c, exited_c) = (events.clone(), dirty.clone(), exited.clone());
         // Emit `Exited` at most once across the EOF reader and the SIGCHLD poll.
         let post_exit = move |q: &Mutex<VecDeque<PaneEvent>>, flag: &AtomicBool| {
             if !flag.swap(true, Ordering::AcqRel) {
                 // The reader only sees master EOF, not the child's status; emit an
                 // unknown-status exit that `drain_events` upgrades once it reaps the code.
-                q.lock().unwrap().push_back(PaneEvent::Exited(None));
+                q.lock().unwrap_or_else(|e| e.into_inner()).push_back(PaneEvent::Exited(None));
             }
         };
         let reader = std::thread::spawn(move || {
-            // SAFETY: `read_fd` is a fresh dup we exclusively own here.
-            let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
-            let mut buf = [0u8; 65536];
-            loop {
-                match file.read(&mut buf) {
-                    Ok(0) => {
-                        post_exit(&events_r, &exited_r);
-                        dirty_r.store(true, Ordering::Release);
-                        break;
-                    }
-                    Ok(n) => {
-                        let mut title = None;
-                        if let Ok(mut t) = term_r.lock() {
-                            t.feed(&buf[..n]);
-                            title = t.take_title(); // OSC 0/2 while holding the lock
+            // Isolate a parser/grid panic to THIS pane: `panic = "unwind"` lets us catch it,
+            // mark the pane crashed, and let the GUI freeze it with a badge — instead of the
+            // whole process (every other pane, an editor with unsaved work) aborting with it.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: `read_fd` is a fresh dup we exclusively own here.
+                let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                let mut buf = [0u8; 65536];
+                loop {
+                    match file.read(&mut buf) {
+                        Ok(0) => {
+                            post_exit(&events_r, &exited_r);
+                            dirty_r.store(true, Ordering::Release);
+                            break;
                         }
-                        let mut q = events_r.lock().unwrap();
-                        if let Some(t) = title {
-                            q.push_back(PaneEvent::Title(t));
+                        Ok(n) => {
+                            let mut title = None;
+                            if let Ok(mut t) = term_r.lock() {
+                                t.feed(&buf[..n]);
+                                title = t.take_title(); // OSC 0/2 while holding the lock
+                            }
+                            let mut q = events_r.lock().unwrap();
+                            if let Some(t) = title {
+                                q.push_back(PaneEvent::Title(t));
+                            }
+                            q.push_back(PaneEvent::Wakeup);
+                            drop(q);
+                            dirty_r.store(true, Ordering::Release);
                         }
-                        q.push_back(PaneEvent::Wakeup);
-                        drop(q);
-                        dirty_r.store(true, Ordering::Release);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(4));
-                    }
-                    // `File::read` already retries EINTR internally; any other error means
-                    // the master is gone.
-                    Err(_) => {
-                        post_exit(&events_r, &exited_r);
-                        dirty_r.store(true, Ordering::Release);
-                        break;
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(4));
+                        }
+                        // `File::read` already retries EINTR internally; any other error means
+                        // the master is gone.
+                        Err(_) => {
+                            post_exit(&events_r, &exited_r);
+                            dirty_r.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                 }
+            }));
+            if ran.is_err() {
+                // The panic poisoned the term mutex; `lock_term` recovers the guard so the
+                // pane's last grid stays readable. Tell the GUI once (dedup via `exited`).
+                if !exited_c.swap(true, Ordering::AcqRel) {
+                    events_c.lock().unwrap_or_else(|e| e.into_inner()).push_back(PaneEvent::Crashed);
+                }
+                dirty_c.store(true, Ordering::Release);
             }
         });
 
@@ -205,6 +220,15 @@ impl VtPane {
     }
     pub fn scrollback_limit(&self) -> usize {
         self.scrollback_limit
+    }
+
+    /// Lock the shared term, recovering the guard even if a prior parser panic poisoned the
+    /// mutex. Pane crash isolation (panic = "unwind") catches a parser/grid panic on the
+    /// reader thread, which drops its guard mid-update and poisons the lock; recovering it
+    /// keeps the pane's last grid readable so a crashed pane freezes with a badge instead of
+    /// cascading the panic into the GUI thread (whose `.unwrap()` would abort everything).
+    fn lock_term(&self) -> std::sync::MutexGuard<'_, vt_term::Term> {
+        self.term.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn write(&self, bytes: &[u8]) {
@@ -243,7 +267,7 @@ impl VtPane {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        if let Ok(mut t) = self.term.lock() {
+        { let mut t = self.lock_term();
             t.resize(cols, rows);
         }
         let ws = libc::winsize {
@@ -279,7 +303,7 @@ impl VtPane {
     /// Materialise the visible grid into a [`Snapshot`], folding bold/dim/inverse/hidden
     /// into the resolved colours the way alacritty's `capture_locked` does.
     fn capture(&self) -> Snapshot {
-        let t = self.term.lock().unwrap();
+        let t = self.lock_term();
         let (cols, rows) = (t.cols(), t.rows());
         let offset = t.display_offset() as i32;
         let blank = SnapCell { c: ' ', fg: self.palette.fg, bg: self.palette.bg, attrs: CellAttrs::default() };
@@ -317,7 +341,7 @@ impl VtPane {
     pub fn render_snapshot(&self) -> Snapshot {
         self.dirty.store(false, Ordering::Release);
         let snap = self.capture();
-        let mut last = self.last_render.lock().unwrap();
+        let mut last = self.last_render.lock().unwrap_or_else(|e| e.into_inner());
         let same_dims =
             last.len() == snap.rows.len() && last.first().map_or(false, |r| r.len() == snap.cols);
         let damage = if !same_dims {
@@ -343,18 +367,18 @@ impl VtPane {
 
     // ── Scrollback viewport ────────────────────────────────────────────────────
     pub fn scroll(&self, delta: isize) {
-        if let Ok(mut t) = self.term.lock() {
+        { let mut t = self.lock_term();
             t.scroll_display(delta as i32); // positive = up into history
         }
     }
     pub fn scroll_to_bottom(&self) {
-        if let Ok(mut t) = self.term.lock() {
+        { let mut t = self.lock_term();
             t.scroll_to_bottom_view();
         }
     }
     pub fn scroll_to_line(&self, line: i32) {
         // Centre absolute `line` in the viewport, matching the alacritty backend.
-        if let Ok(mut t) = self.term.lock() {
+        { let mut t = self.lock_term();
             let screen = t.rows() as i32;
             let history = t.history_size() as i32;
             let current = t.display_offset() as i32;
@@ -363,11 +387,11 @@ impl VtPane {
         }
     }
     pub fn scroll_info(&self) -> (usize, usize, usize) {
-        let t = self.term.lock().unwrap();
+        let t = self.lock_term();
         (t.display_offset(), t.history_size(), t.rows())
     }
     pub fn line_bounds(&self) -> LineBounds {
-        let t = self.term.lock().unwrap();
+        let t = self.lock_term();
         LineBounds {
             topmost: t.topmost(),
             bottommost: t.bottommost(),
@@ -378,7 +402,7 @@ impl VtPane {
     /// Absolute lines `[top, top+rows)` for scrollback rendering; lines outside the
     /// readable range come back blank. Matches the alacritty backend's `snapshot_lines`.
     pub fn snapshot_lines(&self, top: i32, rows: usize) -> Snapshot {
-        let t = self.term.lock().unwrap();
+        let t = self.lock_term();
         let cols = t.cols();
         let (topmost, bottommost) = (t.topmost(), t.bottommost());
         let mut out = Vec::with_capacity(rows);
@@ -399,7 +423,7 @@ impl VtPane {
     /// Extract selected text between two absolute-grid endpoints, trimming trailing
     /// blanks per line (linewise) or per rectangle (block), matching the alac backend.
     pub fn selection_text(&self, anchor: (usize, i32), head: (usize, i32), block: bool) -> String {
-        let t = self.term.lock().unwrap();
+        let t = self.lock_term();
         let cols = t.cols();
         // Order the endpoints top-to-bottom (then left-to-right on the same line).
         let (mut a, mut h) = (anchor, head);
@@ -447,7 +471,7 @@ impl VtPane {
         if needle.is_empty() {
             return Vec::new();
         }
-        let t = self.term.lock().unwrap();
+        let t = self.lock_term();
         let cols = t.cols();
         let want = if case_sensitive { needle.to_string() } else { needle.to_lowercase() };
         let mut hits = Vec::new();
