@@ -138,6 +138,10 @@ impl DamageAccumulator {
                     self.add_cell_span(d.line, d.left, d.right, origin_x, origin_y, cell_w, cell_h);
                 }
             }
+            // A scroll-blit is handled earlier (backend `CopyArea` + span repaint); if it
+            // reaches the generic pixel-damage path it means no backend consumed it, so the
+            // safe, correct answer is a full repaint of the (already scroll-shifted) grid.
+            Damage::Scroll { .. } => self.mark_full(),
         }
     }
 

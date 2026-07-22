@@ -645,24 +645,36 @@ fn apply_damage(
 ) -> Damage {
     let (cols, rows) = (t.cols(), t.rows());
     let dims_ok = resolved.len() == rows && resolved.first().map_or(false, |r| r.len() == cols);
+    // Re-resolve the cells in `spans` from the (already scroll-shifted, if any) term, updating
+    // `resolved` in place and collecting the render-side `CellDamage`.
+    fn repaint(t: &vt_term::Term, palette: &Palette, spans: &[vt_term::LineDamage], resolved: &mut [Vec<SnapCell>], cols: usize, rows: usize) -> Vec<CellDamage> {
+        let mut out = Vec::with_capacity(spans.len());
+        for s in spans {
+            if s.line >= rows || cols == 0 {
+                continue;
+            }
+            let right = s.right.min(cols - 1);
+            for c in s.left..=right {
+                // Native damage never marks while scrolled back (it reports Full), so the
+                // viewport row IS the absolute line: `cell_at(line, c)`.
+                resolved[s.line][c] = resolve_cell(palette, t.cell_at(s.line as i32, c));
+            }
+            out.push(CellDamage { line: s.line, left: s.left, right });
+        }
+        out
+    }
     match dmg {
         vt_term::Damage::Spans(spans) if dims_ok => {
-            let mut lines = Vec::with_capacity(spans.len());
-            for s in &spans {
-                if s.line >= rows || cols == 0 {
-                    continue;
-                }
-                let right = s.right.min(cols - 1);
-                for c in s.left..=right {
-                    // Native damage never marks while scrolled back (it reports Full), so the
-                    // viewport row IS the absolute line: `cell_at(line, c)`.
-                    resolved[s.line][c] = resolve_cell(palette, t.cell_at(s.line as i32, c));
-                }
-                lines.push(CellDamage { line: s.line, left: s.left, right });
-            }
-            Damage::Lines(lines)
+            Damage::Lines(repaint(t, palette, &spans, resolved, cols, rows))
         }
-        // Full damage, first frame, or a resize: rebuild wholesale.
+        vt_term::Damage::Scroll { lines, spans } if dims_ok && lines < rows => {
+            // Blit the resolved grid up by `lines` to mirror the engine's scroll — the top
+            // `rows-lines` rows are now correct; the bottom `lines` (exposed) rows hold stale
+            // data but are in `spans` (marked dirty full-width), so `repaint` fixes them.
+            resolved.rotate_left(lines);
+            Damage::Scroll { lines, spans: repaint(t, palette, &spans, resolved, cols, rows) }
+        }
+        // Full damage, first frame, a resize, or an un-blittable scroll: rebuild wholesale.
         _ => {
             *resolved = resolve_full(t, palette);
             Damage::Full
@@ -746,5 +758,31 @@ mod damage_incremental_tests {
             _ => panic!("expected Lines, got {d2:?}"),
         }
         assert_eq!(resolved, resolve_full(&t, &palette));
+    }
+}
+
+#[cfg(test)]
+mod scroll_damage_tests {
+    use super::*;
+    use vt_term::Term;
+
+    /// A full-screen scroll must report `Damage::Scroll` and leave the resolved grid equal to
+    /// a full re-resolve — i.e. the rotate-up blit + span repaint reproduces the true grid.
+    #[test]
+    fn scroll_shifts_resolved_grid_and_reports_scroll() {
+        let palette = Palette::xterm();
+        let mut t = Term::new(10, 4);
+        let _ = t.take_damage();
+        let mut resolved = resolve_full(&t, &palette);
+        t.feed(b"a\r\nb\r\nc\r\nd");
+        let dmg = t.take_damage();
+        let _ = apply_damage(&t, &palette, dmg, &mut resolved);
+        assert_eq!(resolved, resolve_full(&t, &palette));
+
+        t.feed(b"\r\ne"); // scroll up one, print e on the exposed row
+        let dmg = t.take_damage();
+        let render = apply_damage(&t, &palette, dmg, &mut resolved);
+        assert!(matches!(render, Damage::Scroll { lines: 1, .. }), "got {render:?}");
+        assert_eq!(resolved, resolve_full(&t, &palette), "blit+repaint must equal a full resolve");
     }
 }

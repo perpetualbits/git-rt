@@ -236,14 +236,18 @@ pub struct LineDamage {
 }
 
 /// What changed on the visible grid since the last [`take_damage`](Term::take_damage).
-/// `Full` means "redraw everything" (structural change: scroll, resize, screen clear, alt
-/// switch, reset, or a scrollback-view change); `Spans` lists the dirty column range of each
-/// changed row. It is a conservative *superset* of the cells that actually changed — a cell
-/// rewritten with the same value, or the cells the cursor moved between, are included.
+/// `Full` means "redraw everything" (a structural change with no cheaper description: resize,
+/// screen clear, alt switch, reset, a scrollback-view change, or a sub-region/downward
+/// scroll). `Spans` lists the dirty column range of each changed row. `Scroll { lines, spans }`
+/// means the visible grid scrolled UP by `lines` whole rows (a top-anchored, full-width
+/// scroll): a renderer may blit its rendered rows up by `lines` and then repaint `spans`
+/// (the newly-exposed bottom rows plus anything else that changed) — the scroll-blit
+/// fast path. All three are a conservative *superset* of the cells that actually changed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Damage {
     Full,
     Spans(Vec<LineDamage>),
+    Scroll { lines: usize, spans: Vec<LineDamage> },
 }
 
 /// Accumulates per-frame visible-grid damage: one dirty column span per row plus a `full`
@@ -256,11 +260,49 @@ struct GridDamage {
     cols: usize,
     dirty: Vec<Option<(usize, usize)>>, // per visible row: Some(left, right)
     last_cursor: Option<(usize, usize)>, // (row, col) of the cursor at the previous drain
+    /// Net rows scrolled UP this frame by clean top-anchored full-width scrolls — the amount
+    /// a renderer may blit. `scroll_broken` disables the fast path (a downward or sub-region
+    /// scroll happened, which a single upward blit can't express) → the frame reports `Full`.
+    scroll_lines: usize,
+    scroll_broken: bool,
 }
 impl GridDamage {
     fn new(cols: usize, rows: usize) -> Self {
         // A fresh terminal has never been rendered → the first frame is Full.
-        Self { full: true, cols, dirty: vec![None; rows], last_cursor: None }
+        Self { full: true, cols, dirty: vec![None; rows], last_cursor: None, scroll_lines: 0, scroll_broken: false }
+    }
+    /// A clean top-anchored, full-width scroll UP by `n`: the rendered rows may be blitted up,
+    /// so shift the accumulated dirty spans up with the content and mark the newly-exposed
+    /// bottom `n` rows dirty. Callers use [`scroll_break`](GridDamage::scroll_break) for any
+    /// scroll a single upward blit can't represent.
+    fn scroll_up(&mut self, n: usize) {
+        if self.full {
+            return;
+        }
+        let rows = self.dirty.len();
+        if n == 0 || rows == 0 {
+            return;
+        }
+        // Shift spans up with the content: new row i shows old row i+n.
+        for i in 0..rows {
+            self.dirty[i] = self.dirty.get(i + n).copied().flatten();
+        }
+        // Cursor's previously-rendered position rides the blit up too.
+        if let Some((r, c)) = self.last_cursor {
+            self.last_cursor = Some((r.saturating_sub(n), c));
+        }
+        // Newly-exposed bottom rows are blank content now → dirty full-width.
+        if self.cols > 0 {
+            for i in rows.saturating_sub(n)..rows {
+                self.dirty[i] = Some((0, self.cols - 1));
+            }
+        }
+        self.scroll_lines += n;
+    }
+    /// Mark that a scroll happened that the upward-blit fast path can't represent (downward,
+    /// or a DECSTBM sub-region): fall back to `Full`.
+    fn scroll_break(&mut self) {
+        self.scroll_broken = true;
     }
     #[inline]
     fn cell(&mut self, row: usize, col: usize) {
@@ -316,10 +358,18 @@ impl GridDamage {
         self.dirty = vec![None; rows];
         self.full = true;
         self.last_cursor = None;
+        self.scroll_lines = 0;
+        self.scroll_broken = false;
     }
     /// Drain and reset, returning the frame's damage.
     fn drain(&mut self) -> Damage {
-        if self.full {
+        let scroll = self.scroll_lines;
+        let broken = self.scroll_broken;
+        self.scroll_lines = 0;
+        self.scroll_broken = false;
+        // Full supersedes; a broken (downward/sub-region) scroll or a scroll ≥ the height
+        // (nothing left to preserve) also falls back to Full.
+        if self.full || broken || scroll >= self.dirty.len() {
             self.full = false;
             for d in &mut self.dirty {
                 *d = None;
@@ -332,7 +382,11 @@ impl GridDamage {
                 spans.push(LineDamage { line, left, right });
             }
         }
-        Damage::Spans(spans)
+        if scroll > 0 {
+            Damage::Scroll { lines: scroll, spans }
+        } else {
+            Damage::Spans(spans)
+        }
     }
 }
 
@@ -637,6 +691,8 @@ impl Term {
         // Reading scrolled-back output is static and not perf-critical.
         if self.display_offset != 0 {
             self.damage.full = false;
+            self.damage.scroll_lines = 0;
+            self.damage.scroll_broken = false;
             for d in &mut self.damage.dirty {
                 *d = None;
             }
@@ -844,7 +900,13 @@ impl Term {
     fn scroll_up(&mut self, n: usize) {
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(b - t + 1);
-        self.damage.rows(t, b); // every row in the region shifts content
+        // A scroll of the WHOLE visible grid (top-anchored, full height) is a clean upward
+        // blit; a DECSTBM sub-region isn't (rows outside it don't move), so fall back.
+        if t == 0 && b == self.rows - 1 {
+            self.damage.scroll_up(n);
+        } else {
+            self.damage.scroll_break();
+        }
         // History grows only for a top-anchored scroll on the primary screen (matching
         // alacritty's `scroll_up`: history increases iff `region.start == 0`; the alt
         // screen has no scrollback).
@@ -876,7 +938,7 @@ impl Term {
     fn scroll_down(&mut self, n: usize) {
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(b - t + 1);
-        self.damage.rows(t, b); // every row in the region shifts content
+        self.damage.scroll_break(); // downward scroll: no upward-blit representation → Full
         self.grid[t..=b].rotate_right(n);
         let blank = self.blank();
         for r in t..(t + n) {

@@ -128,13 +128,17 @@ pub struct CursorPos {
 
 /// Which cells changed since the previous rendered frame, in the pane's
 /// viewport cell coordinates. `Full` means "repaint everything" — the honest,
-/// always-correct answer for the first frame, a scroll, a resize, newspaper
-/// columns, or anything the engine can't describe precisely. `Lines` is a
-/// per-row inclusive changed-column span (`left..=right`).
+/// always-correct answer for the first frame, a resize, newspaper columns, or
+/// anything the engine can't describe precisely. `Lines` is a per-row inclusive
+/// changed-column span (`left..=right`). `Scroll { lines, spans }` means the pane
+/// scrolled UP by `lines` whole rows: a backend that can move pixels (the XRender
+/// server-side `CopyArea`) may blit its content up by `lines` and then repaint
+/// only `spans`; a backend that can't treats it as `Full`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Damage {
     Full,
     Lines(Vec<CellDamage>),
+    Scroll { lines: usize, spans: Vec<CellDamage> },
 }
 
 impl Default for Damage {
@@ -148,13 +152,21 @@ impl Damage {
     pub fn contains_line(&self, line: usize) -> bool {
         match self {
             Damage::Full => true,
-            Damage::Lines(v) => v.iter().any(|d| d.line == line),
+            Damage::Lines(v) | Damage::Scroll { spans: v, .. } => v.iter().any(|d| d.line == line),
         }
     }
 
     /// Is this the "repaint everything" variant?
     pub fn is_full(&self) -> bool {
         matches!(self, Damage::Full)
+    }
+
+    /// The scroll distance in rows if this is a scroll-blittable frame, else `None`.
+    pub fn scroll_lines(&self) -> Option<usize> {
+        match self {
+            Damage::Scroll { lines, .. } => Some(*lines),
+            _ => None,
+        }
     }
 }
 
@@ -1321,7 +1333,7 @@ mod vtpane_tests {
         let _ = pane.render_snapshot(); // baseline
         match pane.render_snapshot().damage {
             Damage::Lines(l) => assert!(l.is_empty(), "idle pane reported damage: {l:?}"),
-            Damage::Full => panic!("idle pane reported Full damage"),
+            other => panic!("idle pane should report empty Lines, got {other:?}"),
         }
     }
 }
