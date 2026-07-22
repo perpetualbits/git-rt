@@ -3089,8 +3089,20 @@ impl App {
             // ONCE per pane. Wrapped in catch_unwind so a panic building ONE pane's snapshot
             // (a render/grid bug) is isolated to that pane — it renders stale this frame
             // instead of aborting the whole window. panic = "unwind" makes this catchable.
+            // On the first catch, mark the pane crashed so it is badged [crashed] and
+            // skipped thereafter — otherwise a *deterministic* render panic would re-fire
+            // every frame (render isn't dirty-gated), flooding stderr and burning CPU.
             let snap = active.session.pane(id).and_then(|p| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.render_snapshot())).ok()
+                if p.is_crashed() {
+                    return None; // frozen at its last frame; don't re-enter the panicking path
+                }
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.render_snapshot())) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        p.note_render_crash(); // badge + skip on future frames
+                        None
+                    }
+                }
             });
             if let Some(snap) = &snap {
                 if active.session.columns_of(id) > 1 {

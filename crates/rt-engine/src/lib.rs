@@ -337,6 +337,10 @@ pub struct AlacPane {
     // GUI can show a "used / max" buffer meter. `scroll_info().1` is the current
     // fill against this ceiling.
     scrollback_limit: usize,
+    // Set if the GUI's render_snapshot panicked for this pane and was caught; the
+    // render loop then skips it (frozen at its last frame) so a deterministic render
+    // bug can't re-panic every frame.
+    crashed: std::sync::atomic::AtomicBool,
 }
 
 impl AlacPane {
@@ -452,7 +456,23 @@ impl AlacPane {
             palette: palette::Palette::xterm(), // standard xterm 256-colour table
             pid,
             scrollback_limit: scrollback,
+            crashed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Whether the GUI's `render_snapshot` for this pane panicked and was caught.
+    pub fn is_crashed(&self) -> bool {
+        self.crashed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record a caught render panic: mark the pane crashed (render loop skips it — no
+    /// per-frame panic storm) and emit `Crashed` once for the `[crashed]` badge.
+    pub fn note_render_crash(&self) {
+        if !self.crashed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            if let Ok(mut q) = self.events.lock() {
+                q.push_back(PaneEvent::Crashed);
+            }
+        }
     }
 
     /// The pane's configured scrollback ceiling in lines (what it was spawned
@@ -1074,6 +1094,20 @@ impl TermPane {
         match self {
             Self::Alac(p) => p.render_snapshot(),
             Self::Vt(p) => p.render_snapshot(),
+        }
+    }
+    /// Whether the pane is frozen after a caught panic (parser or render).
+    pub fn is_crashed(&self) -> bool {
+        match self {
+            Self::Alac(p) => p.is_crashed(),
+            Self::Vt(p) => p.is_crashed(),
+        }
+    }
+    /// Record a caught `render_snapshot` panic so the render loop stops re-rendering it.
+    pub fn note_render_crash(&self) {
+        match self {
+            Self::Alac(p) => p.note_render_crash(),
+            Self::Vt(p) => p.note_render_crash(),
         }
     }
     pub fn set_palette(&mut self, palette: Palette) {

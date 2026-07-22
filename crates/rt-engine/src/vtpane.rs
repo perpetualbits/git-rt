@@ -52,14 +52,20 @@ pub struct VtPane {
     pty: Mutex<tty::Pty>,
     /// GUI-facing event FIFO (Wakeup on new output, Exited on child exit).
     events: Arc<Mutex<VecDeque<PaneEvent>>>,
-    /// Set once the child's exit has been reported, so the EOF reader and the SIGCHLD poll
-    /// don't each emit a duplicate `Exited`.
+    /// Set once the child's exit (or crash) has been reported, so the SIGCHLD poll and the
+    /// crash handler don't each emit a duplicate terminal event.
     exited: Arc<AtomicBool>,
-    /// The child's exit status (`$?`-style: code, or `128 + signal`), learned when
-    /// `next_child_event` reaps it. The EOF reader can't know the status, so it emits
-    /// `Exited(None)`; once this is known, `drain_events` upgrades that queued event with
-    /// the real code — so a pane that died on master-EOF still surfaces its status.
-    exit_code: Mutex<Option<i32>>,
+    /// Set when the reader thread's parser panicked and was caught (pane crash isolation).
+    /// A crashed pane is frozen: `write` drops input (there's no reader to drain it) rather
+    /// than backing bytes up behind the dead parser.
+    crashed: Arc<AtomicBool>,
+    /// Queues input to the dedicated writer thread. A PTY-master write can block in the
+    /// kernel when the child isn't reading stdin (a large paste into a paused program), so
+    /// writes must NOT run on the GUI thread — they'd freeze the whole app. Sending here is
+    /// non-blocking and never drops input (unbounded channel, FIFO order).
+    input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Writer thread; detached — ends when `input_tx` drops (channel closes).
+    _writer: std::thread::JoinHandle<()>,
     /// Set by the reader thread when new bytes have been applied (drives redraw).
     dirty: Arc<AtomicBool>,
     /// The grid as of the last `render_snapshot`, diffed against the next to compute
@@ -116,6 +122,7 @@ impl VtPane {
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let dirty = Arc::new(AtomicBool::new(true));
         let exited = Arc::new(AtomicBool::new(false));
+        let crashed = Arc::new(AtomicBool::new(false));
 
         // Reader thread owns its own dup of the master fd so it stays valid until the
         // thread ends (independent of `_pty`'s fd lifetime).
@@ -133,18 +140,45 @@ impl VtPane {
                 libc::fcntl(read_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
             }
         }
-        let (term_r, events_r, dirty_r, exited_r) =
-            (term.clone(), events.clone(), dirty.clone(), exited.clone());
-        // A second set of handles for the crash handler below (the loop moves the `*_r` set).
-        let (events_c, dirty_c, exited_c) = (events.clone(), dirty.clone(), exited.clone());
-        // Emit `Exited` at most once across the EOF reader and the SIGCHLD poll.
-        let post_exit = move |q: &Mutex<VecDeque<PaneEvent>>, flag: &AtomicBool| {
-            if !flag.swap(true, Ordering::AcqRel) {
-                // The reader only sees master EOF, not the child's status; emit an
-                // unknown-status exit that `drain_events` upgrades once it reaps the code.
-                q.lock().unwrap_or_else(|e| e.into_inner()).push_back(PaneEvent::Exited(None));
+
+        // Writer thread: blocking PTY-master writes off the GUI thread (see `input_tx`).
+        // Its own dup of the master fd, owned for the thread's lifetime.
+        let write_fd = unsafe { libc::dup(pty_fd) };
+        if write_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(read_fd) };
+            return Err(err);
+        }
+        let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let writer = std::thread::spawn(move || {
+            while let Ok(bytes) = input_rx.recv() {
+                let mut off = 0;
+                while off < bytes.len() {
+                    // SAFETY: `write_fd` is a fresh dup we exclusively own here.
+                    let ret = unsafe {
+                        libc::write(write_fd, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off)
+                    };
+                    if ret > 0 {
+                        off += ret as usize;
+                        continue;
+                    }
+                    match std::io::Error::last_os_error().raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        Some(libc::EAGAIN) => {
+                            let mut pfd = libc::pollfd { fd: write_fd, events: libc::POLLOUT, revents: 0 };
+                            unsafe { libc::poll(&mut pfd, 1, 100) };
+                        }
+                        _ => break, // EIO / peer gone: drop the rest of this chunk
+                    }
+                }
             }
-        };
+            unsafe { libc::close(write_fd) }; // channel closed (pane dropped): release the dup
+        });
+
+        let (term_r, events_r, dirty_r) = (term.clone(), events.clone(), dirty.clone());
+        // A second set of handles for the crash handler below (the loop moves the `*_r` set).
+        let (events_c, dirty_c, exited_c, crashed_c) =
+            (events.clone(), dirty.clone(), exited.clone(), crashed.clone());
         let reader = std::thread::spawn(move || {
             // Isolate a parser/grid panic to THIS pane: `panic = "unwind"` lets us catch it,
             // mark the pane crashed, and let the GUI freeze it with a badge — instead of the
@@ -156,7 +190,11 @@ impl VtPane {
                 loop {
                     match file.read(&mut buf) {
                         Ok(0) => {
-                            post_exit(&events_r, &exited_r);
+                            // Master EOF. Do NOT emit Exited here — the child may still be
+                            // alive (it only closed its stdout), and even when it did exit we
+                            // don't know the status. `drain_events`' `next_child_event`
+                            // (SIGCHLD + try_wait) is the sole exit authority and carries the
+                            // real code, so it can't race a premature unknown-status exit.
                             dirty_r.store(true, Ordering::Release);
                             break;
                         }
@@ -178,9 +216,9 @@ impl VtPane {
                             std::thread::sleep(std::time::Duration::from_millis(4));
                         }
                         // `File::read` already retries EINTR internally; any other error means
-                        // the master is gone.
+                        // the master is gone. Same as EOF: leave exit detection to
+                        // `next_child_event`.
                         Err(_) => {
-                            post_exit(&events_r, &exited_r);
                             dirty_r.store(true, Ordering::Release);
                             break;
                         }
@@ -189,7 +227,10 @@ impl VtPane {
             }));
             if ran.is_err() {
                 // The panic poisoned the term mutex; `lock_term` recovers the guard so the
-                // pane's last grid stays readable. Tell the GUI once (dedup via `exited`).
+                // pane's last grid stays readable. Mark the pane crashed (so `write` stops
+                // feeding a dead reader) and tell the GUI once (dedup via `exited`, which
+                // also suppresses a later Exited for this now-frozen pane).
+                crashed_c.store(true, Ordering::Release);
                 if !exited_c.swap(true, Ordering::AcqRel) {
                     events_c.lock().unwrap_or_else(|e| e.into_inner()).push_back(PaneEvent::Crashed);
                 }
@@ -203,7 +244,9 @@ impl VtPane {
             pty: Mutex::new(pty),
             events,
             exited,
-            exit_code: Mutex::new(None),
+            crashed,
+            input_tx,
+            _writer: writer,
             dirty,
             last_render: Mutex::new(Vec::new()),
             _reader: reader,
@@ -232,35 +275,20 @@ impl VtPane {
     }
 
     pub fn write(&self, bytes: &[u8]) {
-        // Retry loop: a PTY-master write can return a short count (signal mid-write) or
-        // fail with EINTR/EAGAIN. A single unchecked `write` would silently drop the tail
-        // of a paste or fast typing — a terminal must never lose input. Loop until every
-        // byte is written, or the peer is gone. `pty_fd` is a valid master fd owned by
-        // `pty` for our lifetime.
-        let mut off = 0;
-        while off < bytes.len() {
-            let ret = unsafe {
-                libc::write(
-                    self.pty_fd,
-                    bytes[off..].as_ptr() as *const libc::c_void,
-                    bytes.len() - off,
-                )
-            };
-            if ret > 0 {
-                off += ret as usize;
-                continue;
-            }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => {
-                    // The master should be blocking; be defensive and wait for writability.
-                    let mut pfd =
-                        libc::pollfd { fd: self.pty_fd, events: libc::POLLOUT, revents: 0 };
-                    unsafe { libc::poll(&mut pfd, 1, 100) };
-                }
-                _ => break, // EIO / peer gone, or write==0 — nothing more we can do
-            }
+        if bytes.is_empty() {
+            return;
         }
+        // A crashed pane has no live reader to drain its output; feeding it more input just
+        // backs bytes up in the kernel behind a dead parser. Drop input to the frozen pane.
+        if self.crashed.load(Ordering::Acquire) {
+            return;
+        }
+        // Hand the bytes to the writer thread and return immediately. The actual
+        // (potentially blocking) PTY-master write happens there, never on the GUI thread —
+        // a big paste into a child that isn't reading stdin must not freeze the app. The
+        // unbounded FIFO channel preserves order and never drops input (a terminal must
+        // never lose keystrokes). A send error means the writer is gone (pane dropped).
+        let _ = self.input_tx.send(bytes.to_vec());
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -521,30 +549,46 @@ impl VtPane {
         }
     }
 
+    /// Whether this pane is frozen after a caught panic (reader parser OR GUI render).
+    pub fn is_crashed(&self) -> bool {
+        self.crashed.load(Ordering::Acquire)
+    }
+
+    /// Record that the GUI's `render_snapshot` panicked for this pane and was caught: mark
+    /// it crashed (so the render loop skips it — no per-frame panic storm) and emit
+    /// `Crashed` once so it gets the same `[crashed]` badge the reader-thread path gives.
+    pub fn note_render_crash(&self) {
+        self.crashed.store(true, Ordering::Release);
+        if !self.exited.swap(true, Ordering::AcqRel) {
+            self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(PaneEvent::Crashed);
+        }
+        self.dirty.store(true, Ordering::Release);
+    }
+
     // ── Mode queries the GUI uses to encode input. ──
     pub fn app_cursor_keys(&self) -> bool {
-        self.term.lock().map(|t| t.app_cursor()).unwrap_or(false)
+        self.lock_term().app_cursor()
     }
     pub fn is_alt_screen(&self) -> bool {
-        self.term.lock().map(|t| t.alt_screen()).unwrap_or(false)
+        self.lock_term().alt_screen()
     }
     pub fn wants_mouse(&self) -> bool {
-        self.term.lock().map(|t| t.wants_mouse()).unwrap_or(false)
+        self.lock_term().wants_mouse()
     }
     pub fn wants_motion(&self) -> bool {
-        self.term.lock().map(|t| t.wants_motion()).unwrap_or(false)
+        self.lock_term().wants_motion()
     }
     pub fn mouse_sgr(&self) -> bool {
-        self.term.lock().map(|t| t.mouse_sgr()).unwrap_or(false)
+        self.lock_term().mouse_sgr()
     }
     pub fn bracketed_paste(&self) -> bool {
-        self.term.lock().map(|t| t.bracketed_paste()).unwrap_or(false)
+        self.lock_term().bracketed_paste()
     }
     pub fn focus_events(&self) -> bool {
-        self.term.lock().map(|t| t.focus_events()).unwrap_or(false)
+        self.lock_term().focus_events()
     }
     pub fn alt_scroll(&self) -> bool {
-        self.term.lock().map(|t| t.alt_scroll()).unwrap_or(false)
+        self.lock_term().alt_scroll()
     }
 
     pub fn drain_events(&self) -> Vec<PaneEvent> {
@@ -554,28 +598,14 @@ impl VtPane {
         // the child, so this also clears zombies promptly rather than only at drop.
         if let Ok(mut pty) = self.pty.lock() {
             if let Some(tty::ChildEvent::Exited(status)) = pty.next_child_event() {
-                let code = status.and_then(crate::exit_code); // authoritative $?-style status
-                if code.is_some() {
-                    *self.exit_code.lock().unwrap() = code; // remember for the EOF-race upgrade
-                }
+                // This is the sole exit authority and carries the real $?-style status, so
+                // there's no premature unknown-status Exited to race or upgrade.
+                let code = status.and_then(crate::exit_code);
                 if !self.exited.swap(true, Ordering::AcqRel) {
-                    self.events.lock().unwrap().push_back(PaneEvent::Exited(code));
+                    self.events.lock().unwrap_or_else(|e| e.into_inner()).push_back(PaneEvent::Exited(code));
                 }
             }
         }
-        let mut out: Vec<PaneEvent> =
-            self.events.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
-        // If the EOF reader queued an unknown-status exit but we've since reaped the code,
-        // fill it in so the pane surfaces the real status.
-        if let Some(code) = *self.exit_code.lock().unwrap() {
-            for e in &mut out {
-                if let PaneEvent::Exited(c) = e {
-                    if c.is_none() {
-                        *c = Some(code);
-                    }
-                }
-            }
-        }
-        out
+        self.events.lock().map(|mut q| q.drain(..).collect()).unwrap_or_else(|e| e.into_inner().drain(..).collect())
     }
 }
