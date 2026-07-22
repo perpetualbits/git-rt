@@ -308,6 +308,16 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        // rt: if the child was already reaped (our per-frame `next_child_event` try_waits
+        // it, and a non-zero-exit pane stays open for a long time afterward), its PID may
+        // have been recycled by the kernel — signalling it would hit an unrelated process.
+        // `Child::try_wait` caches the reaped status, so this needs no extra waitpid; only
+        // signal a child we can prove is still ours (`Ok(None)` = alive, not yet reaped).
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            unregister_signal(self.sig_id);
+            return;
+        }
+
         let pid = self.child.id() as i32;
         // Ask the child to hang up.
         unsafe {
