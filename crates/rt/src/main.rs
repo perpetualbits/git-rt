@@ -3282,6 +3282,23 @@ impl App {
                     }
                 };
 
+                // While a resize/divider-drag is settling, the reflow is deferred (~120ms, it
+                // is expensive with scrollback), so this snapshot is briefly the OLD, larger
+                // grid. Clamp the draw to the pane's CURRENT content rect — minus the
+                // scrollbar strip — so the stale extra columns/rows can't spill over the
+                // scrollbar or into the neighbouring pane until the reflow catches up (they'd
+                // "jump" into place, which reads as a glitch). No clamp once settled, so the
+                // normal appearance is unchanged. Single-column panes (the common case) only.
+                let (clamp_cols, clamp_rows) = if active.resize_pending && n <= 1 {
+                    let sb = if pane.scroll_info().1 > 0 { 7.0 } else { 0.0 }; // scrollbar: bw 6 + 1px inset
+                    (
+                        ((rect.w - sb) / cell_w).floor().max(0.0) as usize,
+                        (rect.h / cell_h).floor().max(0.0) as usize,
+                    )
+                } else {
+                    (usize::MAX, usize::MAX)
+                };
+
                 // Draw each cell: an opaque background quad only when the cell's
                 // background differs from the default (so ordinary text keeps the
                 // translucent window background), then the glyph in its colour.
@@ -3290,7 +3307,13 @@ impl App {
                         break; // guard against a transient over-tall snapshot mid-resize
                     }
                     let (ox, sub) = place(r); // where this line draws
+                    if sub >= clamp_rows {
+                        continue; // stale row past the current (smaller) height
+                    }
                     for (col_idx, cell) in row.iter().enumerate() {
+                        if col_idx >= clamp_cols {
+                            break; // stale col past the current width (kept clear of the scrollbar)
+                        }
                         // Selection highlight wins over the cell's own background;
                         // otherwise draw an explicit (non-default) background.
                         if hl_cur.contains(&(r, col_idx)) {
@@ -3328,7 +3351,10 @@ impl App {
                 // stays legible; the other shapes sit over the normal glyph.
                 if let Some(cur) = snap.cursor {
                     let in_range = cur.line < snap.rows.len() && (n <= 1 || cur.line / per_col < geom.count as usize);
-                    if in_range {
+                    let (_, cur_sub) = place(cur.line);
+                    // Also honour the mid-resize clamp so a stale cursor can't sit past the
+                    // new right/bottom edge (over the scrollbar or the neighbour).
+                    if in_range && cur.col < clamp_cols && cur_sub < clamp_rows {
                         use rt_engine::CursorShape;
                         let (ox, sub) = place(cur.line); // cursor's on-screen slot
                         let cc = active.settings.foreground; // cursor colour = configured foreground
