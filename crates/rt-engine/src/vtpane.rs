@@ -398,6 +398,15 @@ impl VtPane {
         let t = self.lock_term();
         (t.display_offset(), t.history_size(), t.rows())
     }
+    /// Whether visible row `row` soft-wraps into the next (its last cell has WRAPLINE).
+    pub fn line_wrapped(&self, row: usize) -> bool {
+        let t = self.lock_term();
+        let cols = t.cols();
+        if cols == 0 || row >= t.rows() {
+            return false;
+        }
+        t.cell_at(row as i32, cols - 1).wrapline()
+    }
     pub fn line_bounds(&self) -> LineBounds {
         let t = self.lock_term();
         LineBounds {

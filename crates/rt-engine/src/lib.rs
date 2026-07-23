@@ -745,6 +745,19 @@ impl AlacPane {
         (offset, history, screen)
     }
 
+    /// Whether visible row `row` soft-wraps into the next (its last cell has WRAPLINE), so a
+    /// word or selection that reaches the row's end continues onto row `row + 1`.
+    pub fn line_wrapped(&self, row: usize) -> bool {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let term = self.term.lock();
+        let cols = term.columns();
+        if cols == 0 || row >= term.screen_lines() {
+            return false;
+        }
+        term.grid()[Line(row as i32)][Column(cols - 1)].flags.contains(Flags::WRAPLINE)
+    }
+
     /// Extract the text of a selection given by two endpoints in ABSOLUTE grid
     /// lines (the alacritty `Line` index — `0..screen_lines` is the visible
     /// screen at the bottom, negative is scrollback history; the same coordinate
@@ -1171,6 +1184,12 @@ impl TermPane {
             Self::Vt(p) => p.scroll_info(),
         }
     }
+    pub fn line_wrapped(&self, row: usize) -> bool {
+        match self {
+            Self::Alac(p) => p.line_wrapped(row),
+            Self::Vt(p) => p.line_wrapped(row),
+        }
+    }
     pub fn selection_text(&self, anchor: (usize, i32), head: (usize, i32), block: bool) -> String {
         match self {
             Self::Alac(p) => p.selection_text(anchor, head, block),
@@ -1517,5 +1536,28 @@ mod damage_tests {
         // Select the whole wrapped line: (col 0, row 0) → (col 4, row 1).
         let got = pane.selection_text((0, 0), (4, 1), false);
         assert_eq!(got, s, "a soft-wrapped copy must be one logical line");
+    }
+
+    /// `line_wrapped` reports the soft-wrap flag that double-click word selection rides across:
+    /// a 25-char line in a 20-wide pane wraps, so row 0 is wrapped and its tail row is not.
+    #[test]
+    fn line_wrapped_reports_the_soft_wrap_flag() {
+        use std::time::{Duration, Instant};
+        let pane = AlacPane::spawn(
+            Some(("sh".into(), vec!["-c".into(), "printf %s ABCDEFGHIJKLMNOPQRSTUVWXY; sleep 30".into()])),
+            None,
+            20,
+            5,
+        )
+        .expect("spawn test pane");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if pane.snapshot().to_text().contains("UVWXY") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(pane.line_wrapped(0), "row 0 (full, autowrapped) must report wrapped");
+        assert!(!pane.line_wrapped(1), "row 1 (the short tail) must not");
     }
 }

@@ -1930,8 +1930,16 @@ impl ApplicationHandler for App {
                                 let line = row as i32 - off;
                                 match count {
                                     2 => {
-                                        if let Some((s, e)) = Self::word_at(active, pane, col, row) {
-                                            active.selection = Some(Selection { pane, anchor: (s, line), head: (e, line), block: false });
+                                        if let Some(((sc, sr), (ec, er))) = Self::word_at(active, pane, col, row) {
+                                            // Screen rows → absolute buffer lines (so the
+                                            // highlight rides the scroll); the word may span a
+                                            // soft-wrap, so start/end can be on different lines.
+                                            active.selection = Some(Selection {
+                                                pane,
+                                                anchor: (sc, sr as i32 - off),
+                                                head: (ec, er as i32 - off),
+                                                block: false,
+                                            });
                                         }
                                         active.selecting = false;
                                         Self::copy_selection_to_primary(active);
@@ -2834,26 +2842,57 @@ impl App {
     /// that usually belongs to paths/URLs). Returns the inclusive `(start, end)`
     /// columns, or `None` if the row/column is out of range. A click on a
     /// non-word character selects just that one cell.
-    fn word_at(active: &Active, pane: rt_core::PaneId, col: usize, row: usize) -> Option<(usize, usize)> {
-        let snap = active.session.pane(pane)?.snapshot(); // the pane's grid
-        let line = snap.rows.get(row)?; // the clicked row
-        if col >= line.len() {
-            return None; // click past the end of the row
-        }
-        // A "word" char: alphanumeric plus the symbols common in paths/URLs.
+    /// The word under `(col, row)` for a double-click, growing ACROSS soft-wrap boundaries so
+    /// a path/URL/key that wraps onto the next screen row selects whole (the old version
+    /// stopped at the row's end — "selects to the end of the row, not the filename"). Returns
+    /// the inclusive start/end cells in SCREEN coordinates `((start_col, start_row),
+    /// (end_col, end_row))`, or `None` if the click is past the row's content.
+    fn word_at(
+        active: &Active,
+        pane: rt_core::PaneId,
+        col: usize,
+        row: usize,
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let p = active.session.pane(pane)?;
+        let snap = p.snapshot(); // owned; safe to hold the pane borrow alongside
+        let cols = snap.cols;
+        let ch = |r: usize, c: usize| snap.rows.get(r).and_then(|line| line.get(c)).map(|cell| cell.c);
+        // A "word" char: alphanumeric plus the symbols common in paths/URLs/keys.
         let is_word = |c: char| c.is_alphanumeric() || "-_./~:@%+#=?&".contains(c);
-        if !is_word(line[col].c) {
-            return Some((col, col)); // lone symbol/space → single-cell select
+        if !is_word(ch(row, col)?) {
+            return Some(((col, row), (col, row))); // lone symbol/space → single cell
         }
-        let mut s = col; // grow the start leftwards
-        while s > 0 && is_word(line[s - 1].c) {
-            s -= 1;
+        // Grow the start leftwards, stepping onto the previous row when it soft-wraps into this.
+        let (mut sr, mut sc) = (row, col);
+        loop {
+            let (pr, pc) = if sc > 0 {
+                (sr, sc - 1)
+            } else if sr > 0 && cols > 0 && p.line_wrapped(sr - 1) {
+                (sr - 1, cols - 1)
+            } else {
+                break;
+            };
+            match ch(pr, pc) {
+                Some(c) if is_word(c) => (sr, sc) = (pr, pc),
+                _ => break,
+            }
         }
-        let mut e = col; // grow the end rightwards
-        while e + 1 < line.len() && is_word(line[e + 1].c) {
-            e += 1;
+        // Grow the end rightwards, stepping onto the next row when this one soft-wraps.
+        let (mut er, mut ec) = (row, col);
+        loop {
+            let (nr, nc) = if ec + 1 < cols {
+                (er, ec + 1)
+            } else if p.line_wrapped(er) {
+                (er + 1, 0)
+            } else {
+                break;
+            };
+            match ch(nr, nc) {
+                Some(c) if is_word(c) => (er, ec) = (nr, nc),
+                _ => break,
+            }
         }
-        Some((s, e))
+        Some(((sc, sr), (ec, er)))
     }
 
     /// Detect a URL at `(col, row)` for Ctrl+click opening. Expands over URL
@@ -3290,9 +3329,11 @@ impl App {
                 // "jump" into place, which reads as a glitch). No clamp once settled, so the
                 // normal appearance is unchanged. Single-column panes (the common case) only.
                 let (clamp_cols, clamp_rows) = if active.resize_pending && n <= 1 {
-                    let sb = if pane.scroll_info().1 > 0 { 7.0 } else { 0.0 }; // scrollbar: bw 6 + 1px inset
+                    // The scrollbar now lives in the right padding gutter, so clamp to the full
+                    // content width — just enough to keep stale columns/rows out of the
+                    // neighbour pane and the gutter until the reflow catches up.
                     (
-                        ((rect.w - sb) / cell_w).floor().max(0.0) as usize,
+                        (rect.w / cell_w).floor().max(0.0) as usize,
                         (rect.h / cell_h).floor().max(0.0) as usize,
                     )
                 } else {
@@ -4585,8 +4626,11 @@ fn fmt_lines(n: usize) -> String {
 /// are always the same rectangle. Only meaningful when `history > 0`.
 fn scrollbar_metrics(rect: Rect, offset: usize, history: usize, screen: usize) -> (f32, f32, f32, f32) {
     let total = (history + screen) as f32; // whole buffer height in lines
-    let bw = 6.0; // scrollbar width
-    let bx = rect.right() - bw - 1.0; // inset slightly from the grid's right edge
+    // Draw the scrollbar in the pane's right PADDING gutter (PANE_PAD = 5px, just RIGHT of
+    // `content_rect`), NOT inside it — so it never overlaps the last text column. Previously
+    // it sat at `right - 7`, covering `7 - slack` px of the final cell in every line.
+    let bw = 4.0; // scrollbar width (fits within the 5px gutter with a hair of margin)
+    let bx = rect.right() + 0.5; // 0.5px into the gutter → clear of every cell
     // Thumb size = the visible fraction of the buffer, floored so it stays
     // grabbable even for a huge history, and capped at the track height.
     let thumb_h = (screen as f32 / total * rect.h).max(24.0).min(rect.h);
