@@ -1945,8 +1945,27 @@ impl ApplicationHandler for App {
                                         Self::copy_selection_to_primary(active);
                                     }
                                     3 => {
-                                        let last = Self::line_last_col(active, pane, row);
-                                        active.selection = Some(Selection { pane, anchor: (0, line), head: (last, line), block: false });
+                                        // Whole LOGICAL line: expand across soft-wraps so a
+                                        // long wrapped line (a key/URL) selects as one piece.
+                                        // selection_text rejoins the wraps, so no newlines or
+                                        // extra spaces are inserted — only what's really there.
+                                        let (mut sr, mut er) = (row, row);
+                                        if let Some(p) = active.session.pane(pane) {
+                                            let screen = p.scroll_info().2; // visible row count
+                                            while sr > 0 && p.line_wrapped(sr - 1) {
+                                                sr -= 1; // up to the logical line's first row
+                                            }
+                                            while er + 1 < screen && p.line_wrapped(er) {
+                                                er += 1; // down to its last row
+                                            }
+                                        }
+                                        let last = Self::line_last_col(active, pane, er);
+                                        active.selection = Some(Selection {
+                                            pane,
+                                            anchor: (0, sr as i32 - off),
+                                            head: (last, er as i32 - off),
+                                            block: false,
+                                        });
                                         active.selecting = false;
                                         Self::copy_selection_to_primary(active);
                                     }
