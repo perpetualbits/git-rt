@@ -755,44 +755,63 @@ impl AlacPane {
     /// corners. Trailing blanks per line are trimmed; rows join with '\n'.
     pub fn selection_text(&self, anchor: (usize, i32), head: (usize, i32), block: bool) -> String {
         use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
         let term = self.term.lock();
         let grid = term.grid();
         let cols = term.columns();
         let (top, bot) = (term.topmost_line().0, term.bottommost_line().0); // readable line range
         let last_col = cols.saturating_sub(1);
-        let mut lines: Vec<String> = Vec::new();
+        // A row's chars over `[cs, ce]`, skipping wide-char spacer cells — invisible padding
+        // beside a wide glyph, not real spaces (they'd otherwise show up in the copy).
+        let row_text = |l: i32, cs: usize, ce: usize| -> String {
+            let row = &grid[Line(l)];
+            (cs..=ce.min(last_col))
+                .filter(|&c| {
+                    !row[Column(c)].flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                })
+                .map(|c| row[Column(c)].c)
+                .collect()
+        };
         if block {
-            // Rectangle: the same column range on every line between the corners.
+            // Rectangle: the same column range on every line; each row is its own line.
             let (c0, c1) = (anchor.0.min(head.0), anchor.0.max(head.0).min(last_col));
             let (l0, l1) = (anchor.1.min(head.1), anchor.1.max(head.1));
+            let mut lines: Vec<String> = Vec::new();
             for l in l0..=l1 {
                 if l < top || l > bot {
                     continue; // outside the readable buffer
                 }
-                let row = &grid[Line(l)];
-                let s: String = (c0..=c1).map(|c| row[Column(c)].c).collect();
-                lines.push(s.trim_end().to_string());
+                lines.push(row_text(l, c0, c1).trim_end().to_string());
             }
+            lines.join("\n")
         } else {
-            // Linear: order the endpoints by (line, col); first/last lines are
-            // bounded by their column, the middle lines run full width.
+            // Linear: order the endpoints by (line, col); first/last lines are bounded by
+            // their column, the middle lines run full width.
             let (start, end) = if (anchor.1, anchor.0) <= (head.1, head.0) { (anchor, head) } else { (head, anchor) };
+            let mut out = String::new();
             for l in start.1..=end.1 {
                 if l < top || l > bot {
                     continue;
                 }
-                let row = &grid[Line(l)];
                 let cs = if l == start.1 { start.0.min(last_col) } else { 0 };
                 let ce = if l == end.1 { end.0.min(last_col) } else { last_col };
-                let s: String = if cs <= ce {
-                    (cs..=ce).map(|c| row[Column(c)].c).collect()
+                let s = if cs <= ce { row_text(l, cs, ce) } else { String::new() };
+                // A soft-wrapped line (WRAPLINE on its last cell) is one logical line that
+                // continues into the next, so join it WITHOUT trimming or a newline — else a
+                // copied long line gains a spurious break at every screen wrap. (VtPane and
+                // alacritty's own copy do this; the vendored path here never did.)
+                let wrapped = l != end.1 && grid[Line(l)][Column(last_col)].flags.contains(Flags::WRAPLINE);
+                if wrapped {
+                    out.push_str(&s);
                 } else {
-                    String::new()
-                };
-                lines.push(s.trim_end().to_string());
+                    out.push_str(s.trim_end());
+                    if l != end.1 {
+                        out.push('\n');
+                    }
+                }
             }
+            out
         }
-        lines.join("\n")
     }
 
     /// The line-index bounds of everything currently in the grid, so a caller
@@ -1469,5 +1488,34 @@ mod damage_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(seen, "writer thread never delivered the typed command to the shell");
+    }
+
+    /// Copying a line that WRAPS across screen rows (one logical line, too long for the width)
+    /// must NOT insert a newline at the wrap — otherwise a pasted key/URL/token gains spurious
+    /// line breaks. 25 chars into a 20-wide pane wraps 20+5; the copy must rejoin them.
+    #[test]
+    fn copy_rejoins_soft_wrapped_line_without_a_break() {
+        use std::time::{Duration, Instant};
+        let s = "ABCDEFGHIJKLMNOPQRSTUVWXY"; // 25 chars, a single logical line
+        let pane = AlacPane::spawn(
+            Some(("sh".into(), vec!["-c".into(), format!("printf %s {s}; sleep 30")])),
+            None,
+            20,
+            5,
+        )
+        .expect("spawn test pane");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if pane.snapshot().to_text().contains("UVWXY") {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ready, "wrapped output never rendered");
+        // Select the whole wrapped line: (col 0, row 0) → (col 4, row 1).
+        let got = pane.selection_text((0, 0), (4, 1), false);
+        assert_eq!(got, s, "a soft-wrapped copy must be one logical line");
     }
 }
