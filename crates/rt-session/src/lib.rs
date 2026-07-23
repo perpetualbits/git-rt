@@ -27,6 +27,10 @@ pub trait Backend {
     fn resize(&mut self, cols: usize, rows: usize);
     /// Apply a colour palette to this pane (for live colour-scheme changes).
     fn set_palette(&mut self, palette: rt_engine::Palette);
+    /// Whether this pane's app enabled bracketed paste (DECSET 2004). A paste must be
+    /// wrapped in `\x1b[200~`…`\x1b[201~` for panes where this is true and sent raw where it
+    /// is false — decided PER PANE, since a broadcast paste can reach panes in either state.
+    fn bracketed_paste(&self) -> bool;
 }
 
 // Bridge the real engine pane into the `Backend` trait. This is the only place
@@ -40,6 +44,9 @@ impl Backend for rt_engine::TermPane {
     }
     fn set_palette(&mut self, palette: rt_engine::Palette) {
         rt_engine::TermPane::set_palette(self, palette); // delegate
+    }
+    fn bracketed_paste(&self) -> bool {
+        rt_engine::TermPane::bracketed_paste(self) // delegate to the engine pane's state
     }
 }
 
@@ -537,6 +544,30 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
         }
     }
 
+    /// Deliver a clipboard **paste** to the same targets as [`feed_input`](Session::feed_input),
+    /// but wrap it in bracketed-paste markers (`\x1b[200~`…`\x1b[201~`) **per pane**, according
+    /// to each target pane's own DECSET-2004 state. A broadcast paste can reach panes in either
+    /// state, so deciding once from the focused pane (the old bug) fed the wrong form to
+    /// mismatched panes — a bracketed-paste app got raw text and treated a pasted key's newlines
+    /// as Enter, so line breaks appeared in one pane but not another. The end marker is stripped
+    /// from the body first so pasted content can't break out of the bracket (injection guard).
+    pub fn feed_paste(&self, text: &[u8]) {
+        // Built once and shared by every bracketed-paste target.
+        let bracketed = {
+            let body = strip_paste_end_marker(text);
+            let mut w = Vec::with_capacity(body.len() + 12);
+            w.extend_from_slice(b"\x1b[200~");
+            w.extend_from_slice(&body);
+            w.extend_from_slice(b"\x1b[201~");
+            w
+        };
+        for (id, p) in &self.panes {
+            if self.receives_broadcast(*id) {
+                p.write(if p.bracketed_paste() { &bracketed } else { text });
+            }
+        }
+    }
+
     /// Would a keystroke reach pane `id` right now?
     ///
     /// Mirrors [`Session::feed_input`]'s fan-out exactly, and exists so the UI
@@ -799,6 +830,23 @@ fn cells_in(rect: Rect, cell: (f32, f32)) -> (usize, usize) {
     (cols.max(1), rows.max(1)) // clamp to a minimum 1x1 grid
 }
 
+/// Remove every embedded bracketed-paste END marker (`\x1b[201~`) from pasted text, so the
+/// content can't terminate the bracket early and inject commands (paste-injection guard).
+fn strip_paste_end_marker(text: &[u8]) -> Vec<u8> {
+    const END: &[u8] = b"\x1b[201~";
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with(END) {
+            i += END.len();
+        } else {
+            out.push(text[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,5 +879,54 @@ mod tests {
         // Far right / far down clamps, never out of bounds.
         let (col, row) = g.cell_at((g.col_cells + g.gap) as f32 * 9.0, 999.0);
         assert!(col < g.col_cells && row < g.count as usize * g.rows);
+    }
+
+    /// A write-capturing, bracketed-paste-configurable stand-in for a real PTY pane.
+    struct MockPane {
+        writes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        bracketed: bool,
+    }
+    impl Backend for MockPane {
+        fn write(&self, bytes: &[u8]) {
+            self.writes.borrow_mut().extend_from_slice(bytes);
+        }
+        fn resize(&mut self, _c: usize, _r: usize) {}
+        fn set_palette(&mut self, _p: rt_engine::Palette) {}
+        fn bracketed_paste(&self) -> bool {
+            self.bracketed
+        }
+    }
+
+    /// A broadcast paste must be bracketed PER PANE — each pane wrapped (or not) by its OWN
+    /// DECSET-2004 state — not decided once from the focused pane. The bug used the focused
+    /// pane's state for the whole group, so a group member with the opposite bracketed-paste
+    /// mode got the wrong form and mangled the newlines in a pasted multi-line key.
+    #[test]
+    fn broadcast_paste_wraps_per_pane_not_per_focus() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let buf0 = Rc::new(RefCell::new(Vec::new())); // focus pane: bracketed OFF
+        let buf1 = Rc::new(RefCell::new(Vec::new())); // grouped pane: bracketed ON
+        let b0 = buf0.clone();
+        let mut s = Session::new(
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            (8.0, 16.0),
+            move |_id, _c, _r| Some(MockPane { writes: b0.clone(), bracketed: false }),
+        );
+        let id0 = s.focus(); // PaneId(0), bracketed OFF (the focused pane)
+        let id1 = PaneId(1);
+        s.panes.insert(id1, MockPane { writes: buf1.clone(), bracketed: true });
+        s.groups.insert(id0, 1);
+        s.groups.insert(id1, 1);
+        s.broadcast = Broadcast::Group;
+
+        s.feed_paste(b"line1\nline2");
+
+        assert_eq!(&buf0.borrow()[..], b"line1\nline2", "focus pane (OFF) must get RAW text");
+        assert_eq!(
+            &buf1.borrow()[..],
+            b"\x1b[200~line1\nline2\x1b[201~",
+            "grouped pane (ON) must get its OWN bracketed wrap",
+        );
     }
 }

@@ -31,6 +31,9 @@ impl Backend for MockBackend {
         self.log.borrow_mut().size = (cols, rows); // record the latest size
     }
     fn set_palette(&mut self, _palette: rt_engine::Palette) {} // no-op for the mock
+    fn bracketed_paste(&self) -> bool {
+        false // these tests don't exercise paste bracketing; the unit test in lib.rs does
+    }
 }
 
 /// A spawner that hands out mock backends and stashes each one's log in a shared
