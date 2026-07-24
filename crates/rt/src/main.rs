@@ -28,6 +28,7 @@ mod menu; // right-click context menu (Terminator-style)
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
 mod render; // the GL glyph-atlas renderer
+mod select; // pure head-navigation logic for anchored selection
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
 use std::cell::RefCell; // shared jacks map between the spawn closure and Active
