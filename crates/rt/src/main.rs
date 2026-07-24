@@ -1859,10 +1859,32 @@ impl ApplicationHandler for App {
                             // select below run.
                             active.composing = false;
                             active.shift_press = false;
+                        } else if active.mods.shift_key() {
+                            // Shift+click commits — but only in the composing pane: it
+                            // sets the end at the clicked cell and copies. A Shift+click
+                            // in a DIFFERENT pane cancels instead (the spec's "start
+                            // fresh there" — a new anchor drops on the next click).
+                            let hit = Self::cell_at(active, mx, my);
+                            let same = matches!((hit, active.selection),
+                                (Some((p, ..)), Some(s)) if p == s.pane);
+                            if same {
+                                if let Some((pane, col, row)) = hit {
+                                    if let Some(sel) = active.selection.as_mut() {
+                                        let off = active
+                                            .session
+                                            .pane(pane)
+                                            .map(|p| p.scroll_info().0 as i32)
+                                            .unwrap_or(0);
+                                        sel.head = (col, row as i32 - off);
+                                    }
+                                }
+                                Self::compose_commit(active);
+                            } else {
+                                Self::compose_cancel(active);
+                            }
+                            return;
                         } else {
-                            // (Shift+click → set head + commit is added in Task 6;
-                            // for now any other click cancels so the mode is always escapable.)
-                            Self::compose_cancel(active);
+                            Self::compose_cancel(active); // a plain click cancels
                             return;
                         }
                     }
@@ -3063,6 +3085,16 @@ impl App {
         active.window.request_redraw();
     }
 
+    /// Finish anchored-compose: copy the selection to CLIPBOARD and PRIMARY, leave
+    /// it highlighted (like a completed drag-select), and exit the mode.
+    fn compose_commit(active: &mut Active) {
+        Self::do_copy(active); // CLIPBOARD + PRIMARY
+        active.composing = false;
+        active.shift_press = false;
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
     /// The head's movement bounds for the pane, from its grid width and buffer
     /// extent. Absolute lines run `-(history) ..= screen-1` (scrollback negative).
     fn compose_bounds(active: &Active, pane: rt_core::PaneId) -> Option<select::Bounds> {
@@ -3181,6 +3213,7 @@ impl App {
             let ctrl = active.mods.control_key();
             match &key_event.logical_key {
                 Key::Named(NamedKey::Escape) => Self::compose_cancel(active),
+                Key::Named(NamedKey::Enter) => Self::compose_commit(active),
                 Key::Named(NamedKey::ArrowLeft) => Self::compose_nav(active, Nav::Left, true),
                 Key::Named(NamedKey::ArrowRight) => Self::compose_nav(active, Nav::Right, true),
                 Key::Named(NamedKey::ArrowUp) => Self::compose_nav(active, Nav::Up, true),
