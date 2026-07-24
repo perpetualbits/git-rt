@@ -310,6 +310,7 @@ struct Active {
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
+    clip_history: clip_history::ClipHistory, // in-memory MRU ring of this session's copies
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
     x11_blur: x11_blur::X11Blur,          // X11 background blur (inert on Wayland / no x11 feature)
     selection: Option<Selection>,         // the current mouse text selection, if any
@@ -1052,6 +1053,7 @@ impl ApplicationHandler for App {
             menu_hover: None,
             ime_preedit: false,
             clipboard,
+            clip_history: clip_history::ClipHistory::new(),
             bg_effect,
             x11_blur,
             selection: None,
@@ -2099,8 +2101,9 @@ impl ApplicationHandler for App {
                             }
                         } else if let Some(text) = Self::selected_text(active) {
                             if let Some(cb) = &active.clipboard {
-                                cb.store_primary(text); // PRIMARY for middle-click paste
+                                cb.store_primary(text.clone()); // PRIMARY for middle-click paste
                             }
+                            Self::record_clip(active, &text);
                         }
                         active.force_full = true; // selection cleared/finalised: repaint highlight
                         active.window.request_redraw();
@@ -2687,10 +2690,18 @@ impl App {
             if !text.is_empty() {
                 if let Some(cb) = &active.clipboard {
                     cb.store(text.clone()); // CLIPBOARD (Ctrl+Shift+V / apps)
-                    cb.store_primary(text); // PRIMARY (middle-click paste)
+                    cb.store_primary(text.clone()); // PRIMARY (middle-click paste)
                 }
+                Self::record_clip(active, &text); // history
             }
         }
+    }
+
+    /// Funnel every user copy through here so it enters the clipboard history.
+    /// Called at the copy SITES (not inside clipboard.store), so promoting a
+    /// clip picked from the history does not re-enter capture.
+    fn record_clip(active: &mut Active, text: &str) {
+        active.clip_history.record(text.to_string());
     }
 
     /// Extract the selected text from its pane's grid, row by row, trimming
@@ -3076,11 +3087,12 @@ impl App {
     /// Copy-on-select for the word/line selections made by double/triple-click
     /// (drag-selection copies on button release instead). Pushes the current
     /// selection text to the PRIMARY buffer for middle-click paste.
-    fn copy_selection_to_primary(active: &Active) {
+    fn copy_selection_to_primary(active: &mut Active) {
         if let Some(text) = Self::selected_text(active) {
             if let Some(cb) = &active.clipboard {
-                cb.store_primary(text);
+                cb.store_primary(text.clone());
             }
+            Self::record_clip(active, &text);
         }
     }
 
