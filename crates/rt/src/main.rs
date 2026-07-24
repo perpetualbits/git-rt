@@ -21,6 +21,7 @@ mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
 #[cfg(feature = "x11")]
 mod xrender_backend; // mechanism C: XRender backend
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
+mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 mod damage; // pure pixel-rect damage accumulator
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
@@ -294,6 +295,9 @@ const JACK_R_FILL: f32 = 5.8; // filled centre when a wire uses the jack
 const JACK_R_RING: f32 = 5.4; // outline radius when the jack is idle
 const JACK_RING_W: f32 = 1.8; // outline stroke width
 
+/// Width (in cells) of the clipboard-history overlay panel.
+const CLIP_PREVIEW_COLS: usize = 44;
+
 /// Everything that only exists once a window and GL context are created (which
 /// happens on the first `resumed`). Kept in an `Option` on the `App` so we can
 /// build it lazily and tear it down on suspend.
@@ -307,8 +311,11 @@ struct Active {
     mouse: (f32, f32),                    // last cursor position in physical pixels
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
+    clip_overlay: Option<usize>,          // clipboard-history overlay open, carrying the selected row
+    clip_affordance: Option<chrome::Recti>, // titlebar "⎘ N" hit-rect for the focused pane this frame, if drawn
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
+    clip_history: clip_history::ClipHistory, // in-memory MRU ring of this session's copies
     bg_effect: Option<bg_effect::BackgroundEffect>, // compositor background blur (None if protocol absent)
     x11_blur: x11_blur::X11Blur,          // X11 background blur (inert on Wayland / no x11 feature)
     selection: Option<Selection>,         // the current mouse text selection, if any
@@ -1049,8 +1056,11 @@ impl ApplicationHandler for App {
             mouse: (0.0, 0.0),
             menu: None,
             menu_hover: None,
+            clip_overlay: None,
+            clip_affordance: None,
             ime_preedit: false,
             clipboard,
+            clip_history: clip_history::ClipHistory::new(),
             bg_effect,
             x11_blur,
             selection: None,
@@ -1550,6 +1560,71 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Clipboard-history overlay: modal like the context menu. Arrow keys move
+        // the selection, Enter/click picks, Esc/click-outside closes.
+        if let Some(sel) = active.clip_overlay {
+            let size = active.window.inner_size();
+            let (cw, ch) = active.backend.cell_size();
+            let n = active.clip_history.len();
+            let anchor = Self::pane_content_rect(active, active.session.focus())
+                .map(|r| (r.x, r.y))
+                .unwrap_or((40.0, 40.0));
+            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS);
+            match &event {
+                WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
+                    match &ke.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            active.clip_overlay = None;
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        Key::Named(NamedKey::Enter) => Self::pick_clip(active, sel),
+                        Key::Named(NamedKey::ArrowDown) => {
+                            active.clip_overlay = Some((sel + 1).min(g.clear_row));
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            active.clip_overlay = Some(sel.saturating_sub(1));
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    active.mouse = (position.x as f32, position.y as f32);
+                    if let Some(i) = chrome::clip_history::hit_row(&g, active.mouse) {
+                        active.clip_overlay = Some(i);
+                        active.force_full = true;
+                        active.window.request_redraw();
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                    match chrome::clip_history::hit_row(&g, active.mouse) {
+                        Some(i) => Self::pick_clip(active, i),
+                        None => {
+                            // click outside
+                            active.clip_overlay = None;
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // Swallow remaining input (releases, wheel, IME, mods); lifecycle
+                // events fall through to normal handling.
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::ModifiersChanged(_) => return,
+                _ => {}
+            }
+        }
+
         // The scrollback-search bar is a lighter overlay: it captures typing and
         // Enter/Escape for navigation, but leaves the terminal visible and lets
         // mouse events (scroll/click) through so the user can still look around
@@ -1900,6 +1975,17 @@ impl ApplicationHandler for App {
                         let size = active.window.inner_size();
                         let bounds = content_bounds(size);
                         let (mx, my) = active.mouse;
+                        // A press on the clipboard-history titlebar affordance opens
+                        // the overlay. Checked first (like the jack/divider/scrollbar
+                        // hit-tests below) so it wins over click-to-focus/selection —
+                        // the rect only exists on the focused pane's titlebar, where
+                        // `cell_at` would return None (no selection) anyway.
+                        if let Some(r) = active.clip_affordance {
+                            if r.contains(active.mouse) {
+                                Self::open_clip_history(active);
+                                return;
+                            }
+                        }
                         // A press on an output jack starts a drag-to-wire. Checked
                         // *before* the divider, since jacks sit on the pane edge
                         // (which is also the divider) and should win.
@@ -2098,8 +2184,9 @@ impl ApplicationHandler for App {
                             }
                         } else if let Some(text) = Self::selected_text(active) {
                             if let Some(cb) = &active.clipboard {
-                                cb.store_primary(text); // PRIMARY for middle-click paste
+                                cb.store_primary(text.clone()); // PRIMARY for middle-click paste
                             }
+                            Self::record_clip(active, &text);
                         }
                         active.force_full = true; // selection cleared/finalised: repaint highlight
                         active.window.request_redraw();
@@ -2640,6 +2727,21 @@ impl App {
                 active.window.set_fullscreen(fs);
                 active.window.request_redraw();
             }
+            Action::ClipHistory => {
+                if active.clip_overlay.is_some() {
+                    active.clip_overlay = None; // toggle closed
+                    active.force_full = true;
+                    active.window.request_redraw();
+                } else {
+                    Self::open_clip_history(active);
+                }
+            }
+            Action::ClearClipHistory => {
+                active.clip_history.clear();
+                active.clip_overlay = None;
+                active.force_full = true;
+                active.window.request_redraw();
+            }
             // Everything else is a session action.
             other => match active.session.apply(other) {
                 Some(SessionEvent::CloseWindow) => exit_clean(), // last pane closed; clean up first
@@ -2686,10 +2788,50 @@ impl App {
             if !text.is_empty() {
                 if let Some(cb) = &active.clipboard {
                     cb.store(text.clone()); // CLIPBOARD (Ctrl+Shift+V / apps)
-                    cb.store_primary(text); // PRIMARY (middle-click paste)
+                    cb.store_primary(text.clone()); // PRIMARY (middle-click paste)
                 }
+                Self::record_clip(active, &text); // history
             }
         }
+    }
+
+    /// Funnel every user copy through here so it enters the clipboard history.
+    /// Called at the copy SITES (not inside clipboard.store), so promoting a
+    /// clip picked from the history does not re-enter capture.
+    fn record_clip(active: &mut Active, text: &str) {
+        active.clip_history.record(text.to_string());
+    }
+
+    /// Open the clipboard-history overlay (no-op if the history is empty),
+    /// selecting the newest clip.
+    fn open_clip_history(active: &mut Active) {
+        if active.clip_history.is_empty() {
+            return;
+        }
+        active.clip_overlay = Some(0);
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
+    /// Act on a picked overlay row: the Clear row empties the history; a clip row
+    /// pastes that clip into the focused pane, promotes it to CLIPBOARD+PRIMARY,
+    /// and moves it to the front. Always closes the overlay.
+    fn pick_clip(active: &mut Active, row: usize) {
+        let n = active.clip_history.len();
+        if row >= n {
+            // the Clear row
+            active.clip_history.clear();
+        } else if let Some(text) = active.clip_history.get(row).map(str::to_string) {
+            active.session.feed_paste(text.as_bytes()); // per-pane bracketed paste
+            if let Some(cb) = &active.clipboard {
+                cb.store(text.clone());
+                cb.store_primary(text.clone());
+            }
+            active.clip_history.record(text); // move-to-front (does NOT go through record_clip)
+        }
+        active.clip_overlay = None;
+        active.force_full = true;
+        active.window.request_redraw();
     }
 
     /// Extract the selected text from its pane's grid, row by row, trimming
@@ -3075,11 +3217,12 @@ impl App {
     /// Copy-on-select for the word/line selections made by double/triple-click
     /// (drag-selection copies on button release instead). Pushes the current
     /// selection text to the PRIMARY buffer for middle-click paste.
-    fn copy_selection_to_primary(active: &Active) {
+    fn copy_selection_to_primary(active: &mut Active) {
         if let Some(text) = Self::selected_text(active) {
             if let Some(cb) = &active.clipboard {
-                cb.store_primary(text);
+                cb.store_primary(text.clone());
             }
+            Self::record_clip(active, &text);
         }
     }
 
@@ -3496,6 +3639,11 @@ impl App {
         let focus = active.session.focus(); // which pane is focused
         let (cell_w, cell_h) = active.backend.cell_size(); // px per cell
         let sep = column_separator(active.settings.foreground, cfg_bg); // fg/bg midpoint: visible but not text-weight
+        // Reset the clip-history titlebar affordance's hit-rect before the
+        // per-pane pass: it is set at most once below (focused pane, non-empty
+        // history), so a stale rect from a previous frame must not survive the
+        // pane unfocusing or the history emptying.
+        active.clip_affordance = None;
         // Draw every visible pane. (No per-pane background fill: the translucent
         // clear above already is the background.) Iterates the pre-fetched
         // snapshots so the engine's damage state is not advanced again here.
@@ -3827,6 +3975,18 @@ impl App {
                         left_of = mx; // title truncates before the meter
                     }
                 }
+                // Clipboard-history affordance: on the focused pane's titlebar, a
+                // clip glyph + count that opens the history overlay on click.
+                if focused && !active.clip_history.is_empty() {
+                    let label = format!("⎘ {}", active.clip_history.len());
+                    let lw = label.chars().count() as f32 * cell_w;
+                    let lx = (left_of - 2.0 * cell_w - lw).max(left_x);
+                    for (i, ch) in label.chars().enumerate() {
+                        active.backend.draw_char(lx, text_top, i, 0, ch, Color::rgb(0x8b, 0x98, 0xa9), false, false);
+                    }
+                    active.clip_affordance = Some(chrome::Recti { x: lx, y: full.y, w: lw, h: bar_h });
+                    left_of = lx;
+                }
                 // Title on the left, truncated so it never runs into the meter/size.
                 // While composing an anchored selection in this pane, replace the
                 // title with a live status ("◉ selecting · N lines") in the
@@ -3974,7 +4134,10 @@ impl App {
         let (cw, ch) = active.backend.cell_size();
         // Whether a menu/manual/search overlay is up; instruments hide beneath it.
         // (Preferences returned above.)
-        let overlay_up = active.menu.is_some() || active.manual_open || active.search_open;
+        let overlay_up = active.menu.is_some()
+            || active.manual_open
+            || active.search_open
+            || active.clip_overlay.is_some();
 
         // Instruments differ by backend. GL: an egui background pass each frame,
         // only when nothing covers them. XRender: a persistent, separate ARGB
@@ -4026,6 +4189,23 @@ impl App {
             let count = active.search_matches.len();
             let pos = if count == 0 { 0 } else { active.search_index + 1 };
             chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, cw, ch);
+        }
+        // Clipboard-history overlay draws on top of everything above (the menu
+        // block's early-return means it can't be up at the same time in
+        // practice, but this keeps it topmost regardless).
+        if let Some(sel) = active.clip_overlay {
+            let n = active.clip_history.len();
+            let anchor = Self::pane_content_rect(active, active.session.focus())
+                .map(|r| (r.x, r.y))
+                .unwrap_or((40.0, 40.0));
+            let previews: Vec<String> = active
+                .clip_history
+                .iter()
+                .map(|c| clip_history::preview(c, CLIP_PREVIEW_COLS - 8))
+                .collect();
+            let badges: Vec<String> = active.clip_history.iter().map(clip_history::badge).collect();
+            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS);
+            chrome::clip_history::draw(&mut *active.backend, &g, &previews, &badges, Some(sel), sel, cw, ch);
         }
     }
 

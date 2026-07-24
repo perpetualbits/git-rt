@@ -7,6 +7,7 @@
 //! encoding of ordinary typed keys into the bytes a PTY expects. Both live here
 //! as pure functions with unit tests.
 
+pub mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 pub mod damage; // pure pixel-rect damage accumulator
 pub mod input; // winit key/modifiers -> Chord, and typed-key -> PTY bytes
 pub mod raster; // CPU anti-aliased coverage masks (disc/ring/bar), used by render.rs

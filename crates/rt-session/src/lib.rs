@@ -494,7 +494,9 @@ impl<B: Backend, F: FnMut(PaneId, usize, usize) -> Option<B>> Session<B, F> {
             | Action::WireStderr
             | Action::Unwire
             | Action::PipeInto
-            | Action::Manual => None,
+            | Action::Manual
+            | Action::ClipHistory
+            | Action::ClearClipHistory => None,
         }
     }
 
