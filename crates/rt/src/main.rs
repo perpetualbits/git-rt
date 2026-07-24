@@ -3063,6 +3063,75 @@ impl App {
         active.window.request_redraw();
     }
 
+    /// The head's movement bounds for the pane, from its grid width and buffer
+    /// extent. Absolute lines run `-(history) ..= screen-1` (scrollback negative).
+    fn compose_bounds(active: &Active, pane: rt_core::PaneId) -> Option<select::Bounds> {
+        let content = Self::pane_content_rect(active, pane)?;
+        let (cw, _) = active.backend.cell_size();
+        let cols = (content.w / cw).max(0.0) as usize;
+        let (_, history, screen) = active.session.pane(pane)?.scroll_info();
+        Some(select::Bounds {
+            cols,
+            min_line: -(history as i32),
+            max_line: screen as i32 - 1,
+            page: screen,
+        })
+    }
+
+    /// Scroll the pane just enough that absolute line `head_line` is on screen.
+    /// Visible absolute lines are `[-offset, screen-1-offset]`; step one line at a
+    /// time (bounded) toward the head.
+    fn scroll_head_into_view(active: &mut Active, pane: rt_core::PaneId, head_line: i32) {
+        for _ in 0..10_000 {
+            // safety cap: never spin
+            let Some(p) = active.session.pane(pane) else { return };
+            let (offset, _, screen) = p.scroll_info();
+            let top = -(offset as i32);
+            let bottom = screen as i32 - 1 - offset as i32;
+            if head_line < top {
+                p.scroll(1); // toward older history
+            } else if head_line > bottom {
+                p.scroll(-1); // toward newest
+            } else {
+                return; // in view
+            }
+        }
+    }
+
+    /// Apply a head navigation while composing. Arrow moves (accelerate = true)
+    /// repeat per the held-arrow acceleration the user configured; jumps apply
+    /// once. Then scroll to keep the head visible and repaint.
+    fn compose_nav(active: &mut Active, nav: select::Nav, accelerate: bool) {
+        let Some(sel) = active.selection else { return };
+        let pane = sel.pane;
+        let Some(bounds) = Self::compose_bounds(active, pane) else { return };
+        // Held-arrow acceleration: reuse arrow_hold/arrow_accel_step. `arrow` is a
+        // per-direction tag so a change of direction resets the run.
+        let now = Instant::now();
+        let steps = if accelerate && active.settings.arrow_accel {
+            let tag = nav as u8; // stable per Nav variant
+            let repeats = match active.arrow_hold {
+                Some((prev, t, n)) if prev == tag && now.duration_since(t) < ARROW_HOLD_GAP => n + 1,
+                _ => 0,
+            };
+            active.arrow_hold = Some((tag, now, repeats));
+            arrow_accel_step(repeats, active.settings.arrow_accel_max)
+        } else {
+            active.arrow_hold = None;
+            1
+        };
+        let mut head = sel.head;
+        for _ in 0..steps {
+            head = select::move_head(head, nav, bounds);
+        }
+        if let Some(s) = active.selection.as_mut() {
+            s.head = head;
+        }
+        Self::scroll_head_into_view(active, pane, head.1);
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
     /// Reload the renderer's fonts from the current settings (rebuilding the
     /// font chains if the family changed), re-measure the cell, and resize every
     /// pane to the new (cols, rows). Shared by the preferences dialog and the
@@ -3104,12 +3173,25 @@ impl App {
         if active.ime_preedit {
             return;
         }
-        // Anchored-compose is modal: keyboard input drives the selection, not the
-        // shell. Esc cancels; navigation/commit keys are added in later tasks;
-        // every other key is swallowed so nothing leaks to the pane.
+        // Anchored-compose is modal: keyboard input drives the selection head, not
+        // the shell. Arrows accelerate on hold (reusing the arrow-accel prefs);
+        // Home/End/Page/Ctrl+Home/End jump; Esc cancels; anything else is swallowed.
         if active.composing {
-            if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
-                Self::compose_cancel(active);
+            use select::Nav;
+            let ctrl = active.mods.control_key();
+            match &key_event.logical_key {
+                Key::Named(NamedKey::Escape) => Self::compose_cancel(active),
+                Key::Named(NamedKey::ArrowLeft) => Self::compose_nav(active, Nav::Left, true),
+                Key::Named(NamedKey::ArrowRight) => Self::compose_nav(active, Nav::Right, true),
+                Key::Named(NamedKey::ArrowUp) => Self::compose_nav(active, Nav::Up, true),
+                Key::Named(NamedKey::ArrowDown) => Self::compose_nav(active, Nav::Down, true),
+                Key::Named(NamedKey::Home) if ctrl => Self::compose_nav(active, Nav::BufTop, false),
+                Key::Named(NamedKey::End) if ctrl => Self::compose_nav(active, Nav::BufBottom, false),
+                Key::Named(NamedKey::Home) => Self::compose_nav(active, Nav::LineStart, false),
+                Key::Named(NamedKey::End) => Self::compose_nav(active, Nav::LineEnd, false),
+                Key::Named(NamedKey::PageUp) => Self::compose_nav(active, Nav::PageUp, false),
+                Key::Named(NamedKey::PageDown) => Self::compose_nav(active, Nav::PageDown, false),
+                _ => {} // swallow everything else
             }
             return;
         }
