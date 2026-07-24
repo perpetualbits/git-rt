@@ -97,6 +97,10 @@ pub enum Action {
     PipeInto,
     /// Open/close the built-in manual overlay.
     Manual,
+    /// Open/close the clipboard-history overlay (recent copies).
+    ClipHistory,
+    /// Empty the clipboard history.
+    ClearClipHistory,
 }
 
 /// Window-level appearance settings (Terminator's "Profiles → Background" in
@@ -414,9 +418,15 @@ impl Config {
 /// lookup is O(n) but trivially fast, and a `Vec` preserves the ability to have
 /// later user bindings override earlier defaults simply by being searched
 /// first. `action_for` returns the first match.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Keymap {
     bindings: Vec<(Chord, Action)>, // searched front-to-back; user entries go first
+}
+
+impl Default for Keymap {
+    fn default() -> Self {
+        Keymap::defaults()
+    }
 }
 
 impl Keymap {
@@ -441,6 +451,7 @@ impl Keymap {
             ("<Alt>Right", Action::GoRight),             // go_right
             ("<Shift><Control>c", Action::Copy),         // copy
             ("<Shift><Control>v", Action::Paste),        // paste
+            ("<Shift><Control>h", Action::ClipHistory),  // clipboard history
             ("<Shift><Control>q", Action::CloseWindow),  // close_window
             // rt-specific newspaper-column controls. Deliberately Ctrl+symbol
             // (no Shift) so winit's shifted-symbol remapping can't break them.
@@ -473,7 +484,7 @@ impl Keymap {
             ("<Shift><Control>p", Action::PipeInto),     // split + pipe stdout in
             ("F1", Action::Manual),                      // built-in manual
         ];
-        let mut map = Keymap::default(); // empty binding list
+        let mut map = Keymap { bindings: Vec::new() }; // empty binding list
         for (accel, action) in defaults {
             // Parse each default; a malformed default is a programming error, so
             // we skip it rather than panic (keeps `defaults()` infallible).
@@ -532,5 +543,12 @@ mod config_tests {
         s2.normalize();
         assert_eq!(s2.background_opacity, Settings::MIN_OPACITY);
         assert_eq!(s2.font_size, 14.0, "an in-range value is left alone");
+    }
+
+    #[test]
+    fn ctrl_shift_h_opens_clip_history_by_default() {
+        let km = Keymap::default();
+        let chord = keys::Chord::parse("<Shift><Control>h").expect("valid chord");
+        assert_eq!(km.action_for(&chord), Some(Action::ClipHistory));
     }
 }
