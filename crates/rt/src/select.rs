@@ -53,6 +53,21 @@ pub fn move_head(head: (usize, i32), nav: Nav, b: Bounds) -> (usize, i32) {
     (col.min(max_col), line)
 }
 
+/// The titlebar status shown while composing. Linear selections read as a line
+/// count; block selections as `cols×rows`. Both spans are inclusive and
+/// order-independent (the head may sit above/left of the anchor).
+pub fn status_text(anchor: (usize, i32), head: (usize, i32), block: bool) -> String {
+    if block {
+        let cols = (anchor.0 as i64 - head.0 as i64).unsigned_abs() as usize + 1;
+        let rows = (anchor.1 - head.1).unsigned_abs() as usize + 1;
+        format!("◉ selecting · {cols}×{rows}")
+    } else {
+        let lines = (anchor.1 - head.1).unsigned_abs() as usize + 1;
+        let unit = if lines == 1 { "line" } else { "lines" };
+        format!("◉ selecting · {lines} {unit}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +110,17 @@ mod tests {
         let z = Bounds { cols: 0, min_line: -5, max_line: 5, page: 10 };
         assert_eq!(move_head((0, 0), Nav::Right, z), (0, 0));
         assert_eq!(move_head((0, 0), Nav::LineEnd, z), (0, 0));
+    }
+
+    #[test]
+    fn status_reads_line_count_for_linear_and_dimensions_for_block() {
+        // Linear: inclusive line span, pluralised.
+        assert_eq!(status_text((0, 0), (10, 0), false), "◉ selecting · 1 line");
+        assert_eq!(status_text((0, 0), (3, 4), false), "◉ selecting · 5 lines");
+        // Order-independent (head may be above the anchor).
+        assert_eq!(status_text((0, 4), (3, 0), false), "◉ selecting · 5 lines");
+        // Block: cols × rows, inclusive, order-independent.
+        assert_eq!(status_text((2, 0), (13, 3), true), "◉ selecting · 12×4");
+        assert_eq!(status_text((13, 3), (2, 0), true), "◉ selecting · 12×4");
     }
 }
