@@ -28,6 +28,7 @@ mod menu; // right-click context menu (Terminator-style)
 mod prefs_model; // which setting each preferences row edits, and how a step clamps
 mod raster; // CPU anti-aliased coverage masks (disc/ring/bar) shared by GL + XRender
 mod render; // the GL glyph-atlas renderer
+mod select; // pure head-navigation logic for anchored selection
 
 use std::num::NonZeroU32; // required by glutin's surface resize API
 use std::cell::RefCell; // shared jacks map between the spawn closure and Active
@@ -312,6 +313,8 @@ struct Active {
     x11_blur: x11_blur::X11Blur,          // X11 background blur (inert on Wayland / no x11 feature)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
+    composing: bool,   // true while an anchored selection is being built (modal)
+    shift_press: bool, // the in-flight left-press was Shift-held (candidate for compose entry)
     mouse_report: Option<(rt_core::PaneId, u16)>, // pane + xterm button code we're forwarding a press to
     hover_cell: Option<(rt_core::PaneId, usize, usize)>, // last cell reported to a 1003 (any-motion) app
     scroll_drag: Option<(rt_core::PaneId, f32, Rect)>, // dragging the scrollbar: (pane, grab-offset in thumb, grid rect)
@@ -1052,6 +1055,8 @@ impl ApplicationHandler for App {
             x11_blur,
             selection: None,
             selecting: false,
+            composing: false,
+            shift_press: false,
             mouse_report: None,
             hover_cell: None,
             scroll_drag: None,
@@ -1766,6 +1771,7 @@ impl ApplicationHandler for App {
                         if let Some(sel) = active.selection.as_mut() {
                             if sel.pane == pane {
                                 sel.head = (col, row as i32 - off); // move the drag end
+                                active.shift_press = false; // a drag, not a click → not compose entry
                                 active.force_full = true; // selection highlight isn't engine-tracked damage
                                 active.window.request_redraw();
                             }
@@ -1830,6 +1836,58 @@ impl ApplicationHandler for App {
                     active.window.request_redraw();
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
+                    // While composing an anchored selection, a click finishes or
+                    // aborts it — it never starts a new selection. EXCEPT: a
+                    // Shift+double/triple-click is two press/release pairs, and the
+                    // FIRST press always resolves as a plain single-click (the
+                    // click-count counter only advances on the *next* press), so its
+                    // release — no drag, shift held — promotes into compose before the
+                    // second press ever arrives. Without this check that second press
+                    // would just cancel compose and swallow the word/line selection.
+                    // Detect that continuation with the same timing+proximity test the
+                    // click-count logic below uses, and if it matches, abandon compose
+                    // and fall through so the word/line select still runs.
+                    if active.composing {
+                        let now = Instant::now();
+                        let (mx, my) = active.mouse;
+                        let continuation = matches!(active.last_click, Some((t, (lx, ly)))
+                            if now.duration_since(t) < Duration::from_millis(400)
+                                && (mx - lx).abs() < 5.0 && (my - ly).abs() < 5.0);
+                        if continuation {
+                            // A Shift+double/triple-click whose first release entered
+                            // compose: abandon compose and let the normal word/line
+                            // select below run.
+                            active.composing = false;
+                            active.shift_press = false;
+                        } else if active.mods.shift_key() {
+                            // Shift+click commits — but only in the composing pane: it
+                            // sets the end at the clicked cell and copies. A Shift+click
+                            // in a DIFFERENT pane cancels instead (the spec's "start
+                            // fresh there" — a new anchor drops on the next click).
+                            let hit = Self::cell_at(active, mx, my);
+                            let same = matches!((hit, active.selection),
+                                (Some((p, ..)), Some(s)) if p == s.pane);
+                            if same {
+                                if let Some((pane, col, row)) = hit {
+                                    if let Some(sel) = active.selection.as_mut() {
+                                        let off = active
+                                            .session
+                                            .pane(pane)
+                                            .map(|p| p.scroll_info().0 as i32)
+                                            .unwrap_or(0);
+                                        sel.head = (col, row as i32 - off);
+                                    }
+                                }
+                                Self::compose_commit(active);
+                            } else {
+                                Self::compose_cancel(active);
+                            }
+                            return;
+                        } else {
+                            Self::compose_cancel(active); // a plain click cancels
+                            return;
+                        }
+                    }
                     {
                         let size = active.window.inner_size();
                         let bounds = content_bounds(size);
@@ -1980,6 +2038,9 @@ impl ApplicationHandler for App {
                                         let block = active.mods.control_key();
                                         active.selection = Some(Selection { pane, anchor: (col, line), head: (col, line), block });
                                         active.selecting = true;
+                                        // A Shift-held press with no ensuing drag becomes an
+                                        // anchored-compose start (resolved at release).
+                                        active.shift_press = active.mods.shift_key();
                                     }
                                 }
                                 active.force_full = true; // selection highlight changed
@@ -2020,7 +2081,13 @@ impl ApplicationHandler for App {
                     // (copy-on-select) copy a real selection to PRIMARY.
                     if let Some(sel) = active.selection {
                         if sel.anchor == sel.head {
-                            active.selection = None;
+                            if active.shift_press {
+                                // No drag followed a Shift-press: promote to anchored
+                                // compose. Keep the (zero-length) selection as the anchor.
+                                active.composing = true;
+                            } else {
+                                active.selection = None; // a plain click: discard
+                            }
                         } else if let Some(text) = Self::selected_text(active) {
                             if let Some(cb) = &active.clipboard {
                                 cb.store_primary(text); // PRIMARY for middle-click paste
@@ -2029,6 +2096,7 @@ impl ApplicationHandler for App {
                         active.force_full = true; // selection cleared/finalised: repaint highlight
                         active.window.request_redraw();
                     }
+                    active.shift_press = false; // consumed
                 }
                 (ElementState::Pressed, MouseButton::Middle) => {
                     // A mouse-reporting app gets the middle-press; otherwise (or
@@ -3007,6 +3075,95 @@ impl App {
         }
     }
 
+    /// Leave anchored-compose mode, discarding the in-progress selection and
+    /// touching no clipboard.
+    fn compose_cancel(active: &mut Active) {
+        active.composing = false;
+        active.shift_press = false;
+        active.selection = None;
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
+    /// Finish anchored-compose: copy the selection to CLIPBOARD and PRIMARY, leave
+    /// it highlighted (like a completed drag-select), and exit the mode.
+    fn compose_commit(active: &mut Active) {
+        Self::do_copy(active); // CLIPBOARD + PRIMARY
+        active.composing = false;
+        active.shift_press = false;
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
+    /// The head's movement bounds for the pane, from its grid width and buffer
+    /// extent. Absolute lines run `-(history) ..= screen-1` (scrollback negative).
+    fn compose_bounds(active: &Active, pane: rt_core::PaneId) -> Option<select::Bounds> {
+        let content = Self::pane_content_rect(active, pane)?;
+        let (cw, _) = active.backend.cell_size();
+        let cols = (content.w / cw).max(0.0) as usize;
+        let (_, history, screen) = active.session.pane(pane)?.scroll_info();
+        Some(select::Bounds {
+            cols,
+            min_line: -(history as i32),
+            max_line: screen as i32 - 1,
+            page: screen,
+        })
+    }
+
+    /// Scroll the pane just enough that absolute line `head_line` is on screen.
+    /// Visible absolute lines are `[-offset, screen-1-offset]`; step one line at a
+    /// time (bounded) toward the head.
+    fn scroll_head_into_view(active: &mut Active, pane: rt_core::PaneId, head_line: i32) {
+        for _ in 0..10_000 {
+            // safety cap: never spin
+            let Some(p) = active.session.pane(pane) else { return };
+            let (offset, _, screen) = p.scroll_info();
+            let top = -(offset as i32);
+            let bottom = screen as i32 - 1 - offset as i32;
+            if head_line < top {
+                p.scroll(1); // toward older history
+            } else if head_line > bottom {
+                p.scroll(-1); // toward newest
+            } else {
+                return; // in view
+            }
+        }
+    }
+
+    /// Apply a head navigation while composing. Arrow moves (accelerate = true)
+    /// repeat per the held-arrow acceleration the user configured; jumps apply
+    /// once. Then scroll to keep the head visible and repaint.
+    fn compose_nav(active: &mut Active, nav: select::Nav, accelerate: bool) {
+        let Some(sel) = active.selection else { return };
+        let pane = sel.pane;
+        let Some(bounds) = Self::compose_bounds(active, pane) else { return };
+        // Held-arrow acceleration: reuse arrow_hold/arrow_accel_step. `arrow` is a
+        // per-direction tag so a change of direction resets the run.
+        let now = Instant::now();
+        let steps = if accelerate && active.settings.arrow_accel {
+            let tag = nav as u8; // stable per Nav variant
+            let repeats = match active.arrow_hold {
+                Some((prev, t, n)) if prev == tag && now.duration_since(t) < ARROW_HOLD_GAP => n + 1,
+                _ => 0,
+            };
+            active.arrow_hold = Some((tag, now, repeats));
+            arrow_accel_step(repeats, active.settings.arrow_accel_max)
+        } else {
+            active.arrow_hold = None;
+            1
+        };
+        let mut head = sel.head;
+        for _ in 0..steps {
+            head = select::move_head(head, nav, bounds);
+        }
+        if let Some(s) = active.selection.as_mut() {
+            s.head = head;
+        }
+        Self::scroll_head_into_view(active, pane, head.1);
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
     /// Reload the renderer's fonts from the current settings (rebuilding the
     /// font chains if the family changed), re-measure the cell, and resize every
     /// pane to the new (cols, rows). Shared by the preferences dialog and the
@@ -3046,6 +3203,29 @@ impl App {
         // the composed result arrives via WindowEvent::Ime(Commit) instead. This
         // is what prevents the dead key (´) and its result (ó) both being sent.
         if active.ime_preedit {
+            return;
+        }
+        // Anchored-compose is modal: keyboard input drives the selection head, not
+        // the shell. Arrows accelerate on hold (reusing the arrow-accel prefs);
+        // Home/End/Page/Ctrl+Home/End jump; Esc cancels; anything else is swallowed.
+        if active.composing {
+            use select::Nav;
+            let ctrl = active.mods.control_key();
+            match &key_event.logical_key {
+                Key::Named(NamedKey::Escape) => Self::compose_cancel(active),
+                Key::Named(NamedKey::Enter) => Self::compose_commit(active),
+                Key::Named(NamedKey::ArrowLeft) => Self::compose_nav(active, Nav::Left, true),
+                Key::Named(NamedKey::ArrowRight) => Self::compose_nav(active, Nav::Right, true),
+                Key::Named(NamedKey::ArrowUp) => Self::compose_nav(active, Nav::Up, true),
+                Key::Named(NamedKey::ArrowDown) => Self::compose_nav(active, Nav::Down, true),
+                Key::Named(NamedKey::Home) if ctrl => Self::compose_nav(active, Nav::BufTop, false),
+                Key::Named(NamedKey::End) if ctrl => Self::compose_nav(active, Nav::BufBottom, false),
+                Key::Named(NamedKey::Home) => Self::compose_nav(active, Nav::LineStart, false),
+                Key::Named(NamedKey::End) => Self::compose_nav(active, Nav::LineEnd, false),
+                Key::Named(NamedKey::PageUp) => Self::compose_nav(active, Nav::PageUp, false),
+                Key::Named(NamedKey::PageDown) => Self::compose_nav(active, Nav::PageDown, false),
+                _ => {} // swallow everything else
+            }
             return;
         }
         let mods = active.mods; // current modifier state
@@ -3640,10 +3820,28 @@ impl App {
                     }
                 }
                 // Title on the left, truncated so it never runs into the meter/size.
-                let title = active.session.title_of(id).filter(|t| !t.is_empty()).unwrap_or("Terminal");
+                // While composing an anchored selection in this pane, replace the
+                // title with a live status ("◉ selecting · N lines") in the
+                // focus-accent blue, so the mode is visible right where the title
+                // normally sits — composing implies this pane is focused, so this
+                // never fights with the unfocused/dimmed title colour.
+                let composing_here =
+                    active.composing && active.selection.is_some_and(|sel| sel.pane == id);
                 let avail = ((left_of - 8.0 - left_x) / cell_w).max(0.0) as usize; // room in cells
-                for (i, ch) in title.chars().take(avail).enumerate() {
-                    active.backend.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
+                if composing_here {
+                    let sel = active.selection.unwrap();
+                    let status = select::status_text(sel.anchor, sel.head, sel.block);
+                    let scol = Color::rgb(0x6a, 0xa9, 0xff); // the focus-accent blue
+                    // Cap to the same room the title gets, so a long status ("◉
+                    // selecting · 12345 lines") never runs into the meter/size.
+                    for (i, ch) in status.chars().take(avail).enumerate() {
+                        active.backend.draw_char(left_x, text_top, i, 0, ch, scol, false, false);
+                    }
+                } else {
+                    let title = active.session.title_of(id).filter(|t| !t.is_empty()).unwrap_or("Terminal");
+                    for (i, ch) in title.chars().take(avail).enumerate() {
+                        active.backend.draw_char(left_x, text_top, i, 0, ch, text_col, false, false);
+                    }
                 }
             } else if let Some(g) = active.session.group_of(id) {
                 // No titlebar: fall back to a small colour-coded corner square so
