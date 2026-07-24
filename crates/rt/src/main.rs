@@ -313,6 +313,8 @@ struct Active {
     x11_blur: x11_blur::X11Blur,          // X11 background blur (inert on Wayland / no x11 feature)
     selection: Option<Selection>,         // the current mouse text selection, if any
     selecting: bool,                      // true while the left button is held for a drag-select
+    composing: bool,   // true while an anchored selection is being built (modal)
+    shift_press: bool, // the in-flight left-press was Shift-held (candidate for compose entry)
     mouse_report: Option<(rt_core::PaneId, u16)>, // pane + xterm button code we're forwarding a press to
     hover_cell: Option<(rt_core::PaneId, usize, usize)>, // last cell reported to a 1003 (any-motion) app
     scroll_drag: Option<(rt_core::PaneId, f32, Rect)>, // dragging the scrollbar: (pane, grab-offset in thumb, grid rect)
@@ -1053,6 +1055,8 @@ impl ApplicationHandler for App {
             x11_blur,
             selection: None,
             selecting: false,
+            composing: false,
+            shift_press: false,
             mouse_report: None,
             hover_cell: None,
             scroll_drag: None,
@@ -1767,6 +1771,7 @@ impl ApplicationHandler for App {
                         if let Some(sel) = active.selection.as_mut() {
                             if sel.pane == pane {
                                 sel.head = (col, row as i32 - off); // move the drag end
+                                active.shift_press = false; // a drag, not a click → not compose entry
                                 active.force_full = true; // selection highlight isn't engine-tracked damage
                                 active.window.request_redraw();
                             }
@@ -1831,6 +1836,14 @@ impl ApplicationHandler for App {
                     active.window.request_redraw();
                 }
                 (ElementState::Pressed, MouseButton::Left) => {
+                    // While composing an anchored selection, a click finishes or
+                    // aborts it — it never starts a new selection.
+                    if active.composing {
+                        // (Shift+click → set head + commit is added in Task 6;
+                        // for now any click cancels so the mode is always escapable.)
+                        Self::compose_cancel(active);
+                        return;
+                    }
                     {
                         let size = active.window.inner_size();
                         let bounds = content_bounds(size);
@@ -1981,6 +1994,9 @@ impl ApplicationHandler for App {
                                         let block = active.mods.control_key();
                                         active.selection = Some(Selection { pane, anchor: (col, line), head: (col, line), block });
                                         active.selecting = true;
+                                        // A Shift-held press with no ensuing drag becomes an
+                                        // anchored-compose start (resolved at release).
+                                        active.shift_press = active.mods.shift_key();
                                     }
                                 }
                                 active.force_full = true; // selection highlight changed
@@ -2021,7 +2037,13 @@ impl ApplicationHandler for App {
                     // (copy-on-select) copy a real selection to PRIMARY.
                     if let Some(sel) = active.selection {
                         if sel.anchor == sel.head {
-                            active.selection = None;
+                            if active.shift_press {
+                                // No drag followed a Shift-press: promote to anchored
+                                // compose. Keep the (zero-length) selection as the anchor.
+                                active.composing = true;
+                            } else {
+                                active.selection = None; // a plain click: discard
+                            }
                         } else if let Some(text) = Self::selected_text(active) {
                             if let Some(cb) = &active.clipboard {
                                 cb.store_primary(text); // PRIMARY for middle-click paste
@@ -2030,6 +2052,7 @@ impl ApplicationHandler for App {
                         active.force_full = true; // selection cleared/finalised: repaint highlight
                         active.window.request_redraw();
                     }
+                    active.shift_press = false; // consumed
                 }
                 (ElementState::Pressed, MouseButton::Middle) => {
                     // A mouse-reporting app gets the middle-press; otherwise (or
@@ -3008,6 +3031,16 @@ impl App {
         }
     }
 
+    /// Leave anchored-compose mode, discarding the in-progress selection and
+    /// touching no clipboard.
+    fn compose_cancel(active: &mut Active) {
+        active.composing = false;
+        active.shift_press = false;
+        active.selection = None;
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
     /// Reload the renderer's fonts from the current settings (rebuilding the
     /// font chains if the family changed), re-measure the cell, and resize every
     /// pane to the new (cols, rows). Shared by the preferences dialog and the
@@ -3047,6 +3080,15 @@ impl App {
         // the composed result arrives via WindowEvent::Ime(Commit) instead. This
         // is what prevents the dead key (´) and its result (ó) both being sent.
         if active.ime_preedit {
+            return;
+        }
+        // Anchored-compose is modal: keyboard input drives the selection, not the
+        // shell. Esc cancels; navigation/commit keys are added in later tasks;
+        // every other key is swallowed so nothing leaks to the pane.
+        if active.composing {
+            if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
+                Self::compose_cancel(active);
+            }
             return;
         }
         let mods = active.mods; // current modifier state
