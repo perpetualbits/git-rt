@@ -1859,32 +1859,40 @@ impl ApplicationHandler for App {
                             // select below run.
                             active.composing = false;
                             active.shift_press = false;
-                        } else if active.mods.shift_key() {
-                            // Shift+click commits — but only in the composing pane: it
-                            // sets the end at the clicked cell and copies. A Shift+click
-                            // in a DIFFERENT pane cancels instead (the spec's "start
-                            // fresh there" — a new anchor drops on the next click).
-                            let hit = Self::cell_at(active, mx, my);
-                            let same = matches!((hit, active.selection),
-                                (Some((p, ..)), Some(s)) if p == s.pane);
-                            if same {
-                                if let Some((pane, col, row)) = hit {
-                                    if let Some(sel) = active.selection.as_mut() {
-                                        let off = active
-                                            .session
-                                            .pane(pane)
-                                            .map(|p| p.scroll_info().0 as i32)
-                                            .unwrap_or(0);
-                                        sel.head = (col, row as i32 - off);
-                                    }
-                                }
-                                Self::compose_commit(active);
-                            } else {
-                                Self::compose_cancel(active);
-                            }
-                            return;
                         } else {
-                            Self::compose_cancel(active); // a plain click cancels
+                            // This click ends compose (commit or cancel) and returns
+                            // before the click-count logic below runs. Clear last_click
+                            // so this mode-ending click can't seed a spurious
+                            // double-click with a rapid follow-up — the next click
+                            // starts fresh.
+                            active.last_click = None;
+                            active.click_count = 0;
+                            if active.mods.shift_key() {
+                                // Shift+click commits — but only in the composing pane:
+                                // it sets the end at the clicked cell and copies. A
+                                // Shift+click in a DIFFERENT pane cancels instead (the
+                                // spec's "start fresh there" — a new anchor drops next).
+                                let hit = Self::cell_at(active, mx, my);
+                                let same = matches!((hit, active.selection),
+                                    (Some((p, ..)), Some(s)) if p == s.pane);
+                                if same {
+                                    if let Some((pane, col, row)) = hit {
+                                        if let Some(sel) = active.selection.as_mut() {
+                                            let off = active
+                                                .session
+                                                .pane(pane)
+                                                .map(|p| p.scroll_info().0 as i32)
+                                                .unwrap_or(0);
+                                            sel.head = (col, row as i32 - off);
+                                        }
+                                    }
+                                    Self::compose_commit(active);
+                                } else {
+                                    Self::compose_cancel(active);
+                                }
+                            } else {
+                                Self::compose_cancel(active); // a plain click cancels
+                            }
                             return;
                         }
                     }
