@@ -3,6 +3,7 @@
 //! backends (GL and XRender). Each unit reads rt's existing overlay state (no
 //! parallel state) and paints via `Backend` primitives.
 
+pub mod clip_history;
 pub mod colour_picker;
 pub mod instruments;
 pub mod manual;
