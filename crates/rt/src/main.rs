@@ -295,6 +295,9 @@ const JACK_R_FILL: f32 = 5.8; // filled centre when a wire uses the jack
 const JACK_R_RING: f32 = 5.4; // outline radius when the jack is idle
 const JACK_RING_W: f32 = 1.8; // outline stroke width
 
+/// Width (in cells) of the clipboard-history overlay panel.
+const CLIP_PREVIEW_COLS: usize = 44;
+
 /// Everything that only exists once a window and GL context are created (which
 /// happens on the first `resumed`). Kept in an `Option` on the `App` so we can
 /// build it lazily and tear it down on suspend.
@@ -308,6 +311,7 @@ struct Active {
     mouse: (f32, f32),                    // last cursor position in physical pixels
     menu: Option<(f32, f32)>,             // open context menu, at this window position (physical px)
     menu_hover: Option<usize>,            // hovered row of the native (XRender) context menu, if any
+    clip_overlay: Option<usize>,          // clipboard-history overlay open, carrying the selected row
     ime_preedit: bool,                    // true while an IME/dead-key composition is in progress
     clipboard: Option<clipboard::Clipboard>, // CLIPBOARD + PRIMARY (Wayland or X11); None if unavailable
     clip_history: clip_history::ClipHistory, // in-memory MRU ring of this session's copies
@@ -1051,6 +1055,7 @@ impl ApplicationHandler for App {
             mouse: (0.0, 0.0),
             menu: None,
             menu_hover: None,
+            clip_overlay: None,
             ime_preedit: false,
             clipboard,
             clip_history: clip_history::ClipHistory::new(),
@@ -1540,6 +1545,71 @@ impl ApplicationHandler for App {
                     active.menu = None;
                     active.menu_hover = None;
                     active.window.request_redraw();
+                    return;
+                }
+                // Swallow remaining input (releases, wheel, IME, mods); lifecycle
+                // events fall through to normal handling.
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::ModifiersChanged(_) => return,
+                _ => {}
+            }
+        }
+
+        // Clipboard-history overlay: modal like the context menu. Arrow keys move
+        // the selection, Enter/click picks, Esc/click-outside closes.
+        if let Some(sel) = active.clip_overlay {
+            let size = active.window.inner_size();
+            let (cw, ch) = active.backend.cell_size();
+            let n = active.clip_history.len();
+            let anchor = Self::pane_content_rect(active, active.session.focus())
+                .map(|r| (r.x, r.y))
+                .unwrap_or((40.0, 40.0));
+            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS);
+            match &event {
+                WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
+                    match &ke.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            active.clip_overlay = None;
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        Key::Named(NamedKey::Enter) => Self::pick_clip(active, sel),
+                        Key::Named(NamedKey::ArrowDown) => {
+                            active.clip_overlay = Some((sel + 1).min(g.clear_row));
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            active.clip_overlay = Some(sel.saturating_sub(1));
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    active.mouse = (position.x as f32, position.y as f32);
+                    if let Some(i) = chrome::clip_history::hit_row(&g, active.mouse) {
+                        active.clip_overlay = Some(i);
+                        active.force_full = true;
+                        active.window.request_redraw();
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                    match chrome::clip_history::hit_row(&g, active.mouse) {
+                        Some(i) => Self::pick_clip(active, i),
+                        None => {
+                            // click outside
+                            active.clip_overlay = None;
+                            active.force_full = true;
+                            active.window.request_redraw();
+                        }
+                    }
                     return;
                 }
                 // Swallow remaining input (releases, wheel, IME, mods); lifecycle
@@ -2644,6 +2714,21 @@ impl App {
                 active.window.set_fullscreen(fs);
                 active.window.request_redraw();
             }
+            Action::ClipHistory => {
+                if active.clip_overlay.is_some() {
+                    active.clip_overlay = None; // toggle closed
+                    active.force_full = true;
+                    active.window.request_redraw();
+                } else {
+                    Self::open_clip_history(active);
+                }
+            }
+            Action::ClearClipHistory => {
+                active.clip_history.clear();
+                active.clip_overlay = None;
+                active.force_full = true;
+                active.window.request_redraw();
+            }
             // Everything else is a session action.
             other => match active.session.apply(other) {
                 Some(SessionEvent::CloseWindow) => exit_clean(), // last pane closed; clean up first
@@ -2702,6 +2787,38 @@ impl App {
     /// clip picked from the history does not re-enter capture.
     fn record_clip(active: &mut Active, text: &str) {
         active.clip_history.record(text.to_string());
+    }
+
+    /// Open the clipboard-history overlay (no-op if the history is empty),
+    /// selecting the newest clip.
+    fn open_clip_history(active: &mut Active) {
+        if active.clip_history.is_empty() {
+            return;
+        }
+        active.clip_overlay = Some(0);
+        active.force_full = true;
+        active.window.request_redraw();
+    }
+
+    /// Act on a picked overlay row: the Clear row empties the history; a clip row
+    /// pastes that clip into the focused pane, promotes it to CLIPBOARD+PRIMARY,
+    /// and moves it to the front. Always closes the overlay.
+    fn pick_clip(active: &mut Active, row: usize) {
+        let n = active.clip_history.len();
+        if row >= n {
+            // the Clear row
+            active.clip_history.clear();
+        } else if let Some(text) = active.clip_history.get(row).map(str::to_string) {
+            active.session.feed_paste(text.as_bytes()); // per-pane bracketed paste
+            if let Some(cb) = &active.clipboard {
+                cb.store(text.clone());
+                cb.store_primary(text.clone());
+            }
+            active.clip_history.record(text); // move-to-front (does NOT go through record_clip)
+        }
+        active.clip_overlay = None;
+        active.force_full = true;
+        active.window.request_redraw();
     }
 
     /// Extract the selected text from its pane's grid, row by row, trimming
@@ -3987,7 +4104,10 @@ impl App {
         let (cw, ch) = active.backend.cell_size();
         // Whether a menu/manual/search overlay is up; instruments hide beneath it.
         // (Preferences returned above.)
-        let overlay_up = active.menu.is_some() || active.manual_open || active.search_open;
+        let overlay_up = active.menu.is_some()
+            || active.manual_open
+            || active.search_open
+            || active.clip_overlay.is_some();
 
         // Instruments differ by backend. GL: an egui background pass each frame,
         // only when nothing covers them. XRender: a persistent, separate ARGB
@@ -4039,6 +4159,23 @@ impl App {
             let count = active.search_matches.len();
             let pos = if count == 0 { 0 } else { active.search_index + 1 };
             chrome::search::draw(&mut *active.backend, bar, &active.search_query, pos, count, cw, ch);
+        }
+        // Clipboard-history overlay draws on top of everything above (the menu
+        // block's early-return means it can't be up at the same time in
+        // practice, but this keeps it topmost regardless).
+        if let Some(sel) = active.clip_overlay {
+            let n = active.clip_history.len();
+            let anchor = Self::pane_content_rect(active, active.session.focus())
+                .map(|r| (r.x, r.y))
+                .unwrap_or((40.0, 40.0));
+            let previews: Vec<String> = active
+                .clip_history
+                .iter()
+                .map(|c| clip_history::preview(c, CLIP_PREVIEW_COLS - 8))
+                .collect();
+            let badges: Vec<String> = active.clip_history.iter().map(clip_history::badge).collect();
+            let g = chrome::clip_history::layout(n, anchor, cw, ch, size.width as f32, size.height as f32, CLIP_PREVIEW_COLS);
+            chrome::clip_history::draw(&mut *active.backend, &g, &previews, &badges, Some(sel), sel, cw, ch);
         }
     }
 
