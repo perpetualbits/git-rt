@@ -105,7 +105,7 @@ window.PROJECT_MAP = {
         { label: "Drag / word / line select", status: "done", desc: "Copy-on-select to PRIMARY; wrap-aware word and logical-line." },
         { label: "Anchored mode", status: "done", desc: "Shipped v0.3.12: Shift-click anchor → navigate → commit, block via Ctrl." },
         { label: "Clipboard history in titlebar (B)", status: "done", desc: "Shipped v0.3.13: in-memory MRU ring (cap 20, dedup, no disk); a ⎘ N titlebar affordance + Ctrl+Shift+H open a native overlay; picking a clip pastes it and promotes it to CLIPBOARD+PRIMARY." },
-        { label: "Drag auto-scroll acceleration (C)", status: "active", desc: "Time-held ramp of the fixed 35ms edge auto-scroll (distance ruled out — terminal runs vertically maximized), reusing the arrow-accel curve + prefs. Design approved 2026-07-24." }
+        { label: "Drag auto-scroll acceleration (C)", status: "done", desc: "Shipped v0.3.14: drag-select past the pane edge ramps the auto-scroll the longer the edge is held (capped), reusing the arrow-accel curve + prefs; off ⇒ flat 1 line/35ms. Distance ruled out — terminal runs vertically maximized." }
       ],
       deps: ["rt-session"]
     },
