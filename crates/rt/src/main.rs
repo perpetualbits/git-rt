@@ -21,6 +21,7 @@ mod x11_present; // Route 1: X11 damage-rect present (glReadPixels + XPutImage)
 #[cfg(feature = "x11")]
 mod xrender_backend; // mechanism C: XRender backend
 mod clipboard; // cross-backend clipboard (Wayland smithay / X11 arboard)
+mod clip_history; // in-memory clipboard history: bounded most-recently-used ring
 mod damage; // pure pixel-rect damage accumulator
 mod input; // (also re-exported by lib.rs for tests; declared here for the bin)
 mod manual; // the built-in manual overlay (F1)
